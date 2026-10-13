@@ -44,6 +44,7 @@ static_assert(offsetof(KernelIovec, iov_len) == 8);
 void Initialize();
 void Shutdown();
 void EmergencyShutdown();
+bool IsOpenFile(int d);
 
 struct Lifecycle {
 	static constexpr const char* name        = "FileSystem";
@@ -52,8 +53,8 @@ struct Lifecycle {
 	static constexpr auto emergency_shutdown = Libs::LibKernel::FileSystem::EmergencyShutdown;
 };
 
-void                  Mount(const std::filesystem::path& folder, const std::string& point);
-void                  Umount(const std::string& folder_or_point);
+void Mount(const std::filesystem::path& folder, const std::string& point);
+void Umount(const std::string& folder_or_point);
 // Returns an empty path when the guest path has no mounted filesystem.
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
 
