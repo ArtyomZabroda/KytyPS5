@@ -385,23 +385,23 @@ struct PthreadGuestData {
 static_assert(sizeof(PthreadGuestData) == 4096);
 
 struct PthreadPrivate {
-	PthreadGuestData      guest;
-	std::string           name;
-	pthread_t             p;
-	PthreadAttr           attr;
-	pthread_entry_func_t  entry;
-	void*                 arg;
-	int                   unique_id;
-	std::atomic_bool      detached;
-	std::atomic_bool      almost_done;
-	std::atomic_bool      free;
-	uint64_t              host_thread_id;
-	uintptr_t             guest_host_rbx;
-	uintptr_t             guest_host_rsp;
-	uintptr_t             guest_host_rbp;
-	uint64_t              cond_sequence = 0;
+	PthreadGuestData        guest;
+	std::string             name;
+	pthread_t               p;
+	PthreadAttr             attr;
+	pthread_entry_func_t    entry;
+	void*                   arg;
+	int                     unique_id;
+	std::atomic_bool        detached;
+	std::atomic_bool        almost_done;
+	std::atomic_bool        free;
+	uint64_t                host_thread_id;
+	uintptr_t               guest_host_rbx;
+	uintptr_t               guest_host_rsp;
+	uintptr_t               guest_host_rbp;
+	uint64_t                cond_sequence = 0;
 	std::condition_variable cond_cv;
-	std::atomic<uint64_t> pending_signal_mask {0};
+	std::atomic<uint64_t>   pending_signal_mask {0};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -452,11 +452,11 @@ struct PthreadCondattrPrivate {
 };
 
 struct PthreadCondPrivate {
-	uint8_t                 reserved[256];
-	std::string             name;
-	std::mutex              m;
-	KernelClockid           clock_id = KERNEL_CLOCK_REALTIME;
-	std::vector<Pthread>    waiters;
+	uint8_t              reserved[256];
+	std::string          name;
+	std::mutex           m;
+	KernelClockid        clock_id = KERNEL_CLOCK_REALTIME;
+	std::vector<Pthread> waiters;
 };
 
 static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
@@ -3178,6 +3178,43 @@ static void CleanupThread(void* arg) {
 	thread->almost_done = true;
 }
 
+static void ApplyHostAffinity(Pthread thread) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	KernelCpumask guest_mask;
+	PthreadAttrGetaffinity(&thread->attr, &guest_mask);
+	uint64_t proc, sys;
+	GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
+	uint64_t host_mask = guest_mask & proc;
+
+	if (host_mask == 0) {
+		LOGF("ApplyHostAffinity: thread_name: %s, thread_unique_id: %d, mask: 0x%" PRIx64 "\n",
+		     thread->name.c_str(), thread->unique_id, host_mask);
+		return;
+	}
+
+	const bool is_current = (thread->host_thread_id == static_cast<uint64_t>(GetCurrentThreadId()));
+	HANDLE     native_handle;
+	if (is_current) {
+		native_handle = GetCurrentThread();
+		SetThreadAffinityMask(native_handle, host_mask);
+	} else {
+		native_handle = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE,
+		                           (DWORD)thread->host_thread_id);
+		if (!native_handle) {
+			LOGF("ApplyHostAffinity: thread_name: %s, thread_unique_id: %s\n", thread->name.c_str(),
+			     thread->unique_id, GetLastError());
+		}
+		if (!SetThreadAffinityMask(native_handle, host_mask)) {
+			LOGF("ApplyHostAffinity: thread_name: %s, thread_unique_id: %s\n", thread->name.c_str(),
+			     thread->unique_id, GetLastError());
+		}
+		CloseHandle(native_handle);
+	}
+	LOGF("ApplyHostAffinity: thread_name: %s, thread_unique_id: %d, mask: 0x%" PRIx64 "\n",
+	     thread->name.c_str(), thread->unique_id, host_mask);
+#endif
+}
+
 static void* RunThread(void* arg) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -3200,6 +3237,7 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+	ApplyHostAffinity(thread);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!thread->name.empty()) {
 #if defined(__APPLE__)
@@ -3381,7 +3419,14 @@ int KYTY_SYSV_ABI PthreadSetaffinity(Pthread thread, KernelCpumask mask) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	LOGF("PthreadSetaffinity: thread_name: %s, thread_unique_id: %d, mask: 0x%" PRIx64 "\n",
+	     thread->name.c_str(), thread->unique_id, mask);
+
 	auto result = PthreadAttrSetaffinity(&thread->attr, mask);
+
+	if (thread->host_thread_id != 0) {
+		ApplyHostAffinity(thread);
+	}
 
 	return result;
 }
