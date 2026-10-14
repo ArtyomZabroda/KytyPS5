@@ -31,6 +31,8 @@ struct ResourceSpecialization {
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
 		bool                          operator==(const Image&) const = default;
+
+		bool depth16_as_uint = false;
 	};
 
 	std::vector<Buffer> buffers;

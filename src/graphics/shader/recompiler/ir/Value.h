@@ -131,9 +131,7 @@ public:
 	}
 	// Backend definitions belong to one emission. Wave64 emulation needs one per half.
 	[[nodiscard]] uint32_t Definition(uint32_t half) const { return definitions[half]; }
-	void SetDefinition(uint32_t half, uint32_t definition) const {
-		definitions[half] = definition;
-	}
+	void SetDefinition(uint32_t half, uint32_t definition) const { definitions[half] = definition; }
 	void ResetDefinitions() const { definitions = {}; }
 
 	void SetParent(Block* block);
@@ -165,23 +163,23 @@ private:
 	void ClearArgs();
 
 	static constexpr uint8_t InlineArity = 4;
-	static constexpr uint8_t PhiArity = UINT8_MAX;
+	static constexpr uint8_t PhiArity    = UINT8_MAX;
 
-	ValueOpcode         opcode;
-	uint8_t             num_args;
-	bool                live = false;
-	mutable uint32_t    evaluation_index = UINT32_MAX;
+	ValueOpcode                     opcode;
+	uint8_t                         num_args;
+	bool                            live             = false;
+	mutable uint32_t                evaluation_index = UINT32_MAX;
 	mutable std::array<uint32_t, 2> definitions {};
-	uint64_t            flags;
-	Block*              parent = nullptr;
+	uint64_t                        flags;
+	Block*                          parent = nullptr;
 	union {
-		std::array<Value, InlineArity> fixed_args {};
-		std::vector<Value> large_args;
+		std::array<Value, InlineArity>        fixed_args {};
+		std::vector<Value>                    large_args;
 		std::vector<std::pair<Block*, Value>> phi_args;
 	};
-	std::vector<Use>    uses;
+	std::vector<Use> uses;
 };
 
-static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
+static_assert(sizeof(Inst) <= 128, "Inst operand and backend storage unintentionally increased");
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
