@@ -104,6 +104,48 @@ private:
   std::filesystem::path m_path;
 };
 
+void CheckOpenFileCoherence(const std::filesystem::path& root) {
+  const auto path = root / "open-file-coherence.dat";
+  Common::File writer;
+  Check(writer.Create(path), "create shared file fixture");
+  uint32_t count = 0;
+  writer.Write("abcdef", 6, &count);
+  Check(count == 6 && Common::File::Size(path) == 6,
+        "created file writes are visible before flush or close");
+
+  Common::File reader(path, Common::File::Mode::Read);
+  Common::File update(path, Common::File::Mode::Write);
+  Check(!reader.IsInvalid() && !update.IsInvalid(), "open independent file handles");
+  std::array<char, 2> bytes {};
+  reader.Read(bytes.data(), 1, &count);
+  Check(count == 1 && bytes[0] == 'a' && update.Seek(1),
+        "prime sequential read and position independent writer");
+  update.Write("XY", 2, &count);
+  Check(count == 2, "overwrite bytes through write handle");
+  reader.Read(bytes.data(), bytes.size(), &count);
+  Check(count == bytes.size() && std::memcmp(bytes.data(), "XY", bytes.size()) == 0,
+        "sequential reader observes another handle's writes without seeking");
+
+  Common::File read_write(path, Common::File::Mode::ReadWrite);
+  Check(!read_write.IsInvalid() && read_write.Seek(3), "open read-write handle");
+  read_write.Write("Z", 1, &count);
+  Check(count == 1, "overwrite through read-write handle");
+  reader.Read(bytes.data(), 1, &count);
+  Check(count == 1 && bytes[0] == 'Z', "read-write handle changes are immediately visible");
+
+  writer.Write("g", 1, &count);
+  Check(count == 1 && writer.Tell() == 7, "extend through the original writer");
+  std::error_code error;
+  std::filesystem::resize_file(path, 2, error);
+  Check(!error && writer.Tell() == 7 && Common::File::Size(path) == 2,
+        "path resize preserves an open writer's position");
+  writer.Close();
+  update.Close();
+  read_write.Close();
+  Check(Common::File::Size(path) == 2,
+        "closing existing writers cannot undo a path truncation");
+}
+
 void CheckSaveRename(const std::filesystem::path &root,
                      std::string_view payload) {
   constexpr char Source[] = "/savedata0/STEMP000.DAT";
@@ -288,6 +330,136 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
         "save truncation is visible before close");
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
+}
+
+void TestSaveTruncate() {
+  namespace Kernel = Libs::LibKernel;
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto* symbol = symbols.Find(
+      {"WlyEA-sLDf0", "libkernel", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+  Check(symbol != nullptr, "sceKernelTruncate export resolves");
+  const auto truncate =
+      reinterpret_cast<int (KYTY_SYSV_ABI *)(const char*, int64_t)>(symbol->vaddr);
+  constexpr char Path[] = "/savedata0/truncate-save.dat";
+  constexpr char Payload[] = "profile data";
+  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, sizeof(Payload) - 1) ==
+                       sizeof(Payload) - 1,
+        "populate path truncation fixture");
+  FileSystem::FileStat stat {};
+  std::array<char, 8> bytes {};
+  Check(truncate(Path, 3) == OK &&
+            FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == 3 &&
+            FileSystem::KernelLseek(fd, 0, 1) == sizeof(Payload) - 1 &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == 3 &&
+            std::memcmp(bytes.data(), Payload, 3) == 0,
+        "path truncate discards the tail without moving an open descriptor");
+  bytes.fill('x');
+  Check(truncate(Path, bytes.size()) == OK &&
+            FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == bytes.size() &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == bytes.size() &&
+            std::memcmp(bytes.data(), Payload, 3) == 0 &&
+            std::all_of(bytes.begin() + 3, bytes.end(), [](char byte) { return byte == 0; }) &&
+            FileSystem::KernelLseek(fd, 0, 1) == sizeof(Payload) - 1,
+        "path truncate extends with zero bytes and preserves the descriptor position");
+  Check(truncate(Path, -1) == Kernel::KERNEL_ERROR_EINVAL &&
+            truncate(nullptr, 0) == Kernel::KERNEL_ERROR_EFAULT &&
+            truncate("truncate-save.dat", 0) == Kernel::KERNEL_ERROR_EINVAL &&
+            truncate("/savedata0/missing-save.dat", 0) == Kernel::KERNEL_ERROR_ENOENT &&
+            truncate("/savedata0", 0) == Kernel::KERNEL_ERROR_EISDIR &&
+            truncate("/savedata0/truncate-save.dat/child", 0) == Kernel::KERNEL_ERROR_ENOTDIR &&
+            FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == bytes.size() &&
+            FileSystem::KernelLseek(fd, 0, 1) == sizeof(Payload) - 1,
+        "path truncate errors preserve file size and descriptor position");
+  Check(truncate("/dev/urandom", 0) == OK,
+        "path truncate is a no-op for a nonregular nondirectory file");
+  std::string long_path = "/savedata0";
+  long_path.resize(1024, '/');
+  Check(truncate(long_path.c_str(), 0) == Kernel::KERNEL_ERROR_ENAMETOOLONG,
+        "path truncate rejects a pathname beyond the guest length limit");
+  long_path.pop_back();
+  Check(truncate(long_path.c_str(), 0) == Kernel::KERNEL_ERROR_EISDIR &&
+            truncate((std::string("/savedata0/") + std::string(256, 'a')).c_str(), 0) ==
+                Kernel::KERNEL_ERROR_ENAMETOOLONG,
+        "path truncate permits the pathname length limit and bounds each component");
+  Check(FileSystem::KernelClose(fd) == OK, "close path truncation fixture");
+}
+
+void TestSaveWritev() {
+  namespace Kernel = Libs::LibKernel;
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto resolve = [&](const char* nid) {
+    const auto* symbol = symbols.Find(
+        {nid, "libkernel", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+    Check(symbol != nullptr, "vectored write export resolves");
+    return symbol->vaddr;
+  };
+  const auto writev = reinterpret_cast<int64_t (KYTY_SYSV_ABI *)(
+      int, const FileSystem::KernelIovec*, int)>(resolve("kAt6VDbHmro"));
+  const auto pwritev = reinterpret_cast<int64_t (KYTY_SYSV_ABI *)(
+      int, const FileSystem::KernelIovec*, int, int64_t)>(resolve("mBd4AfLP+u8"));
+  constexpr char Path[] = "/savedata0/vector-save.dat";
+  char first[] = "abc";
+  char second[] = "DE";
+  const std::array<FileSystem::KernelIovec, 3> buffers {{
+      {first, 3}, {nullptr, 0}, {second, 2}}};
+  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, "_", 1) == 1 &&
+            writev(fd, buffers.data(), buffers.size()) == 5 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 6,
+        "writev writes consecutive segments and advances the descriptor position");
+  std::array<char, 6> bytes {};
+  Check(FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == bytes.size() &&
+            std::memcmp(bytes.data(), "_abcDE", bytes.size()) == 0,
+        "writev preserves the prefix and writes every nonempty segment in order");
+  char replacement[] = "12";
+  const std::array<FileSystem::KernelIovec, 2> patch {{
+      {replacement, 1}, {replacement + 1, 1}}};
+  Check(pwritev(fd, patch.data(), patch.size(), 1) == 2 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 6 &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == bytes.size() &&
+            std::memcmp(bytes.data(), "_12cDE", bytes.size()) == 0,
+        "pwritev shares segment ordering while preserving the descriptor position");
+
+  const std::array<FileSystem::KernelIovec, 2> invalid {{
+      {first, 1}, {nullptr, 1}}};
+  const std::array<FileSystem::KernelIovec, 2> oversized {{
+      {first, 1}, {second, static_cast<size_t>(std::numeric_limits<int>::max())}}};
+  Check(writev(fd, nullptr, 1) == Kernel::KERNEL_ERROR_EFAULT &&
+            writev(fd, invalid.data(), invalid.size()) == Kernel::KERNEL_ERROR_EFAULT &&
+            writev(fd, buffers.data(), -1) == Kernel::KERNEL_ERROR_EINVAL &&
+            writev(fd, buffers.data(), 1025) == Kernel::KERNEL_ERROR_EINVAL &&
+            writev(fd, oversized.data(), oversized.size()) == Kernel::KERNEL_ERROR_EINVAL &&
+            pwritev(fd, patch.data(), patch.size(), -1) == Kernel::KERNEL_ERROR_EINVAL &&
+            writev(-1, buffers.data(), buffers.size()) == Kernel::KERNEL_ERROR_EBADF &&
+            writev(fd, nullptr, 0) == 0 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 6 &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == bytes.size() &&
+            std::memcmp(bytes.data(), "_12cDE", bytes.size()) == 0,
+        "invalid vectors fail before writing any segment or moving the descriptor");
+  const int reader = FileSystem::KernelOpen(Path, 0, 0);
+  Check(reader >= 3 && writev(reader, buffers.data(), buffers.size()) ==
+                           Kernel::KERNEL_ERROR_EBADF &&
+            FileSystem::KernelLseek(reader, 0, 1) == 0 &&
+            FileSystem::KernelClose(reader) == OK,
+        "writev rejects a read-only descriptor without moving it");
+
+  const int append = FileSystem::KernelOpen(Path, 0xa, 0);
+  Check(append >= 3 && FileSystem::KernelLseek(append, 1, 0) == 1 &&
+            writev(append, buffers.data(), buffers.size()) == 5 &&
+            FileSystem::KernelLseek(append, 0, 1) == 11 &&
+            FileSystem::KernelLseek(append, 1, 0) == 1 &&
+            pwritev(append, patch.data(), patch.size(), 0) == 2 &&
+            FileSystem::KernelLseek(append, 0, 1) == 1,
+        "append vectored writes target EOF while positional writes preserve the cursor");
+  std::array<char, 13> appended {};
+  Check(FileSystem::KernelPread(fd, appended.data(), appended.size(), 0) == appended.size() &&
+            std::memcmp(appended.data(), "_12cDEabcDE12", appended.size()) == 0,
+        "append writes retain the original contents and ordered segments");
+  Check(FileSystem::KernelClose(append) == OK && FileSystem::KernelClose(fd) == OK,
+        "close vectored write fixtures");
 }
 
 void TestAioBatches() {
@@ -657,6 +829,12 @@ void CheckArchiveMount(const std::filesystem::path &root) {
             FileSystem::KernelFtruncate(fd, 0) ==
             Libs::LibKernel::KERNEL_ERROR_EBADF,
         "archive read-only descriptors reject write and truncate");
+  Check(FileSystem::KernelTruncate(GuestMember, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelFstat(fd, &descriptor_stat) == OK &&
+            descriptor_stat.st_size == payload.size() &&
+            FileSystem::KernelLseek(fd, 0, 1) == payload.size(),
+        "path truncate rejects a read-only archive and preserves its member");
 
   const auto unicode_guest = std::string("/app0/") + std::string(ArchiveTests::UnicodeFilename);
   const int unicode = FileSystem::KernelOpen(unicode_guest.c_str(), 0, 0);
@@ -1851,6 +2029,7 @@ int main(int, char**) {
   graphics->CreateVulkan();
 
   TempDirectory temporary;
+  CheckOpenFileCoherence(temporary.Path());
   FileSystem::Initialize();
   TestSysmoduleReferences();
   TestSystemServiceEntitlementEvents();
@@ -1865,6 +2044,8 @@ int main(int, char**) {
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
+  TestSaveTruncate();
+  TestSaveWritev();
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
