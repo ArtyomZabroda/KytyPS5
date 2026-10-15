@@ -5557,16 +5557,16 @@ void TestShaderInfoCollection() {
 void TestImageBindingAbi() {
   using NumericClass = Libs::Graphics::Prospero::TextureNumericClass;
 
-  Check(ImageBindingCount == 48u &&
+  Check(ImageBindingCount == 52u &&
             static_cast<uint32_t>(DescriptorBindingKind::Buffers) == 0u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Gds) == 50u &&
-            static_cast<uint32_t>(DescriptorBindingKind::BdaPagetable) == 51u &&
-            static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 52u &&
-            static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 53u &&
-            static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 54u &&
-            static_cast<uint32_t>(DescriptorBindingKind::SharedMemory) == 55u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u,
+            static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 53u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Gds) == 54u &&
+            static_cast<uint32_t>(DescriptorBindingKind::BdaPagetable) == 55u &&
+            static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 56u &&
+            static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 57u &&
+            static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 58u &&
+            static_cast<uint32_t>(DescriptorBindingKind::SharedMemory) == 59u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 60u,
         "native descriptor binding anchors changed");
 
   const std::array sampled_dimensions{
@@ -5634,6 +5634,14 @@ void TestImageBindingAbi() {
     CheckBinding(ImageResourceClass::Storage, NumericClass::Uint, dimension,
                  true, false, true);
   }
+  const std::array storage_msaa_dimensions{
+    Decoder::ImageDimension::Dim2DMsaa, Decoder::ImageDimension::Dim2DMsaaArray,
+  };
+  for (const auto numeric_class : storage_classes) {
+      for (const auto dimension : storage_msaa_dimensions) {
+          CheckBinding(ImageResourceClass::Storage, numeric_class, dimension, false);
+      }
+  }
   Check(index == ImageBindingCount, "image descriptor ABI case count changed");
 
   const auto Invalid = [](ImageResource image) {
@@ -5667,10 +5675,13 @@ void TestImageBindingAbi() {
   image.atomic = false;
   image.numeric_class = NumericClass::Sint;
   Check(Invalid(image), "signed storage image received a descriptor binding");
-  image.numeric_class = NumericClass::Float;
+  image.numeric_class = NumericClass::Uint;
   image.dimension = Decoder::ImageDimension::Dim2DMsaa;
+  image.atomic = true;
   Check(Invalid(image),
-        "multisampled storage image received a descriptor binding");
+        "multisampled atomic image received a descriptor binding");
+  image.atomic = false;
+  image.numeric_class = NumericClass::Float;
   image.dimension = Decoder::ImageDimension::Dim2D;
   image.atomic = true;
   Check(Invalid(image), "float atomic image received a descriptor binding");

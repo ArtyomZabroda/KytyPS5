@@ -32,7 +32,7 @@ namespace ImageViewOps {
 }
 
 [[nodiscard]] inline bool IsValidImageSwizzle(uint32_t swizzle,
-                                             uint32_t component_count = 4) noexcept {
+                                              uint32_t component_count = 4) noexcept {
 	if ((swizzle & ~0xfffu) != 0) {
 		return false;
 	}
@@ -114,7 +114,10 @@ IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resou
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D ||
-	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) &&
+	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
+	        ((resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa ||
+	          resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray) &&
+	         !resource.atomic && resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None)) &&
 	       ((resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None &&
 	         resource.mip_count == 1u) ||
 	        (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic &&

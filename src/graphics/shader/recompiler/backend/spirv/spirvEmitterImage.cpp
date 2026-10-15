@@ -976,9 +976,14 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    state.program.info.images[mem.resource].mip_mode == IR::ImageMipMode::Dynamic
 			        ? LodU32(ctx, mem, *address, dimension)
 			        : 0u;
-			const auto coord = CoordU32(ctx, mem, *address, dimension);
-			const auto texel = StoreTexel(ctx, mem, ctx.Arg(inst, 2), uint_image);
-			EmitStorageImageWrite(state, mem.resource, mip_lod, coord, texel);
+			const auto  coord          = CoordU32(ctx, mem, *address, dimension);
+			const auto  texel          = StoreTexel(ctx, mem, ctx.Arg(inst, 2), uint_image);
+			const auto& dimension_info = ImageDimensionInfoFor(dimension);
+			const auto  sample =
+			    dimension_info.multisampled != 0u
+			        ? AddressU32(ctx, mem, *address, dimension_info.coordinate_components)
+			        : 0u;
+			EmitStorageImageWrite(state, mem.resource, mip_lod, coord, texel, sample);
 		});
 		return;
 	}

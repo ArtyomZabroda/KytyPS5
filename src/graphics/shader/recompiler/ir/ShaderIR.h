@@ -304,10 +304,11 @@ struct StageOutput {
 	bool operator==(const StageOutput& other) const = default;
 };
 
-inline constexpr uint32_t FirstImageBinding           = 1u;
-inline constexpr uint32_t FirstComparisonImageBinding = 22u;
-inline constexpr uint32_t FirstStorageImageBinding    = 29u;
-inline constexpr uint32_t ImageBindingCount           = 48u;
+inline constexpr uint32_t FirstImageBinding            = 1u;
+inline constexpr uint32_t FirstComparisonImageBinding  = 22u;
+inline constexpr uint32_t FirstStorageImageBinding     = 29u;
+inline constexpr uint32_t FirstStorageMsaaImageBinding = 49u;
+inline constexpr uint32_t ImageBindingCount            = 52u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -321,8 +322,9 @@ enum class DescriptorBindingKind : uint32_t {
 	Count,
 };
 
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 53u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 60u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) <= 64u);
 
 struct PushData {
 	static constexpr uint32_t        DwordCount         = 32;
@@ -420,17 +422,21 @@ DescriptorBindingForImage(const ImageResource& image) {
 		case Decoder::ImageDimension::Dim2D: dimension = 2u; break;
 		case Decoder::ImageDimension::Dim2DArray: dimension = 3u; break;
 		case Decoder::ImageDimension::Dim2DMsaa:
-			if (!sampled) {
+		case Decoder::ImageDimension::Dim2DMsaaArray: {
+			const uint32_t array =
+			    image.dimension == Decoder::ImageDimension::Dim2DMsaaArray ? 1u : 0u;
+			if (sampled) {
+				dimension = 4u + array;
+				break;
+			}
+			if (image.atomic) {
 				return std::nullopt;
 			}
-			dimension = 4u;
-			break;
-		case Decoder::ImageDimension::Dim2DMsaaArray:
-			if (!sampled) {
-				return std::nullopt;
-			}
-			dimension = 5u;
-			break;
+			const uint32_t numeric =
+			    image.numeric_class == Prospero::TextureNumericClass::Uint ? 2u : 0u;
+			return static_cast<DescriptorBindingKind>(FirstStorageMsaaImageBinding + numeric +
+			                                          array);
+		}
 		case Decoder::ImageDimension::Dim3D: dimension = sampled ? 6u : 4u; break;
 		case Decoder::ImageDimension::Unknown: return std::nullopt;
 		default: return std::nullopt;

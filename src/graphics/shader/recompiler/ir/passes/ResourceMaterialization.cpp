@@ -365,6 +365,14 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				root.indirect_mapping_offset    = static_cast<uint32_t>(mapping_offset);
 				root.indirect_search_iterations = 0u;
 			}
+			{
+				static uint64_t calls = 0;
+				if ((calls++ % 1000u) == 0u) {
+					std::fprintf(stderr, "bounded table: W=%zu D=%zu calls=%llu\n", keys.size(),
+					             descriptors.size() - children_begin,
+					             static_cast<unsigned long long>(calls));
+				}
+			}
 			return true;
 		}
 		if (selector == nullptr) {
