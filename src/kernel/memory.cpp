@@ -69,9 +69,9 @@ constexpr int      PAGE_TABLE_POOL_ENTRIES =
     static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
 constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 1ull * 1024ull * 1024ull * 1024ull;
 
-static uint64_t                      g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
-static bool                          g_flexible_memory_size_frozen = false;
-static Graphics::RenderContext*       g_gpu_resources               = nullptr;
+static uint64_t                 g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
+static bool                     g_flexible_memory_size_frozen = false;
+static Graphics::RenderContext* g_gpu_resources               = nullptr;
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static void (*g_test_gpu_range)(bool, uint64_t, size_t) = nullptr;
 #endif
@@ -177,8 +177,8 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t        g_test_backing_store_unmaps_before_failure = UINT32_MAX;
-static callback_func_t g_test_before_backing_map                   = nullptr;
-static callback_func_t g_test_backing_read                         = nullptr;
+static callback_func_t g_test_before_backing_map                  = nullptr;
+static callback_func_t g_test_backing_read                        = nullptr;
 #endif
 
 #include "memoryAddressSpace.inc"
@@ -268,7 +268,6 @@ public:
 			return true;
 		}
 		auto removed = RemoveUnlocked(start, size);
-		MergeUnlocked();
 		return removed;
 	}
 
@@ -303,17 +302,17 @@ public:
 		return true;
 	}
 
-	bool ReplaceSpan(uint64_t start, uint64_t size, VirtualRangeType expected_type,
-	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
-	                 const char* name, bool disallow_merge = false) {
+	bool ReplaceSpan(uint64_t start, uint64_t size, VirtualRangeType expected_type, uint64_t offset,
+	                 int protection, int memory_type, VirtualRangeType type, const char* name,
+	                 bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
 		}
 
-		auto current = start;
-		const auto end = start + size;
+		auto       current = start;
+		const auto end     = start + size;
 		while (current < end) {
 			const Range* candidate = nullptr;
 			for (const auto& r: m_ranges) {
@@ -345,8 +344,8 @@ public:
 		replacement.disallow_merge = disallow_merge;
 		CopyVirtualRangeName(replacement.name, name);
 		RemoveUnlocked(start, size);
-		auto position = LowerBound(start);
-		const auto index = static_cast<size_t>(position - m_ranges.begin());
+		auto       position = LowerBound(start);
+		const auto index    = static_cast<size_t>(position - m_ranges.begin());
 		m_ranges.insert(position, replacement);
 		MergeAroundUnlocked(index);
 		return true;
@@ -530,6 +529,63 @@ private:
 		    [](const Range& range, uint64_t value) { return range.start < value; });
 	}
 
+	std::pair<size_t, size_t> OverlapSliceUnlocked(uint64_t start, uint64_t size) {
+		const auto end = End(start, size);
+
+		auto first = std::upper_bound(
+		    m_ranges.begin(), m_ranges.end(), start,
+		    [](uint64_t value, const Range& range) { return value < range.start; });
+
+		if (first != m_ranges.begin()) {
+			const auto& previous = *std::prev(first);
+			if (End(previous.start, previous.size) > start) {
+				--first;
+			}
+		}
+
+		auto last =
+		    std::lower_bound(first, m_ranges.end(), end, [](const Range& range, uint64_t value) {
+			    return range.start < value;
+		    });
+
+		return {static_cast<size_t>(first - m_ranges.begin()),
+		        static_cast<size_t>(last - m_ranges.begin())};
+	}
+
+	void ReplaceSliceUnlocked(size_t first, size_t last, const std::vector<Range>& pieces) {
+		const size_t old_count = last - first;
+		const size_t common    = std::min(old_count, pieces.size());
+
+		std::copy_n(pieces.begin(), common, m_ranges.begin() + static_cast<std::ptrdiff_t>(first));
+
+		if (pieces.size() > old_count) {
+			m_ranges.insert(m_ranges.begin() + static_cast<std::ptrdiff_t>(first + old_count),
+			                pieces.begin() + static_cast<std::ptrdiff_t>(common), pieces.end());
+		} else if (pieces.size() < old_count) {
+			m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(first + common),
+			               m_ranges.begin() + static_cast<std::ptrdiff_t>(last));
+		}
+
+		MergeSliceUnlocked(first, first + pieces.size());
+	}
+
+	void MergeSliceUnlocked(size_t first, size_t last) {
+		size_t index = (first > 0 ? first - 1 : 0);
+		size_t stop  = std::min(last + 1, m_ranges.size());
+
+		while (index + 1 < stop) {
+			auto& current = m_ranges[index];
+			auto& next    = m_ranges[index + 1];
+			if (End(current.start, current.size) == next.start && SameMergeKey(current, next)) {
+				current.size += next.size;
+				m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index + 1));
+				stop--;
+			} else {
+				index++;
+			}
+		}
+	}
+
 	void MergeAroundUnlocked(size_t index) {
 		if (index >= m_ranges.size()) {
 			return;
@@ -561,20 +617,21 @@ private:
 			return;
 		}
 
-		std::vector<Range> out;
-		auto               edit_end = End(start, size);
+		const auto edit_end      = End(start, size);
+		const auto [first, last] = OverlapSliceUnlocked(start, size);
+		if (first == last) {
+			return;
+		}
 
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
+		std::vector<Range> pieces;
+		pieces.reserve(last - first + 2);
+		for (size_t index = first; index < last; index++) {
+			const Range& r         = m_ranges[index];
+			const auto   r_end     = End(r.start, r.size);
+			const auto   mid_start = std::max(start, r.start);
+			const auto   mid_end   = std::min(edit_end, r_end);
 
-			auto mid_start = std::max(start, r.start);
-			auto mid_end   = std::min(edit_end, r_end);
-
-			AddPiece(&out, r, r.start, mid_start);
+			AddPiece(&pieces, r, r.start, mid_start);
 
 			Range mid = r;
 			mid.start = mid_start;
@@ -583,13 +640,12 @@ private:
 				mid.offset += mid_start - r.start;
 			}
 			edit(&mid);
-			out.push_back(mid);
+			pieces.push_back(mid);
 
-			AddPiece(&out, r, mid_end, r_end);
+			AddPiece(&pieces, r, mid_end, r_end);
 		}
 
-		m_ranges = out;
-		MergeUnlocked();
+		ReplaceSliceUnlocked(first, last, pieces);
 	}
 
 	bool RemoveUnlocked(uint64_t start, uint64_t size) {
@@ -597,46 +653,23 @@ private:
 			return false;
 		}
 
-		std::vector<Range> out;
-		bool               removed = false;
-		auto               rem_end = End(start, size);
-
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
-
-			removed = true;
-			AddPiece(&out, r, r.start, std::max(start, r.start));
-			AddPiece(&out, r, std::min(rem_end, r_end), r_end);
+		const auto rem_end       = End(start, size);
+		const auto [first, last] = OverlapSliceUnlocked(start, size);
+		if (first == last) {
+			return false;
 		}
 
-		m_ranges = out;
-		return removed;
-	}
+		const Range head = m_ranges[first];
+		const Range tail = m_ranges[last - 1];
 
-	void MergeUnlocked() {
-		if (m_ranges.size() < 2) {
-			return;
-		}
+		std::vector<Range> pieces;
+		pieces.reserve(2);
+		AddPiece(&pieces, head, head.start, std::max(start, head.start));
+		AddPiece(&pieces, tail, std::min(rem_end, End(tail.start, tail.size)),
+		         End(tail.start, tail.size));
 
-		std::sort(m_ranges.begin(), m_ranges.end(),
-		          [](const Range& left, const Range& right) { return left.start < right.start; });
-
-		std::vector<Range> merged;
-		for (const auto& r: m_ranges) {
-			if (!merged.empty()) {
-				auto& last = merged[merged.size() - 1];
-				if (End(last.start, last.size) == r.start && SameMergeKey(last, r)) {
-					last.size += r.size;
-					continue;
-				}
-			}
-			merged.push_back(r);
-		}
-		m_ranges = merged;
+		ReplaceSliceUnlocked(first, last, pieces);
+		return true;
 	}
 
 	Range* FindOverlap(uint64_t start, uint64_t size) {
@@ -1127,15 +1160,15 @@ bool PhysicalMemory::Alloc(uint64_t search_start, uint64_t search_end, size_t le
 		}
 
 		AllocatedBlock b {};
-		b.size           = len;
-		b.start_addr     = free_pos;
-		b.gpu_mode       = GpuAccessMode::NoAccess;
-		b.map_size       = 0;
-		b.map_vaddr      = 0;
-		b.prot           = 0;
-		b.mode           = VirtualMemory::Mode::NoAccess;
-		b.memory_type    = memory_type;
-		b.kind           = kind;
+		b.size        = len;
+		b.start_addr  = free_pos;
+		b.gpu_mode    = GpuAccessMode::NoAccess;
+		b.map_size    = 0;
+		b.map_vaddr   = 0;
+		b.prot        = 0;
+		b.mode        = VirtualMemory::Mode::NoAccess;
+		b.memory_type = memory_type;
+		b.kind        = kind;
 
 		RemoveFreeRange(m_free, free_pos, len);
 		EXIT_IF(!m_physical.emplace(b.start_addr, b).second);
@@ -1389,7 +1422,7 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int pro
 	if (next == m_physical.begin()) {
 		return false;
 	}
-	auto first = std::prev(next);
+	auto first         = std::prev(next);
 	bool has_automatic = false;
 	while (current < phys_addr + len) {
 		auto block = m_physical.upper_bound(current);
@@ -1569,8 +1602,8 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 			right.size      = b.map_vaddr + b.map_size - (vaddr + size);
 			right.map_size  = right.size;
 			right.map_vaddr = vaddr + size;
-			b.size     = vaddr - b.map_vaddr;
-			b.map_size = b.size;
+			b.size          = vaddr - b.map_vaddr;
+			b.map_size      = b.size;
 			m_mappings.push_back(right);
 		} else if (vaddr == b.map_vaddr) {
 			b.start_addr += size;
@@ -2363,14 +2396,13 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 		return KERNEL_ERROR_ENOMEM;
 	}
 
-	const bool published = reserved_target
-	                           ? g_virtual_ranges->ReplaceSpan(
-	                                 out_addr, len, VirtualRangeType::Reserved, 0, prot, 0,
-	                                 VirtualRangeType::Flexible, name,
-	                                 (map_flags & GUEST_MAP_NO_COALESCE) != 0)
-	                           : g_virtual_ranges->Add(out_addr, len, 0, prot, 0,
-	                                                   VirtualRangeType::Flexible, name,
-	                                                   (map_flags & GUEST_MAP_NO_COALESCE) != 0);
+	const bool published =
+	    reserved_target
+	        ? g_virtual_ranges->ReplaceSpan(out_addr, len, VirtualRangeType::Reserved, 0, prot, 0,
+	                                        VirtualRangeType::Flexible, name,
+	                                        (map_flags & GUEST_MAP_NO_COALESCE) != 0)
+	        : g_virtual_ranges->Add(out_addr, len, 0, prot, 0, VirtualRangeType::Flexible, name,
+	                                (map_flags & GUEST_MAP_NO_COALESCE) != 0);
 	if (!published) {
 		GpuAccessMode rollback_gpu_mode = GpuAccessMode::NoAccess;
 		EXIT_IF(!g_flexible_memory->Unmap(out_addr, len, &rollback_gpu_mode));
@@ -2636,8 +2668,8 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 
 static bool IsAmmMemoryRange(uint64_t vaddr, size_t size) {
 	constexpr uint64_t page_size = 0x4000;
-	return size != 0 && ((vaddr | size) & (page_size - 1)) == 0 &&
-	       vaddr >= kExtendedMemoryBase && vaddr < kExtendedMemoryBase + kExtendedMemorySize &&
+	return size != 0 && ((vaddr | size) & (page_size - 1)) == 0 && vaddr >= kExtendedMemoryBase &&
+	       vaddr < kExtendedMemoryBase + kExtendedMemorySize &&
 	       size <= kExtendedMemoryBase + kExtendedMemorySize - vaddr;
 }
 
@@ -2650,9 +2682,9 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size) {
 		VirtualRanges::Range range {};
 		// AMM unmap accepts holes, including a completely unmapped range.
 		if (!g_virtual_ranges->Query(vaddr, 1, &range) || range.start >= end) break;
-		vaddr = std::max(vaddr, range.start);
-		const auto chunk = std::min(end, range.start + range.size) - vaddr;
-		const int result = UnmapMemoryRange(range, vaddr, chunk);
+		vaddr             = std::max(vaddr, range.start);
+		const auto chunk  = std::min(end, range.start + range.size) - vaddr;
+		const int  result = UnmapMemoryRange(range, vaddr, chunk);
 		if (result != OK) return result;
 		vaddr += chunk;
 	}
@@ -2843,7 +2875,7 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	uint64_t addr = 0;
+	uint64_t   addr = 0;
 	const auto kind = automatic ? PhysicalMemory::AllocationKind::Automatic
 	                            : PhysicalMemory::AllocationKind::Direct;
 	if (!g_physical_memory->Alloc(search_start, search_end, len, alignment, &addr, memory_type,
@@ -2939,10 +2971,9 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 		GpuAccessMode alias_gpu_mode = GpuAccessMode::NoAccess;
 		if (!g_physical_memory->Unmap(alias.map_vaddr, alias.map_size, &alias_gpu_mode)) {
 			for (const auto& removed: metadata_unmapped) {
-				EXIT_IF(!g_physical_memory->Map(removed.map_vaddr, removed.start_addr,
-				                                removed.map_size, removed.prot, removed.mode,
-				                                removed.gpu_mode, removed.name,
-				                                removed.memory_type));
+				EXIT_IF(!g_physical_memory->Map(
+				    removed.map_vaddr, removed.start_addr, removed.map_size, removed.prot,
+				    removed.mode, removed.gpu_mode, removed.name, removed.memory_type));
 			}
 			restore_owner_aliases(owner_unmapped);
 			restore_gpu_aliases();
@@ -3066,9 +3097,8 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 				EXIT_IF(!g_guest_address_space->MapBacking(old.map_vaddr, old.map_size,
 				                                           old.start_addr, old.mode));
 			}
-			EXIT_IF(!g_physical_memory->Map(old.map_vaddr, old.start_addr, old.map_size,
-			                               old.prot, old.mode, old.gpu_mode, old.name,
-			                               old.memory_type));
+			EXIT_IF(!g_physical_memory->Map(old.map_vaddr, old.start_addr, old.map_size, old.prot,
+			                                old.mode, old.gpu_mode, old.name, old.memory_type));
 		}
 		MapGpuRange(in_addr, len);
 	};
@@ -3084,9 +3114,8 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		std::vector<VirtualRanges::Range> reserved_ranges;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		if (g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&
-		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
-			    return range.type == VirtualRangeType::Direct;
-		    })) {
+		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(),
+		                [](const auto& range) { return range.type == VirtualRangeType::Direct; })) {
 			uint64_t covered = 0;
 			{
 				Common::LockGuard lock(g_physical_memory->GetMutex());
@@ -3109,7 +3138,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 			}
 			UnmapGpuRange(in_addr, len);
 			for (size_t index = 0; index < replaced_mappings.size(); ++index) {
-				const auto& old = replaced_mappings[index];
+				const auto&   old          = replaced_mappings[index];
 				GpuAccessMode old_gpu_mode = GpuAccessMode::NoAccess;
 				if (!g_physical_memory->Unmap(old.map_vaddr, old.map_size, &old_gpu_mode)) {
 					restore_mappings(index, false);
@@ -3211,16 +3240,14 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		return KERNEL_ERROR_EBUSY;
 	}
 
-	const bool published = !replaced_mappings.empty() || reserved_target
-	                           ? g_virtual_ranges->ReplaceSpan(
-	                                 out_addr, len, replaced_mappings.empty()
-	                                                    ? VirtualRangeType::Reserved
-	                                                    : VirtualRangeType::Direct,
-	                                 direct_memory_start,
-	                                 prot, memory_type, VirtualRangeType::Direct, name)
-	                           : g_virtual_ranges->Add(out_addr, len, direct_memory_start, prot,
-	                                                   memory_type,
-	                                                   VirtualRangeType::Direct, name);
+	const bool published =
+	    !replaced_mappings.empty() || reserved_target
+	        ? g_virtual_ranges->ReplaceSpan(
+	              out_addr, len,
+	              replaced_mappings.empty() ? VirtualRangeType::Reserved : VirtualRangeType::Direct,
+	              direct_memory_start, prot, memory_type, VirtualRangeType::Direct, name)
+	        : g_virtual_ranges->Add(out_addr, len, direct_memory_start, prot, memory_type,
+	                                VirtualRangeType::Direct, name);
 	if (!published) {
 		GpuAccessMode rollback_gpu_mode = GpuAccessMode::NoAccess;
 		EXIT_IF(!g_physical_memory->Unmap(out_addr, len, &rollback_gpu_mode));
@@ -3650,15 +3677,15 @@ uint64_t TestGuestBackingSize() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool TestWindowsBackingViewModes() {
 	constexpr uint64_t size = 0x10000;
-	GuestBackingStore backing(size);
-	void* placeholder = VirtualAlloc2(GetCurrentProcess(), nullptr, size,
-	                                  MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
-	                                  nullptr, 0);
+	GuestBackingStore  backing(size);
+	void*              placeholder =
+	    VirtualAlloc2(GetCurrentProcess(), nullptr, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+	                  PAGE_NOACCESS, nullptr, 0);
 	if (placeholder == nullptr) {
 		return false;
 	}
 	const auto address = reinterpret_cast<uint64_t>(placeholder);
-	bool valid = true;
+	bool       valid   = true;
 	for (auto [mode, protection]: std::array {
 	         std::pair {VirtualMemory::Mode::NoAccess, DWORD {PAGE_NOACCESS}},
 	         std::pair {VirtualMemory::Mode::Read, DWORD {PAGE_READONLY}},
@@ -3669,8 +3696,8 @@ bool TestWindowsBackingViewModes() {
 			break;
 		}
 		MEMORY_BASIC_INFORMATION info {};
-		valid = VirtualQuery(placeholder, &info, sizeof(info)) != 0 &&
-		        info.Type == MEM_MAPPED && info.Protect == protection && valid;
+		valid = VirtualQuery(placeholder, &info, sizeof(info)) != 0 && info.Type == MEM_MAPPED &&
+		        info.Protect == protection && valid;
 		EXIT_IF(!backing.Unmap(address, size));
 	}
 	return VirtualFree(placeholder, 0, MEM_RELEASE) != 0 && valid;
