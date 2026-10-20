@@ -45,6 +45,12 @@ void Initialize();
 void Shutdown();
 void EmergencyShutdown();
 
+enum class DescriptorKind : uint8_t { None, File, Socket };
+
+int            ReserveDescriptor(DescriptorKind kind, int max);
+void           ReleaseDescriptor(int d, DescriptorKind kind);
+DescriptorKind GetDescriptorKind(int d);
+
 struct Lifecycle {
 	static constexpr const char* name        = "FileSystem";
 	static constexpr auto        initialize  = Libs::LibKernel::FileSystem::Initialize;

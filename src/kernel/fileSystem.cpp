@@ -100,6 +100,49 @@ private:
 static MountPoints*     g_mount_points = nullptr;
 static FileDescriptors* g_files        = nullptr;
 
+static Common::Mutex g_descriptor_mutex;
+// Indexed by descriptor number; the standard streams are never handed out.
+static std::vector<DescriptorKind> g_descriptor_kinds(DESCRIPTOR_MIN, DescriptorKind::None);
+
+int ReserveDescriptor(DescriptorKind kind, int max) {
+	EXIT_IF(kind == DescriptorKind::None || max <= DESCRIPTOR_MIN);
+
+	Common::LockGuard lock(g_descriptor_mutex);
+
+	// The lowest number freed earlier.
+	const auto limit = std::min(g_descriptor_kinds.size(), static_cast<size_t>(max));
+	for (size_t index = DESCRIPTOR_MIN; index < limit; index++) {
+		if (g_descriptor_kinds[index] == DescriptorKind::None) {
+			g_descriptor_kinds[index] = kind;
+			return static_cast<int>(index);
+		}
+	}
+
+	// Otherwise the next number past the end.
+	if (g_descriptor_kinds.size() >= static_cast<size_t>(max)) {
+		return -1;
+	}
+	g_descriptor_kinds.emplace_back(kind);
+	return static_cast<int>(g_descriptor_kinds.size() - 1);
+}
+
+void ReleaseDescriptor(int d, DescriptorKind kind) {
+	Common::LockGuard lock(g_descriptor_mutex);
+
+	const auto index = static_cast<size_t>(d);
+	EXIT_IF(d < 0 || index >= g_descriptor_kinds.size() || g_descriptor_kinds[index] != kind);
+
+	g_descriptor_kinds[index] = DescriptorKind::None;
+}
+
+DescriptorKind GetDescriptorKind(int d) {
+	Common::LockGuard lock(g_descriptor_mutex);
+
+	const auto index = static_cast<size_t>(d);
+	return (d >= 0 && index < g_descriptor_kinds.size() ? g_descriptor_kinds[index]
+	                                                    : DescriptorKind::None);
+}
+
 static bool IsRandomDevice(const std::string& path) {
 	return path == "/dev/random" || path == "/dev/urandom";
 }
@@ -187,16 +230,17 @@ int FileDescriptors::CreateDescriptor() {
 	file->sync_writes = false;
 	file->special     = SpecialFile::None;
 
-	int files_num = static_cast<int>(m_files.size());
-	for (int index = 0; index < files_num; index++) {
-		if (m_files[index] == nullptr) {
-			m_files[index] = file;
-			return index + DESCRIPTOR_MIN;
-		}
-	}
+	const int d = ReserveDescriptor(DescriptorKind::File, INT_MAX);
+	EXIT_IF(d < 0);
 
-	m_files.push_back(file);
-	return static_cast<int>(m_files.size()) + DESCRIPTOR_MIN - 1;
+	const auto index = static_cast<size_t>(d - DESCRIPTOR_MIN);
+	if (index >= m_files.size()) {
+		m_files.resize(index + 1, nullptr);
+	}
+	EXIT_IF(m_files[index] != nullptr);
+
+	m_files[index] = file;
+	return d;
 }
 
 void FileDescriptors::DeleteDescriptor(int d) {
@@ -215,6 +259,7 @@ void FileDescriptors::DeleteDescriptor(int d) {
 
 	delete m_files[index];
 	m_files[index] = nullptr;
+	ReleaseDescriptor(d, DescriptorKind::File);
 }
 
 File* FileDescriptors::GetFile(int d) {
@@ -244,13 +289,15 @@ File* FileDescriptors::GetFile(const std::filesystem::path& real_name) {
 void FileDescriptors::CloseAll() {
 	Common::LockGuard lock(m_mutex);
 
-	for (auto& f: m_files) {
+	for (size_t index = 0; index < m_files.size(); index++) {
+		auto& f = m_files[index];
 		if (f != nullptr) {
 			if (f->opened) {
 				f->f.Close();
 			}
 			delete f;
 			f = nullptr;
+			ReleaseDescriptor(static_cast<int>(index) + DESCRIPTOR_MIN, DescriptorKind::File);
 		}
 	}
 }
@@ -570,7 +617,7 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 		return KERNEL_ERROR_EPERM;
 	}
 
-	if (::Libs::Network::Net::IsSocket(d)) {
+	if (GetDescriptorKind(d) == DescriptorKind::Socket) {
 		const auto result = ::Libs::Network::Net::SocketClose(d);
 		return (result == OK ? OK : PosixToKernel(::Libs::Network::NetToPosix(result)));
 	}
@@ -603,6 +650,15 @@ int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
 		return KERNEL_ERROR_EBADF;
 	}
 
+	if (GetDescriptorKind(d) == DescriptorKind::Socket) {
+		// The guest never execs, so FD_CLOEXEC has no effect on a socket and is not kept.
+		switch (command) {
+			case 1: return 0;  // F_GETFD
+			case 2: return OK; // F_SETFD
+			default: return KERNEL_ERROR_EINVAL;
+		}
+	}
+
 	auto* file = g_files->GetFile(d);
 	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
@@ -628,7 +684,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		return KERNEL_ERROR_EFAULT;
 	}
 
-	if (::Libs::Network::Net::IsSocket(d)) {
+	if (GetDescriptorKind(d) == DescriptorKind::Socket) {
 		const auto result = ::Libs::Network::Net::Recv(d, buf, nbytes, 0);
 		return (result >= 0 ? result : PosixToKernel(*Posix::GetErrorAddr()));
 	}
@@ -708,7 +764,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	if (::Libs::Network::Net::IsSocket(d)) {
+	if (GetDescriptorKind(d) == DescriptorKind::Socket) {
 		const auto result = ::Libs::Network::Net::Send(d, buf, nbytes, 0);
 		return (result >= 0 ? result : PosixToKernel(*Posix::GetErrorAddr()));
 	}
@@ -854,7 +910,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 	if (d < DESCRIPTOR_MIN) {
 		return KERNEL_ERROR_EBADF;
 	}
-	if (::Libs::Network::Net::IsSocket(d)) {
+	if (GetDescriptorKind(d) == DescriptorKind::Socket) {
 		return KERNEL_ERROR_ESPIPE;
 	}
 	auto* file = g_files->GetFile(d);
@@ -981,7 +1037,7 @@ static int64_t Writev(int d, const KernelIovec* iov, int iovcnt, std::optional<i
 	if (d < DESCRIPTOR_MIN) {
 		return KERNEL_ERROR_EBADF;
 	}
-	if (::Libs::Network::Net::IsSocket(d)) {
+	if (GetDescriptorKind(d) == DescriptorKind::Socket) {
 		return KERNEL_ERROR_ESPIPE;
 	}
 	auto* file = g_files->GetFile(d);
@@ -1055,6 +1111,10 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 
 	if (d < DESCRIPTOR_MIN) {
 		return KERNEL_ERROR_EBADF;
+	}
+
+	if (GetDescriptorKind(d) == DescriptorKind::Socket) {
+		return KERNEL_ERROR_ESPIPE;
 	}
 
 	auto* file = g_files->GetFile(d);
@@ -1170,6 +1230,14 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 
 	if (sb == nullptr) {
 		return KERNEL_ERROR_EFAULT;
+	}
+
+	if (GetDescriptorKind(d) == DescriptorKind::Socket) {
+		FileStat stat {};
+		stat.st_mode    = 0140666u; // S_IFSOCK
+		stat.st_blksize = 512;
+		*sb             = stat;
+		return OK;
 	}
 
 	auto* file = g_files->GetFile(d);
@@ -1297,7 +1365,7 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	if (::Libs::Network::Net::IsSocket(d)) {
+	if (GetDescriptorKind(d) == DescriptorKind::Socket) {
 		return KERNEL_ERROR_EINVAL;
 	}
 

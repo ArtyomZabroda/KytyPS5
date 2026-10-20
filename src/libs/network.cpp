@@ -30,6 +30,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -913,7 +914,6 @@ struct NetTimeval {
 	int64_t tv_usec;
 };
 
-static constexpr int                         SOCKET_FD_MIN = 128;
 static constexpr int                         SOCKET_FD_MAX = 1024;
 static Common::Mutex                         g_socket_mutex;
 static std::array<SocketSlot, SOCKET_FD_MAX> g_sockets;
@@ -1268,23 +1268,27 @@ static bool TakeSocketBackend(int guest_fd, SocketSlot* out) {
 
 	*out = std::move(slot);
 	slot = {};
+	LibKernel::FileSystem::ReleaseDescriptor(guest_fd,
+	                                         LibKernel::FileSystem::DescriptorKind::Socket);
 	return true;
 }
 
 static int AllocSocketFd(const std::shared_ptr<SocketTransport>& transport, bool p2p = false) {
 	Common::LockGuard lock(g_socket_mutex);
-	for (int fd = SOCKET_FD_MIN; fd < SOCKET_FD_MAX; fd++) {
-		auto& slot = g_sockets[static_cast<size_t>(fd)];
-		if (!slot.transport) {
-			slot.transport = transport;
-			if (p2p) {
-				slot.p2p.emplace();
-			}
-			return fd;
-		}
+	// The number comes from the descriptor table shared with files, so no file holds it.
+	const int fd = LibKernel::FileSystem::ReserveDescriptor(
+	    LibKernel::FileSystem::DescriptorKind::Socket, SOCKET_FD_MAX);
+	if (fd < 0) {
+		return -1;
 	}
 
-	return -1;
+	auto& slot = g_sockets[static_cast<size_t>(fd)];
+	EXIT_IF(slot.transport);
+	slot.transport = transport;
+	if (p2p) {
+		slot.p2p.emplace();
+	}
+	return fd;
 }
 
 static int SelectSockets(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds,
@@ -2577,7 +2581,15 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	FD_ZERO(&host_write);
 	FD_ZERO(&host_except);
 
-	std::vector<std::pair<int, NativeSocket>> descriptors;
+	struct ReadyFileDescriptor {
+		int  fd;
+		bool read;
+		bool write;
+		bool except;
+	};
+
+	std::vector<std::pair<int, NativeSocket>>     descriptors;
+	std::vector<ReadyFileDescriptor>              file_descriptors;
 	std::vector<std::shared_ptr<SocketTransport>> stream_reads;
 	int                                           host_nfds = 0;
 	for (int fd = 0; fd < nfds; fd++) {
@@ -2589,14 +2601,21 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		}
 		NativeSocket                     socket = INVALID_NATIVE_SOCKET;
 		std::shared_ptr<SocketTransport> transport;
+
 #if !defined(_WIN32)
 		if (fd < 3) {
 			socket = fd;
 		} else
 #endif
-		if (!GetSocketBackend(fd, &socket, nullptr, &transport)) {
+		    if (LibKernel::FileSystem::GetDescriptorKind(fd) ==
+		        LibKernel::FileSystem::DescriptorKind::File) {
+			// Regular files and directories are always ready.
+			file_descriptors.push_back({fd, read, write, except});
+			continue;
+		} else if (!GetSocketBackend(fd, &socket, nullptr, &transport)) {
 			return -1;
 		}
+		descriptors.emplace_back(fd, socket);
 
 #if defined(_WIN32)
 		if ((read && host_read.fd_count == FD_SETSIZE) ||
@@ -2610,7 +2629,6 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		}
 		host_nfds = std::max(host_nfds, socket + 1);
 #endif
-		descriptors.emplace_back(fd, socket);
 		if (read) {
 			FD_SET(socket, &host_read);
 #if defined(_WIN32)
@@ -2641,13 +2659,11 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	}
 
 	int result = 0;
-#if defined(_WIN32)
-	if (descriptors.empty()) {
-		Sleep(host_timeout_ptr == nullptr ? INFINITE :
-		      static_cast<DWORD>(host_timeout.tv_sec * 1000 + host_timeout.tv_usec / 1000));
-	} else
-#endif
-	{
+	if (!descriptors.empty()) {
+		if (!file_descriptors.empty()) {
+			host_timeout     = {}; // files are already ready, no need to wait for sockets
+			host_timeout_ptr = &host_timeout;
+		}
 		result = SelectSockets(host_nfds, readfds != nullptr ? &host_read : nullptr,
 		                       writefds != nullptr ? &host_write : nullptr,
 		                       exceptfds != nullptr ? &host_except : nullptr, host_timeout_ptr,
@@ -2656,11 +2672,32 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 			return SetHostSocketError();
 		}
 	}
+#if defined(_WIN32)
+	else if (file_descriptors.empty()) {
+		Sleep(host_timeout_ptr == nullptr
+		          ? INFINITE
+		          : static_cast<DWORD>(host_timeout.tv_sec * 1000 + host_timeout.tv_usec / 1000));
+	}
+#endif
 
 	GuestFdZero(readfds, nfds);
 	GuestFdZero(writefds, nfds);
 	GuestFdZero(exceptfds, nfds);
 	result = 0;
+	for (ReadyFileDescriptor rfd: file_descriptors) {
+		if (rfd.read) {
+			GuestFdSet(readfds, rfd.fd);
+			result++;
+		}
+		if (rfd.write) {
+			GuestFdSet(writefds, rfd.fd);
+			result++;
+		}
+		if (rfd.except) {
+			GuestFdSet(exceptfds, rfd.fd);
+			result++;
+		}
+	}
 	for (const auto& [fd, socket]: descriptors) {
 		if (FD_ISSET(socket, &host_read)) {
 			GuestFdSet(readfds, fd);
