@@ -355,7 +355,9 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
-	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
+	    storage ||
+	            resource.depth_read_conversion != ShaderRecompiler::IR::DepthReadConversion::None ||
+	            surface_format.conversion_format != Prospero::BufferFormat::kInvalid
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
 	switch (resource.dimension) {
@@ -518,8 +520,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
 	const bool sampled_numeric_class =
-	    storage || resource.numeric_class ==
-	                   Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+	    storage ||
+	    resource.depth_read_conversion != ShaderRecompiler::IR::DepthReadConversion::None ||
+	    resource.numeric_class ==
+	        Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
 		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
@@ -533,8 +537,30 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto image_layers = layered ? depth : 1u;
 	auto       view_base    = static_cast<uint32_t>(base_level);
 	auto       pixel_format = surface_format.vk_format;
-	if (resource.depth_compare) {
-		if (const auto* depth_format = FindGuestDepthFormatPolicy(format)) {
+
+	// A float read of an existing depth image requests the depth format. Deciding by the guest
+	// format alone would recreate a color texture with the same format as depth. Depth images are
+	// never volumes, so a 3D read keeps replacing the depth image with a color one.
+	const auto* float_depth_policy =
+	    storage || volume ? nullptr : FindGuestDepthFormatPolicy(format);
+	const bool reads_depth_image =
+	    float_depth_policy != nullptr &&
+	    texture_cache.DepthImageBytesPerBlock(address) == float_depth_policy->bytes_per_element;
+	if (resource.depth_compare ||
+	    resource.depth_read_conversion != ShaderRecompiler::IR::DepthReadConversion::None ||
+	    reads_depth_image) {
+		Prospero::BufferFormat guest = Prospero::BufferFormat::kInvalid;
+		switch (resource.depth_read_conversion) {
+			case ShaderRecompiler::IR::DepthReadConversion::DepthAsUInt16:
+				guest = Prospero::BufferFormat::k16UNorm;
+				break;
+			case ShaderRecompiler::IR::DepthReadConversion::DepthAsUInt32:
+				guest = Prospero::BufferFormat::k32Float;
+				break;
+			case ShaderRecompiler::IR::DepthReadConversion::None: guest = format; break;
+		}
+
+		if (const auto* depth_format = FindGuestDepthFormatPolicy(guest)) {
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
@@ -611,6 +637,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
+
+	if (resource.depth_read_conversion != ShaderRecompiler::IR::DepthReadConversion::None) {
+		const uint32_t expected = resource.depth_read_conversion ==
+		                                  ShaderRecompiler::IR::DepthReadConversion::DepthAsUInt16
+		                              ? 2u
+		                              : 4u;
+		if (!image->info.IsDepth() || image->info.bytes_per_block != expected) {
+			EXIT("depth read conversion does not match the bound image: addr=0x%016" PRIx64
+			     " depth=%d bytes=%u expected=%u\n",
+			     address, image->info.IsDepth(), image->info.bytes_per_block, expected);
+		}
+	}
+
 	return {id, nullptr, std::move(desc)};
 }
 

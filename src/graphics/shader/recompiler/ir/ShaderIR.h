@@ -147,6 +147,8 @@ enum class ImageMipMode { None, Dynamic };
 
 constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
+enum class DepthReadConversion : uint8_t { None, DepthAsUInt16, DepthAsUInt32 };
+
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
 
@@ -172,6 +174,7 @@ struct ImageResource {
 	uint32_t                      indirect_mapping_offset    = 0;
 	uint32_t                      indirect_search_iterations = 0;
 	std::vector<uint32_t>         indirect_resources;
+	DepthReadConversion           depth_read_conversion = DepthReadConversion::None;
 
 	bool operator==(const ImageResource& other) const = default;
 };

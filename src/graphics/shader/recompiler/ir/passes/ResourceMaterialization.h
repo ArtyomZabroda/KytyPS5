@@ -32,6 +32,7 @@ struct ResourceSpecialization {
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
 		bool                          operator==(const Image&) const = default;
+		DepthReadConversion           depth_read_conversion          = DepthReadConversion::None;
 	};
 
 	struct Sampler {
@@ -48,13 +49,20 @@ struct ResourceSpecialization {
 	bool operator==(const ResourceSpecialization&) const = default;
 };
 
+// Host renderer state that selects a shader permutation but is not part of guest memory.
+struct HostResourceQueries {
+	uint32_t (*depth_image_bytes_per_block)(void* context, uint64_t address) = nullptr;
+	void* context                                                            = nullptr;
+};
+
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          const HostResourceQueries& host_resource_queries = {});
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

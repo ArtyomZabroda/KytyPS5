@@ -410,6 +410,10 @@ uint32_t ExtractPackedImageComponent(EmitterState& state, const Format::BufferFo
 }
 
 uint32_t ImageGatherSource(const EmitterState& state, const IR::MemoryInfo& mem) {
+	if (state.program.info.images[mem.resource].depth_read_conversion !=
+	    ShaderRecompiler::IR::DepthReadConversion::None)
+		return 0u;
+
 	const auto component = ImageGatherComponent(mem.dmask);
 	const auto info      = ImageConversionFormat(state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return component;
@@ -420,6 +424,49 @@ uint32_t ImageGatherSource(const EmitterState& state, const IR::MemoryInfo& mem)
 }
 
 uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
+	auto&       state = ctx.state;
+	const auto& image = state.program.info.images[mem.resource];
+	if (image.depth_read_conversion == ShaderRecompiler::IR::DepthReadConversion::DepthAsUInt16) {
+		// D16 sampled as float [0, 1]; the guest expects the raw 16-bit integer.
+		const auto depth = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), depth, texel, 0u);
+		const auto scaled =
+		    Binary(state, spv::OpFMul, TypeF32(state), depth, ConstantF32Value(state, 65535.0f));
+		const auto rounded = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), rounded, GlslStd450(state),
+		                          GLSLstd450RoundEven, scaled);
+		const auto value = Unary(state, spv::OpConvertFToU, TypeU32(state), rounded);
+		// Swizzle after conversion so that constant 1 stays integer 1.
+		uint32_t selected[4] {};
+		for (uint32_t component = 0; component < 4u; component++) {
+			const auto selector = (image.shader_swizzle >> (component * 3u)) & 7u;
+			selected[component] =
+			    selector == 4u ? value
+			                   : ConstantU32(state, selector == 1u || selector == 7u ? 1u : 0u);
+		}
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), result,
+		                          selected[0], selected[1], selected[2], selected[3]);
+		return result;
+	} else if (image.depth_read_conversion ==
+	           ShaderRecompiler::IR::DepthReadConversion::DepthAsUInt32) {
+		const auto depth = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), depth, texel, 0u);
+		const auto value = Unary(state, spv::OpBitcast, TypeU32(state), depth);
+		// Swizzle after conversion so that constant 1 stays integer 1.
+		uint32_t selected[4] {};
+		for (uint32_t component = 0; component < 4u; component++) {
+			const auto selector = (image.shader_swizzle >> (component * 3u)) & 7u;
+			selected[component] =
+			    selector == 4u ? value
+			                   : ConstantU32(state, selector == 1u || selector == 7u ? 1u : 0u);
+		}
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), result,
+		                          selected[0], selected[1], selected[2], selected[3]);
+		return result;
+	}
+
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
 
@@ -478,6 +525,32 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 }
 
 uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t gathered) {
+	auto&       state = ctx.state;
+	const auto& image = state.program.info.images[mem.resource];
+	if (image.depth_read_conversion != ShaderRecompiler::IR::DepthReadConversion::None) {
+		const auto u32x4    = TypeU32Vector(state, 4);
+		const auto selector = (image.shader_swizzle >> (ImageGatherComponent(mem.dmask) * 3u)) & 7u;
+		if (selector != 4u) {
+			const auto value = ConstantU32(state, selector == 1u || selector == 7u ? 1u : 0u);
+			return state.builder.Constant(spv::OpConstantComposite, u32x4, value, value, value,
+			                              value);
+		}
+		if (image.depth_read_conversion ==
+		    ShaderRecompiler::IR::DepthReadConversion::DepthAsUInt32) {
+			return Unary(state, spv::OpBitcast, u32x4, gathered);
+		}
+
+		const auto f32x4 = TypeF32Vector(state, 4);
+		const auto scale = ConstantF32Value(state, 65535.0f);
+		const auto scales =
+		    state.builder.Constant(spv::OpConstantComposite, f32x4, scale, scale, scale, scale);
+		const auto scaled  = Binary(state, spv::OpFMul, f32x4, gathered, scales);
+		const auto rounded = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, f32x4, rounded, GlslStd450(state),
+		                          GLSLstd450RoundEven, scaled);
+		return Unary(state, spv::OpConvertFToU, u32x4, rounded);
+	}
+
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return gathered;
 
@@ -759,16 +832,24 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 
 template <typename Emit>
 uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit& emit) {
-	auto&       state       = ctx.state;
-	const auto& mem         = ctx.Memory(inst);
-	const auto& image       = state.program.info.images[mem.resource];
-	const bool  gather      = inst.GetOpcode() == IR::ValueOpcode::ImageGatherRaw;
-	const bool  dref        = HasFlag(mem, Decoder::ImageSampleFlagCompare);
-	const bool  scalar      = dref && !gather;
-	const bool  mixed       = std::ranges::any_of(image.indirect_resources, [&](uint32_t resource) {
-		return state.program.info.images[resource].numeric_class != image.numeric_class;
+	auto&       state  = ctx.state;
+	const auto& mem    = ctx.Memory(inst);
+	const auto& image  = state.program.info.images[mem.resource];
+	const bool  gather = inst.GetOpcode() == IR::ValueOpcode::ImageGatherRaw;
+	const bool  dref   = HasFlag(mem, Decoder::ImageSampleFlagCompare);
+	const bool  scalar = dref && !gather;
+
+	const auto result_class = [&](uint32_t resource) {
+		const auto& img = state.program.info.images[resource];
+		if (dref) return Prospero::TextureNumericClass::Float;
+		return img.depth_read_conversion != ShaderRecompiler::IR::DepthReadConversion::None
+		           ? Prospero::TextureNumericClass::Uint
+		           : img.numeric_class;
+	};
+	const bool mixed       = std::ranges::any_of(image.indirect_resources, [&](uint32_t resource) {
+		return result_class(resource) != result_class(mem.resource);
 	});
-	const auto  native_type = [&](uint32_t resource) {
+	const auto native_type = [&](uint32_t resource) {
 		return scalar ? TypeF32(state)
 		              : ImageVectorType(state,
 		                                dref ? Prospero::TextureNumericClass::Float
@@ -783,8 +864,7 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 			               : UnpackImageTexel(ctx, candidate_mem, value);
 		}
 		return ResultVector(ctx, value,
-		                    dref ? Prospero::TextureNumericClass::Float
-		                         : state.program.info.images[resource].numeric_class,
+		                    dref ? Prospero::TextureNumericClass::Float : result_class(resource),
 		                    scalar, candidate_mem, gather);
 	};
 	// RDNA returns register bits. Convert per typed run only when the join mixes

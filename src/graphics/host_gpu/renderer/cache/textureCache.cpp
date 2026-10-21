@@ -1329,6 +1329,21 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	return selected;
 }
 
+uint32_t TextureCache::DepthImageBytesPerBlock(uint64_t address) {
+	if (!GuestRange {address, 1}.Valid()) {
+		return 0;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, 1, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image != nullptr && image->registered && image->info.data.address == address &&
+		    image->info.IsDepth()) {
+			return image->info.bytes_per_block;
+		}
+	}
+	return 0;
+}
+
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];

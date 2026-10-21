@@ -22,6 +22,7 @@ struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
 class CommandBuffer;
+class TextureCache;
 
 namespace HW {
 class Context;
@@ -103,7 +104,8 @@ struct ShaderProgram {
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
-	explicit PipelineCache(GraphicContext& graphics);
+	// Without a texture cache, sampled depth images are never read through a depth conversion.
+	explicit PipelineCache(GraphicContext& graphics, TextureCache* texture_cache = nullptr);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();

@@ -1352,6 +1352,144 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
+struct DepthImageQuery {
+  uint64_t address = 0;
+  uint32_t bytes_per_block = 0;
+  uint32_t calls = 0;
+};
+
+uint32_t QueryTestDepthImage(void *context, uint64_t address) {
+  auto &query = *static_cast<DepthImageQuery *>(context);
+  ++query.calls;
+  return address == query.address ? query.bytes_per_block : 0u;
+}
+
+void TestDepthReadConversionSpecialization() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  using N = Libs::Graphics::Prospero::TextureNumericClass;
+  constexpr auto swizzle = Libs::Graphics::DstSel(4, 0, 0, 1);
+  using Type = Libs::Graphics::Prospero::ImageType;
+  using Dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  const auto make_program = [](Type type = Type::kColor2D) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    program.user_data_count = 1u;
+    auto &block = AddValueBlock(program);
+    DescriptorSource image_source;
+    image_source.dword_count = 8u;
+    image_source.dwords.fill(Value(0u));
+    image_source.dwords[0] = Value(0x100u);
+    image_source.dwords[1] =
+        Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))}));
+    image_source.dwords[3] = Value(swizzle | (uint32_t(type) << 28u));
+    program.descriptor_sources.push_back(image_source);
+    DescriptorSource sampler_source;
+    sampler_source.dword_count = 4u;
+    sampler_source.dwords.fill(Value(0u));
+    program.descriptor_sources.push_back(sampler_source);
+    program.info.images.push_back(
+        {.source = 0u,
+         .resource_class = ImageResourceClass::Sampled,
+         .dimension = type == Type::kColor3D ? Dimension::Dim3D : Dimension::Dim2D,
+         .read = true});
+    program.info.samplers.push_back({.source = 1u});
+    program.info.sampled_pairs.push_back({.image = 0, .sampler = 0});
+    return program;
+  };
+  const auto plan = ExtractResourcePlan(make_program());
+
+  std::array<uint32_t, 1> data{};
+  const SrtRuntime runtime{.user_data = data};
+  DepthImageQuery query{.address = 0x100ull << 8u};
+  const HostResourceQueries host{.depth_image_bytes_per_block = QueryTestDepthImage,
+                                 .context = &query};
+
+  struct Case {
+    F format;
+    uint32_t depth_bytes;
+    DepthReadConversion expected;
+    const char *text;
+  };
+  const Case cases[] = {
+      {F::k16UInt, 2u, DepthReadConversion::DepthAsUInt16,
+       "16-bit uint read of a Z16 image did not select DepthAsUInt16"},
+      {F::k32UInt, 4u, DepthReadConversion::DepthAsUInt32,
+       "32-bit uint read of a Z32F image did not select DepthAsUInt32"},
+      {F::k16UInt, 0u, DepthReadConversion::None,
+       "uint read without a depth image selected a depth conversion"},
+      {F::k16UInt, 4u, DepthReadConversion::None,
+       "16-bit uint read of a Z32F image selected a depth conversion"},
+      {F::k32UInt, 2u, DepthReadConversion::None,
+       "32-bit uint read of a Z16 image selected a depth conversion"},
+      {F::k32Float, 4u, DepthReadConversion::None,
+       "float read of a depth image selected a depth conversion"},
+  };
+  ResourceSpecialization depth16;
+  ResourceSpecialization plain16;
+  for (const auto &c : cases) {
+    data[0] = uint32_t(c.format) << 20u;
+    query.bytes_per_block = c.depth_bytes;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization, host),
+          "depth read conversion materialization failed");
+    const auto &image = specialization.images[0];
+    const bool converted = c.expected != DepthReadConversion::None;
+    Check(image.depth_read_conversion == c.expected, c.text);
+    Check(!converted || (image.numeric_class == N::Float && image.shader_swizzle == swizzle),
+          "depth read conversion did not sample float and swizzle in the shader");
+    Check(converted || c.format == F::k32Float || image.numeric_class == N::Uint,
+          "uint read without depth conversion lost its integer class");
+
+    auto specialized = make_program();
+    ApplyResourceSpecialization(specialized, specialization);
+    Check(specialized.info.images[0].depth_read_conversion == c.expected,
+          "depth read conversion was not applied to the native image");
+    // Integer reads always sample unfiltered; a converted depth read must stay unfiltered
+    // although its native image is float.
+    const auto sampler = specialized.info.sampled_pairs[0].sampler;
+    const bool point_filtering = converted || c.format != F::k32Float;
+    Check(specialized.info.samplers[sampler].force_point_filtering == point_filtering,
+          "depth read conversion did not force point filtering on its sampler");
+    const auto binding = DescriptorBindingForImage(specialized.info.images[0]);
+    Check(binding && ImageBindingResourceClass(*binding) == ImageResourceClass::Sampled,
+          "depth read conversion image has no sampled descriptor binding");
+
+    if (c.format == F::k16UInt && c.depth_bytes == 2u) depth16 = specialization;
+    if (c.format == F::k16UInt && c.depth_bytes == 0u) plain16 = specialization;
+  }
+  Check(depth16 != plain16,
+        "converted and plain uint reads shared one shader permutation");
+
+  data[0] = uint32_t(F::k16UInt) << 20u;
+  query.calls = 0;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization.images[0].depth_read_conversion == DepthReadConversion::None &&
+            query.calls == 0,
+        "depth read conversion was selected without a host query");
+  data[0] = uint32_t(F::k8UNorm) << 20u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization, host) &&
+            query.calls == 0,
+        "a non-candidate format queried the host texture cache");
+
+  // A depth image cannot back a volume; the 3D read replaces it with a color image.
+  const auto volume_plan = ExtractResourcePlan(make_program(Type::kColor3D));
+  data[0] = uint32_t(F::k16UInt) << 20u;
+  query.bytes_per_block = 2u;
+  ResourceSnapshot volume_snapshot;
+  ResourceSpecialization volume_specialization;
+  Check(MaterializeResources(volume_plan, runtime, volume_snapshot, volume_specialization,
+                             host) &&
+            volume_specialization.images[0].depth_read_conversion ==
+                DepthReadConversion::None &&
+            volume_specialization.images[0].numeric_class == N::Uint,
+        "3D uint read of a depth image selected a depth conversion");
+}
+
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
@@ -1374,6 +1512,7 @@ int main() {
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSignedStorageSpecialization();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
+  TestDepthReadConversionSpecialization();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

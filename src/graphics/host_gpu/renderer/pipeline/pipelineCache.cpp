@@ -115,6 +115,10 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	                                                                        values.size_bytes());
 }
 
+uint32_t QueryDepthImageBytesPerBlock(void* context, uint64_t address) {
+	return static_cast<TextureCache*>(context)->DepthImageBytesPerBlock(address);
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -253,10 +257,11 @@ struct PipelineCache::ProgramCache {
 		}
 
 		template <bool HasCalls>
-		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                             uint32_t                                push_data_cursor) {
+		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime&          runtime,
+		                             const ShaderRecompiler::IR::HostResourceQueries& host,
+		                             uint32_t push_data_cursor) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-			                                                    specialization));
+			                                                    specialization, host));
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
 				if (layout.push_data_start_dword !=
@@ -357,6 +362,12 @@ struct PipelineCache::ProgramCache {
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
+		const auto host = texture_cache != nullptr
+		                      ? ShaderRecompiler::IR::HostResourceQueries {
+		                            .depth_image_bytes_per_block = QueryDepthImageBytesPerBlock,
+		                            .context                     = texture_cache,
+		                        }
+		                      : ShaderRecompiler::IR::HostResourceQueries {};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts      = input_info.workgroup_counts;
 			runtime.indirect_args_address = input_info.indirect_args_address;
@@ -369,9 +380,9 @@ struct PipelineCache::ProgramCache {
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
 				if (!source_changed)
-					permutation = cached.FindPermutation<true>(runtime, push_data_cursor);
+					permutation = cached.FindPermutation<true>(runtime, host, push_data_cursor);
 			} else {
-				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
+				permutation = cached.FindPermutation<false>(runtime, host, push_data_cursor);
 			}
 			if (permutation != nullptr) {
 				input_info.stage = {.program   = &permutation->program,
@@ -481,14 +492,14 @@ struct PipelineCache::ProgramCache {
 			                         ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
 			                         std::move(retained))
 			            .first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan,
-			                                                    runtime, entry->second.resources,
-			                                                    entry->second.specialization));
+			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+			    entry->second.resource_plan, runtime, entry->second.resources,
+			    entry->second.specialization, host));
 		} else if (source_changed) {
 			entry->second.resource_plan =
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			if (const auto* permutation =
-			        entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
+			        entry->second.FindPermutation<true>(runtime, host, push_data_cursor)) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
@@ -518,7 +529,8 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(GraphicContext& graphics): graphics(graphics) {
+	ProgramCache(GraphicContext& graphics, TextureCache* texture_cache)
+	    : graphics(graphics), texture_cache(texture_cache) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -533,11 +545,13 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	GraphicContext&                                             graphics;
+	TextureCache*                                               texture_cache;
 	uint64_t                                                    next_shader_id = 0;
 };
 
-PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics)),
+PipelineCache::PipelineCache(GraphicContext& graphics, TextureCache* texture_cache)
+    : m_graphics(graphics),
+      m_program_cache(std::make_unique<ProgramCache>(graphics, texture_cache)),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();

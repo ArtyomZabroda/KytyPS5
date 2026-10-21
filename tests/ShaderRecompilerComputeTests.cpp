@@ -3970,9 +3970,6 @@ public:
                              vk::ComponentSwizzle::eR};
     depth_sampled.usage = vk::ImageUsageFlagBits::eSampled;
     const auto depth_first = depth.FindView(depth_sampled);
-    auto depth_alias_info = depth_sampled;
-    depth_alias_info.format = vk::Format::eR32Uint;
-    const auto depth_alias = depth.FindView(depth_alias_info);
     const auto depth_again = depth.FindView(depth_sampled);
     auto depth_array_info = depth_sampled;
     depth_array_info.type = vk::ImageViewType::e2DArray;
@@ -3985,7 +3982,7 @@ public:
     const auto depth_attachment = depth.FindView(depth_attachment_info);
     Require(name, "depth views",
             depth_first != nullptr && depth_again == depth_first &&
-                depth_alias == depth_first && depth_array != nullptr &&
+                depth_array != nullptr &&
                 depth_array != depth_first && depth_attachment != nullptr &&
                 depth_attachment != depth_array &&
                 depth.views.size() == 3,
@@ -13522,6 +13519,41 @@ public:
                   color.desc.info.mip_layout[0].size == allocation_size &&
                   image.usage.render_target && image.IsGpuModified(),
               "supported depth-tiled color target was not resolved");
+
+      // Depth tiling alone does not make a color target a depth image.
+      ShaderTextureResource color_descriptor{};
+      color_descriptor.fields[0] = static_cast<uint32_t>(base >> 8u);
+      color_descriptor.fields[1] =
+          static_cast<uint32_t>(base >> 40u) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+          (((width - 1u) & 3u) << 30u);
+      color_descriptor.fields[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+      color_descriptor.fields[3] =
+          DstSel(4, 4, 4, 4) |
+          (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      color_descriptor.fields[5] = 0x00700000u;
+      ShaderRecompiler::IR::DescriptorValue color_value{};
+      std::copy(std::begin(color_descriptor.fields),
+                std::end(color_descriptor.fields), color_value.dwords.begin());
+      color_value.dword_count = 8;
+      ShaderRecompiler::IR::ImageResource color_resource{};
+      color_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      color_resource.numeric_class = Prospero::TextureNumericClass::Float;
+      color_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      color_resource.read = true;
+      const auto color_backing = image.backing.image;
+      const auto color_binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, color_resource, color_value);
+      const auto &color_sampled = texture_cache.GetImage(color_binding.image_id);
+      Require(name, "depth-tiled color sampled as color",
+              color_binding.image_id == color.image_id &&
+                  color_binding.desc.info.pixel_format == vk::Format::eR32Sfloat &&
+                  !color_sampled.info.IsDepth() &&
+                  color_sampled.backing.image == color_backing,
+              "float T# over a depth-tiled color target requested a depth image");
+      RenderExecutorTestAccess::ResetBindings(executor);
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
       std::vector<uint8_t> cleared(allocation_size);
@@ -15210,8 +15242,11 @@ public:
       ShaderRecompiler::IR::ImageResource sampled_depth_resource{};
       sampled_depth_resource.resource_class =
           ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      // Materialization selects a float depth image and a shader-side bitcast for uint reads.
       sampled_depth_resource.numeric_class =
-          Prospero::TextureNumericClass::Uint;
+          Prospero::TextureNumericClass::Float;
+      sampled_depth_resource.depth_read_conversion =
+          ShaderRecompiler::IR::DepthReadConversion::DepthAsUInt32;
       sampled_depth_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       sampled_depth_resource.read = true;
@@ -15236,9 +15271,9 @@ public:
               sampled_depth_binding.desc.info.guest_format ==
                   Prospero::BufferFormat::k32UInt &&
               sampled_depth_binding.desc.info.pixel_format ==
-                  vk::Format::eR32Uint &&
+                  vk::Format::eD32Sfloat &&
               sampled_depth_binding.desc.view_info.format ==
-                  vk::Format::eR32Uint &&
+                  vk::Format::eD32Sfloat &&
               sampled_depth_binding.desc.view_info.aspect ==
                   vk::ImageAspectFlagBits::eColor &&
               sampled_depth_binding.desc.view_info.usage ==
@@ -15247,8 +15282,41 @@ public:
               sampled_depth_image.backing.format == vk::Format::eD32Sfloat &&
               sampled_depth_image.backing.image == sampled_depth_backing &&
               sampled_depth_view != nullptr && normalized_depth_view,
-          "uint T# did not retain its requested format while the concrete "
-          "view followed the D32 backing");
+          "uint T# over a D32 target did not request the depth format of "
+          "its backing");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
+      // A float T# over the same D32 target requests the depth format directly.
+      auto float_depth_value = sampled_depth_value;
+      float_depth_value.dwords[1] =
+          static_cast<uint32_t>(sampled_address >> 32u) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+          ((sampled_width & 3u) << 30u);
+      ShaderRecompiler::IR::ImageResource float_depth_resource{};
+      float_depth_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      float_depth_resource.numeric_class = Prospero::TextureNumericClass::Float;
+      float_depth_resource.dimension =
+          ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      float_depth_resource.read = true;
+      auto float_depth_binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, float_depth_resource, float_depth_value);
+      const auto float_depth_view = texture_cache.FindTexture(
+          float_depth_binding.image_id, float_depth_binding.desc);
+      const auto &float_depth_image =
+          texture_cache.GetImage(float_depth_binding.image_id);
+      Require(
+          name, "R32 float depth-backed view",
+          float_depth_binding.image_id == depth_only.image_id &&
+              float_depth_binding.desc.info.pixel_format ==
+                  vk::Format::eD32Sfloat &&
+              float_depth_binding.desc.view_info.format ==
+                  vk::Format::eD32Sfloat &&
+              float_depth_image.info.pixel_format == vk::Format::eD32Sfloat &&
+              float_depth_image.backing.image == sampled_depth_backing &&
+              float_depth_view != nullptr,
+          "float T# over a D32 target did not request the depth format of "
+          "its backing");
       RenderExecutorTestAccess::ResetBindings(executor);
 
       // Attachment acquisition consumes pending HTile clears using DB_DEPTH_CLEAR.
@@ -15262,10 +15330,29 @@ public:
       registers.SetDepthControl(bounds_control);
       registers.SetRenderControl({});
       registers.SetDepthClearValue(0.375f);
+      // Materialization reads a k32UInt T# over a D32 target as float depth with a bitcast.
+      auto depth_read_resource = sampled_resource;
+      depth_read_resource.numeric_class = Prospero::TextureNumericClass::Float;
+      depth_read_resource.depth_read_conversion =
+          ShaderRecompiler::IR::DepthReadConversion::DepthAsUInt32;
+      const auto make_depth_read_info = [&](ShaderType stage) {
+        ShaderRecompiler::IR::Program program{};
+        program.stage = stage;
+        program.resource_tracking_complete = true;
+        program.info.images.push_back(depth_read_resource);
+        set_image_bindings(program);
+        ShaderRecompiler::IR::CompiledShaderInfo info{};
+        info.stage = program.stage;
+        info.info = std::move(program.info);
+        info.bindings = std::move(program.bindings);
+        return info;
+      };
+      const auto vertex_depth_read_info = make_depth_read_info(ShaderType::Vertex);
+      const auto pixel_depth_read_info = make_depth_read_info(ShaderType::Pixel);
       ShaderRecompiler::IR::ResourceSnapshot bounds_snapshot;
       bounds_snapshot.images.push_back(sampled_depth_value);
-      ShaderStageRuntime bounds_vertex{&vertex_sampled_info, &bounds_snapshot};
-      ShaderStageRuntime bounds_pixel{&sampled_info, &bounds_snapshot};
+      ShaderStageRuntime bounds_vertex{&vertex_depth_read_info, &bounds_snapshot};
+      ShaderStageRuntime bounds_pixel{&pixel_depth_read_info, &bounds_snapshot};
       const auto depth_texels = depth_only.desc.info.extent.width *
                                 depth_only.desc.info.extent.height;
       const auto depth_bytes = depth_texels * sizeof(uint32_t);
@@ -15643,8 +15730,9 @@ public:
           name, "copied depth sampled owner",
           copy_sample_binding.image_id == copy_destination.image_id &&
               copy_sample_binding.desc.info.pixel_format ==
-                  vk::Format::eR32Sfloat,
-          "R32 sampling did not reuse the GPU-written depth-copy destination");
+                  vk::Format::eD32Sfloat,
+          "R32 sampling did not reuse the GPU-written depth-copy destination "
+          "through its depth format");
       auto &copy_sample_image = texture_cache.GetImage(copy_destination.image_id);
       copy_sample_image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
                                 vk::AccessFlagBits2::eShaderRead, {},
@@ -15681,9 +15769,9 @@ public:
       shared_depth_value.dword_count = 8;
       ShaderRecompiler::IR::ResourceSnapshot shared_depth_snapshot;
       shared_depth_snapshot.images.push_back(shared_depth_value);
-      ShaderStageRuntime shared_depth_vertex{&vertex_sampled_info,
+      ShaderStageRuntime shared_depth_vertex{&vertex_depth_read_info,
                                               &shared_depth_snapshot};
-      ShaderStageRuntime shared_depth_pixel{&sampled_info,
+      ShaderStageRuntime shared_depth_pixel{&pixel_depth_read_info,
                                              &shared_depth_snapshot};
       for (const bool stencil_write : {true, false}) {
         registers.SetDepthRenderTarget(phased_depth_target);
@@ -15762,6 +15850,8 @@ public:
       // PPSA03541 reuses a tile24 depth allocation through a tile27 RGB10A2 T#.
       auto pooled_resource = sampled_depth_resource;
       pooled_resource.numeric_class = Prospero::TextureNumericClass::Float;
+      pooled_resource.depth_read_conversion =
+          ShaderRecompiler::IR::DepthReadConversion::None;
       ImageId pooled_color_id{};
       for (const bool color : {false, true, false, true}) {
         auto value = shared_depth_value;
@@ -44558,40 +44648,51 @@ void CheckSampledColorViews() {
           "incompatible sampled depth format was accepted");
   Require("SampledColorViews", "invalid depth swizzle",
           !IsSupportedSampledDepthView(vk::Format::eD32SfloatS8Uint,
-                                       vk::Format::eR32Sfloat,
+                                       vk::Format::eD32Sfloat,
                                        DstSel(4, 5, 6, 7)),
           "incompatible sampled depth swizzle was accepted");
   Require("SampledColorViews", "D32 depth target",
           IsSupportedSampledDepthView(vk::Format::eD32SfloatS8Uint,
-                                      vk::Format::eR32Sfloat,
+                                      vk::Format::eD32Sfloat,
                                       DstSel(4, 4, 4, 4)),
           "D32 depth target did not select its depth-aspect view");
   Require("SampledColorViews", "D16 R000 depth target",
           IsSupportedSampledDepthView(
-              vk::Format::eD16Unorm, vk::Format::eR16Unorm, DstSel(4, 0, 0, 0)),
+              vk::Format::eD16Unorm, vk::Format::eD16Unorm, DstSel(4, 0, 0, 0)),
           "D16 depth target did not select its R000 depth-aspect view");
   Require("SampledColorViews", "D16 RRR1 depth target",
           IsSupportedSampledDepthView(
-              vk::Format::eD16Unorm, vk::Format::eR16Unorm, DstSel(4, 4, 4, 1)),
+              vk::Format::eD16Unorm, vk::Format::eD16Unorm, DstSel(4, 4, 4, 1)),
           "D16 depth target rejected replicated depth with constant alpha");
   Require("SampledColorViews", "D16S8 R001 depth target",
           IsSupportedSampledDepthView(vk::Format::eD16UnormS8Uint,
-                                      vk::Format::eR16Unorm,
+                                      vk::Format::eD16Unorm,
                                       DstSel(4, 0, 0, 1)),
           "D16S8 depth target did not select its R001 depth-aspect view");
   Require("SampledColorViews", "promoted D24S8 R001 depth target",
           IsSupportedSampledDepthView(vk::Format::eD24UnormS8Uint,
-                                      vk::Format::eR16Unorm,
+                                      vk::Format::eD16Unorm,
                                       DstSel(4, 0, 0, 1)),
-          "D24S8 host fallback did not preserve the guest R16 depth view");
+          "D24S8 host fallback did not preserve the guest D16 depth view");
   Require("SampledColorViews", "promoted D32S8 R001 depth target",
           IsSupportedSampledDepthView(vk::Format::eD32SfloatS8Uint,
-                                      vk::Format::eR16Unorm,
+                                      vk::Format::eD16Unorm,
                                       DstSel(4, 0, 0, 1)),
-          "D32S8 host fallback did not preserve the guest R16 depth view");
+          "D32S8 host fallback did not preserve the guest D16 depth view");
+  Require("SampledColorViews", "color view on depth target",
+          !IsSupportedSampledDepthView(vk::Format::eD32Sfloat,
+                                       vk::Format::eR32Sfloat,
+                                       DstSel(4, 4, 4, 4)) &&
+              !IsSupportedSampledDepthView(vk::Format::eD16Unorm,
+                                           vk::Format::eR16Unorm,
+                                           DstSel(4, 0, 0, 0)) &&
+              !IsSupportedSampledDepthView(vk::Format::eD32Sfloat,
+                                           vk::Format::eR32Uint,
+                                           DstSel(4, 4, 4, 4)),
+          "a color view format was accepted on a depth target");
   Require("SampledColorViews", "D32S8 R001 depth target",
           IsSupportedSampledDepthView(vk::Format::eD32SfloatS8Uint,
-                                      vk::Format::eR32Sfloat,
+                                      vk::Format::eD32Sfloat,
                                       DstSel(4, 0, 0, 1)),
           "D32S8 depth target did not select its R001 depth-aspect view");
   ShaderRecompiler::IR::ImageResource storage_resource{};
@@ -44722,9 +44823,12 @@ void CheckSampledDepthResource() {
   Require("SampledDepthResource", "integer comparison rejected",
           !IsSupportedSampledDepthResource(resource),
           "uint depth resource accepted comparison sampling");
+  // Integer reads of depth convert in the shader; the view keeps the depth format.
   Require("SampledDepthResource", "R32 uint depth view",
           IsSupportedSampledDepthFormat(vk::Format::eD32Sfloat,
-                                        vk::Format::eR32Uint) &&
+                                        vk::Format::eD32Sfloat) &&
+              !IsSupportedSampledDepthFormat(vk::Format::eD32Sfloat,
+                                             vk::Format::eR32Uint) &&
               !IsSupportedSampledDepthFormat(vk::Format::eR32Uint,
                                              vk::Format::eR32Uint),
           "R32 uint depth-view compatibility diverged from its backing role");

@@ -16,10 +16,7 @@ namespace ImageViewOps {
 [[nodiscard]] inline bool IsFormatDepthCompatible(vk::Format format) noexcept {
 	switch (format) {
 		case vk::Format::eD32Sfloat:
-		case vk::Format::eR32Sfloat:
-		case vk::Format::eR32Uint:
-		case vk::Format::eD16Unorm:
-		case vk::Format::eR16Unorm: return true;
+		case vk::Format::eD16Unorm: return true;
 		default: return false;
 	}
 }

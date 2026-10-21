@@ -933,7 +933,8 @@ private:
 };
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
-                                        ResourceSpecialization& specialization) {
+                                        ResourceSpecialization&    specialization,
+                                        const HostResourceQueries& host_resource_queries = {}) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
@@ -994,6 +995,25 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (raw_sint_format == Prospero::BufferFormat::k16UInt) image.conversion_format = format;
 		image.numeric_class =
 		    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+
+		const auto tile = static_cast<Prospero::TileMode>((descriptor.dwords[3] >> 20u) & 0x1fu);
+
+		const uint32_t        depth_bytes = format == Prospero::BufferFormat::k16UInt   ? 2u
+		                                    : format == Prospero::BufferFormat::k32UInt ? 4u
+		                                                                                : 0u;
+		ShaderTextureResource texture;
+		std::copy_n(descriptor.dwords.begin(), std::size(texture.fields), texture.fields);
+		// Depth images are never volumes; a 3D read recreates the depth image as color.
+		if (!storage && !base.depth_compare && depth_bytes != 0 &&
+		    texture.Type() != Prospero::ImageType::kColor3D &&
+		    host_resource_queries.depth_image_bytes_per_block != nullptr &&
+		    host_resource_queries.depth_image_bytes_per_block(host_resource_queries.context,
+		                                                      texture.Base40()) == depth_bytes) {
+			image.depth_read_conversion = depth_bytes == 2u ? DepthReadConversion::DepthAsUInt16
+			                                                : DepthReadConversion::DepthAsUInt32;
+			image.numeric_class         = Prospero::TextureNumericClass::Float;
+			image.shader_swizzle        = DescriptorImageSwizzle(descriptor);
+		}
 		if (!storage && format == Prospero::BufferFormat::k11_11_10UNorm) {
 			if (image.indirect_root != ImageResource::NoIndirectImage) {
 				return SpecializationFail("packed UNorm sampling requires a direct image");
@@ -1607,7 +1627,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          const HostResourceQueries& host_resource_queries) {
 	for (auto& keys: program.selector_keys)
 		keys.resolved = false;
 	if (!program.resource_tracking_complete ||
@@ -1821,7 +1842,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	return BuildResourceSpecialization(program, snapshot, specialization, host_resource_queries);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
@@ -1874,6 +1895,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.depth_read_conversion      = source.depth_read_conversion;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {
@@ -1915,6 +1937,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		if (index >= original_sampler_count) {
 			samplers.push_back(samplers[binding.source]);
 		}
+
 		samplers[index].snapshot_index        = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::Integer;
 		samplers[index].integer_border        = binding.type != SamplerClass::Float;
@@ -1933,6 +1956,17 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		samplers[pair.sampler].depth_compare |= images[pair.image].depth_compare;
 		for (const auto candidate: samplers[pair.sampler].indirect_resources)
 			samplers[candidate].depth_compare |= images[pair.image].depth_compare;
+
+		if (images[pair.image].depth_read_conversion !=
+		        ShaderRecompiler::IR::DepthReadConversion::None ||
+		    std::ranges::any_of(images[pair.image].indirect_resources, [&](uint32_t c) {
+			    return images[c].depth_read_conversion !=
+			           ShaderRecompiler::IR::DepthReadConversion::None;
+		    })) {
+			samplers[pair.sampler].force_point_filtering = true;
+			for (const auto candidate: samplers[pair.sampler].indirect_resources)
+				samplers[candidate].force_point_filtering = true;
+		}
 	}
 
 	auto& memory_info = program.memory_info;
