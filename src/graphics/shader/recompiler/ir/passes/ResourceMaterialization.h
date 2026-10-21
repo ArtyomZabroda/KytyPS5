@@ -35,14 +35,14 @@ struct ResourceSpecialization {
 	};
 
 	struct Sampler {
-		uint32_t indirect_root = SamplerResource::NoIndirectSampler;
-		uint32_t indirect_mapping_offset = 0;
-		uint32_t indirect_search_iterations = 0;
-		bool operator==(const Sampler&) const = default;
+		uint32_t indirect_root                    = SamplerResource::NoIndirectSampler;
+		uint32_t indirect_mapping_offset          = 0;
+		uint32_t indirect_search_iterations       = 0;
+		bool     operator==(const Sampler&) const = default;
 	};
 
-	std::vector<Buffer> buffers;
-	std::vector<Image>  images;
+	std::vector<Buffer>  buffers;
+	std::vector<Image>   images;
 	std::vector<Sampler> samplers;
 
 	bool operator==(const ResourceSpecialization&) const = default;
