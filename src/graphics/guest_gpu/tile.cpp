@@ -1230,20 +1230,87 @@ static bool TileGetColorMetadataSize(uint32_t width, uint32_t height, uint32_t s
 	return true;
 }
 
-bool TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
-                    uint32_t bytes_per_element, uint32_t levels, Prospero::TileMode tile,
-                    TileSizeAlign& total_size, uint32_t num_fragments_log2) {
-	total_size = {};
-	if (levels != 1 || num_fragments_log2 != 0 ||
-	    !std::has_single_bit(bytes_per_element) || bytes_per_element > 16 ||
+// Gen5 DCC uses 4 KiB blocks, with one byte per 256 bytes of color data, so one block covers
+// 2^20 bytes. The block raster is the nearest power-of-two rectangle with that many elements.
+static bool TileGetDccBlockSize(uint32_t bytes_per_element, Prospero::TileMode tile,
+                                uint32_t num_fragments_log2, uint32_t& block_width,
+                                uint32_t& block_height) {
+	if (num_fragments_log2 != 0 || !std::has_single_bit(bytes_per_element) ||
+	    bytes_per_element > 16 ||
 	    (tile != Prospero::TileMode::kRenderTarget && tile != Prospero::TileMode::kDepth)) {
 		return false;
 	}
-	// Gen5 DCC uses 4 KiB blocks, with one byte per 256 bytes of color data.
-	// Metadata stays thin for volume surfaces, so every depth slice has its own block raster.
 	const uint32_t coverage_bits = 20u - std::countr_zero(bytes_per_element);
-	return TileGetColorMetadataSize(width, height, slices, 1u << ((coverage_bits + 1u) / 2u),
-	                                1u << (coverage_bits / 2u), total_size);
+	block_width                  = 1u << ((coverage_bits + 1u) / 2u);
+	block_height                 = 1u << (coverage_bits / 2u);
+	return true;
+}
+
+bool TileGetDccLevelRange(uint32_t width, uint32_t height, uint32_t bytes_per_element,
+                          uint32_t levels, uint32_t level, Prospero::TileMode tile,
+                          uint64_t& offset, uint64_t& size, uint32_t num_fragments_log2) {
+	offset                = 0;
+	size                  = 0;
+	uint32_t block_width  = 0;
+	uint32_t block_height = 0;
+	if (levels == 0 || level >= levels ||
+	    !TileGetDccBlockSize(bytes_per_element, tile, num_fragments_log2, block_width,
+	                         block_height)) {
+		return false;
+	}
+	// Mip-chain metadata stores each level's block raster back to back. Like guest color data,
+	// the chain runs backwards: the smallest level comes first and level 0 comes last.
+	uint64_t level_offset = 0;
+	for (uint32_t i = levels; i-- > 0;) {
+		TileSizeAlign level_size {};
+		if (!TileGetColorMetadataSize(std::max(width >> i, 1u), std::max(height >> i, 1u), 1,
+		                              block_width, block_height, level_size)) {
+			return false;
+		}
+		if (i == level) {
+			offset = level_offset;
+			size   = level_size.size;
+		}
+		level_offset += level_size.size;
+	}
+	return true;
+}
+
+bool TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
+                    uint32_t bytes_per_element, uint32_t levels, Prospero::TileMode tile,
+                    TileSizeAlign& total_size, uint32_t num_fragments_log2) {
+	total_size            = {};
+	uint32_t block_width  = 0;
+	uint32_t block_height = 0;
+	if (levels == 0 || !TileGetDccBlockSize(bytes_per_element, tile, num_fragments_log2,
+	                                        block_width, block_height)) {
+		return false;
+	}
+	// Metadata stays thin for volume surfaces, so every depth slice has its own block raster.
+	if (levels == 1) {
+		return TileGetColorMetadataSize(width, height, slices, block_width, block_height,
+		                                total_size);
+	}
+	// The slice order of layered mip-chain metadata is unverified.
+	if (slices != 1) {
+		return false;
+	}
+	uint64_t total = 0;
+	for (uint32_t i = 0; i < levels; i++) {
+		uint64_t offset = 0;
+		uint64_t size   = 0;
+		if (!TileGetDccLevelRange(width, height, bytes_per_element, levels, i, tile, offset, size,
+		                          num_fragments_log2)) {
+			return false;
+		}
+		total += size;
+	}
+	if (total > UINT32_MAX) {
+		return false;
+	}
+	total_size.size  = static_cast<uint32_t>(total);
+	total_size.align = 4096;
+	return true;
 }
 
 bool TileGetCmaskSize(uint32_t width, uint32_t height, uint32_t slices, uint32_t levels,

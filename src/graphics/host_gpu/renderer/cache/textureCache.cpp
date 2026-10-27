@@ -1050,18 +1050,38 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile clear flag.
 		m_surface_metas.erase(range.address);
-		if (range.size == 0 || desc.info.resources.levels != 1) {
+		if (range.size == 0) {
 			return;
 		}
 	}
+	const auto& view = desc.view_info;
+	// A render target binds one mip level. Its clear keys live in that level's part of the
+	// mip-chain metadata. A sampled mip chain is handled by MaterializeFreshTextureClear;
+	// other bindings keep the single-level contract.
+	const bool mip_chain    = desc.info.resources.levels != 1;
+	uint64_t   level_offset = 0;
+	uint64_t   level_size   = 0;
+	if (mip_chain && desc.type == BindingType::Texture) {
+		MaterializeFreshTextureClear(id, desc);
+		return;
+	}
+	if (mip_chain &&
+	    (desc.type != BindingType::RenderTarget ||
+	     desc.info.metadata.kind != ImageMetadataKind::Dcc || desc.info.IsVolume() ||
+	     desc.info.TransferLayers() != 1 || view.level_count != 1 || desc.info.samples != 1 ||
+	     !TileGetDccLevelRange(desc.info.extent.width, desc.info.extent.height,
+	                           desc.info.bytes_per_block, desc.info.resources.levels,
+	                           view.base_level, desc.info.tile_mode, level_offset, level_size) ||
+	     level_offset + level_size > range.size)) {
+		return;
+	}
 	const auto layers = desc.info.TransferLayers();
-	// These one-mip surfaces use complete 4 KiB color metadata blocks.
+	// These surfaces use complete 4 KiB color metadata blocks.
 	constexpr uint64_t MetadataBlockSize = 0x1000;
 	if (!range.Valid() || range.address % MetadataBlockSize != 0 || layers == 0 ||
 	    range.size % layers != 0 || (range.size / layers) % MetadataBlockSize != 0) {
 		EXIT("TextureCache: color metadata slices must contain aligned 4 KiB blocks\n");
 	}
-	const auto& view           = desc.view_info;
 	const bool  volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
 	const auto  first          = volume_texture ? 0u : metadata_base_layer;
 	const auto  image_first    = volume_texture ? 0u : view.base_layer;
@@ -1069,8 +1089,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
-	const auto       slice_size = range.size / layers;
-	const GuestRange viewed {range.address + slice_size * first, slice_size * count};
+	const auto       slice_size  = range.size / layers;
+	const auto       region_size = mip_chain ? level_size : slice_size;
+	const GuestRange viewed {range.address + slice_size * first + level_offset,
+	                         region_size * count};
 	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
 		std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
 		uint32_t keys = 0;
@@ -1142,7 +1164,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
 	}
 	for (uint32_t slice = 0; slice < count; slice++) {
-		const auto address = range.address + slice_size * (first + slice);
+		const auto address = range.address + slice_size * (first + slice) + level_offset;
 		uint8_t code = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
@@ -1151,7 +1173,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
-		std::vector<uint8_t> bytes(slice_size);
+		std::vector<uint8_t> bytes(region_size);
 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
 			EXIT("TextureCache: failed to read color metadata slice\n");
 		}
@@ -1175,9 +1197,60 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
-			m_buffer_cache.InvalidateMemory(address, slice_size);
+			m_buffer_cache.InvalidateMemory(address, region_size);
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
+	}
+}
+
+// A render-target mip chain can be fast-cleared and then sampled without any draw. When such an
+// image is first seen through a texture binding, its host contents come from guest memory that
+// still holds the bytes of an older resource, so the guest clear keys are applied instead.
+// Guest metadata is only read here: a texture's metadata address may already be reused memory.
+void TextureCache::MaterializeFreshTextureClear(ImageId id, const ImageDesc& desc) {
+	const auto  range  = desc.info.metadata.range;
+	const auto& view   = desc.view_info;
+	const auto  levels = desc.info.resources.levels;
+	if (desc.info.metadata.kind != ImageMetadataKind::Dcc ||
+	    desc.info.tile_mode != Prospero::TileMode::kRenderTarget || desc.info.IsVolume() ||
+	    desc.info.TransferLayers() != 1 || desc.info.samples != 1 || view.level_count == 0 ||
+	    view.base_level >= levels || view.level_count > levels - view.base_level) {
+		return;
+	}
+	{
+		std::scoped_lock lock {m_lock};
+		if (m_slot_images[id].IsGpuModified()) {
+			return;
+		}
+	}
+	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		m_buffer_cache.ReadMemory(range.address, range.size, false);
+	}
+	for (uint32_t level = view.base_level; level < view.base_level + view.level_count; level++) {
+		uint64_t level_offset = 0;
+		uint64_t level_size   = 0;
+		if (!TileGetDccLevelRange(desc.info.extent.width, desc.info.extent.height,
+		                          desc.info.bytes_per_block, levels, level, desc.info.tile_mode,
+		                          level_offset, level_size) ||
+		    level_size == 0 || level_offset + level_size > range.size) {
+			continue;
+		}
+		std::vector<uint8_t> bytes(level_size);
+		if (!LibKernel::Memory::TryReadBacking(range.address + level_offset, bytes.data(),
+		                                       bytes.size())) {
+			continue;
+		}
+		const auto     code = bytes[0];
+		vk::ClearValue clear {};
+		const bool     clear_level = std::all_of(bytes.begin(), bytes.end(),
+		                                         [code](uint8_t byte) { return byte == code; }) &&
+		                         DecodeColorClear(desc, code, clear.color);
+		if (!clear_level) {
+			continue;
+		}
+		std::scoped_lock lock {m_lock};
+		ClearImage(m_scheduler.Current(), id, view.format,
+		           {vk::ImageAspectFlagBits::eColor, level, 1, view.base_layer, 1}, clear);
 	}
 }
 

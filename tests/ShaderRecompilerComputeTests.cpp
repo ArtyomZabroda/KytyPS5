@@ -1349,6 +1349,59 @@ void CheckLeastRecentlyUsedCacheOrdering() {
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
 }
 
+void CheckDccMipChainLayout() {
+  constexpr const char *name = "DccMipChainLayout";
+  struct LevelCase {
+    uint32_t bytes_per_element;
+    std::array<uint64_t, 5> offsets;
+    std::array<uint64_t, 5> sizes;
+    uint32_t total;
+  };
+  // 3200x1800 with five levels, as Cyberpunk 2077 binds its UI and scene targets. A 4 KiB block
+  // covers 512x512 four-byte or 512x256 eight-byte pixels; level 0 comes last.
+  constexpr std::array cases{
+      LevelCase{4, {0x0c000, 0x4000, 0x2000, 0x1000, 0x0000},
+                {0x1c000, 0x8000, 0x2000, 0x1000, 0x1000}, 0x28000},
+      LevelCase{8, {0x16000, 0x6000, 0x2000, 0x1000, 0x0000},
+                {0x38000, 0x10000, 0x4000, 0x1000, 0x1000}, 0x4e000},
+  };
+  for (const auto &level_case : cases) {
+    for (uint32_t level = 0; level < 5; level++) {
+      uint64_t offset = 0;
+      uint64_t size = 0;
+      Require(name, "level range",
+              TileGetDccLevelRange(3200, 1800, level_case.bytes_per_element, 5, level,
+                                   Prospero::TileMode::kRenderTarget, offset, size) &&
+                  offset == level_case.offsets[level] && size == level_case.sizes[level],
+              "a mip level's DCC metadata range is misplaced");
+    }
+    TileSizeAlign total{};
+    Require(name, "mip chain size",
+            TileGetDccSize(3200, 1800, 1, level_case.bytes_per_element, 5,
+                           Prospero::TileMode::kRenderTarget, total) &&
+                total.size == level_case.total && total.align == 4096,
+            "the DCC metadata of a mip chain is not the sum of its levels");
+  }
+  TileSizeAlign size{};
+  Require(name, "single level",
+          TileGetDccSize(3200, 1800, 2, 4, 1, Prospero::TileMode::kRenderTarget, size) &&
+              size.size == 2 * 0x1c000,
+          "single-level DCC metadata changed size");
+  uint64_t offset = 0;
+  uint64_t level_size = 0;
+  Require(name, "unsupported layouts",
+          !TileGetDccSize(3200, 1800, 2, 4, 5, Prospero::TileMode::kRenderTarget, size) &&
+              size.size == 0 &&
+              !TileGetDccSize(3200, 1800, 1, 4, 0, Prospero::TileMode::kRenderTarget, size) &&
+              !TileGetDccSize(3200, 1800, 1, 4, 5, Prospero::TileMode::kRenderTarget, size, 1) &&
+              !TileGetDccLevelRange(3200, 1800, 4, 5, 5, Prospero::TileMode::kRenderTarget,
+                                    offset, level_size) &&
+              !TileGetDccLevelRange(3200, 1800, 4, 5, 0, Prospero::TileMode::kLinear, offset,
+                                    level_size),
+          "an unverified DCC layout produced a metadata range");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
@@ -13668,6 +13721,169 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "captured scene allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckDccMipChainClear() {
+    constexpr const char *name = "DccMipChainClear";
+    constexpr uintptr_t base = 0x000000020a000000ull;
+    constexpr uint64_t allocation_size = 0x1000000;
+    constexpr uint64_t alignment = 0x10000;
+    constexpr uint64_t dcc_address = base + 0x800000;
+    // 1024x512 RGBA16F with three levels: level 2 and level 1 take one 4 KiB block each, and
+    // level 0 takes four blocks at the end of the chain.
+    constexpr uint64_t metadata_size = 0x6000;
+    constexpr uint64_t level1_metadata = 0x1000;
+    constexpr uint64_t level0_metadata = 0x2000;
+    const std::vector<u32> stale{0x5a5a5a5au, 0x5a5a5a5au};
+    const std::vector<u32> transparent_black{0, 0};
+    const std::vector<u32> opaque_black{0, 0x3c000000u};
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, alignment, 0, &direct_offset) == 0,
+            "mip chain allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "mip chain mapping failed");
+    // Older resource bytes, with clear keys only in level 0's metadata.
+    const auto fill_guest = [&] {
+      std::memset(mapped, 0x5a, dcc_address - base);
+      std::memset(reinterpret_cast<void *>(dcc_address), 0x5a, level0_metadata);
+      std::memset(reinterpret_cast<void *>(dcc_address + level0_metadata), 0,
+                  metadata_size - level0_metadata);
+    };
+    const auto metadata_is = [&](RenderContext &context, uint64_t begin, uint64_t end,
+                                 uint8_t value) {
+      context.GetBufferCache().ReadMemory(dcc_address + begin, end - begin, false);
+      std::vector<uint8_t> bytes(end - begin);
+      return LibKernel::Memory::TryReadBacking(dcc_address + begin, bytes.data(),
+                                               bytes.size()) &&
+             std::ranges::all_of(bytes, [value](uint8_t byte) { return byte == value; });
+    };
+    TextureCache::ImageDesc sampled{};
+    {
+      fill_guest();
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(0, {.dcc_compression_enable = true,
+                                 .format = Prospero::ChannelLayout::k16_16_16_16,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorView(0, {});
+      registers.SetColorAttrib(0, {});
+      registers.SetColorAttrib2(0, {.height = 511, .width = 1023, .num_mip_levels = 2});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                    .dimension = 1,
+                                    .metadata_pipe_aligned = true});
+      registers.SetColorDccAddr(0, {.addr = dcc_address});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+      auto &executor = context.GetRenderExecutor();
+      context.MapMemory(base, allocation_size);
+
+      // Level 0 bound as a render target: only its part of the metadata is a clear.
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0);
+      Require(name, "mip chain metadata range",
+              color.desc.info.resources.levels == 3 &&
+                  color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+                  color.desc.info.metadata.range == GuestRange{dcc_address, metadata_size} &&
+                  color.desc.info.data.address + color.desc.info.data.size <= dcc_address,
+              "a render target with a mip chain lost its DCC metadata range");
+      Require(name, "bound level clear",
+              ReadCachedTexel(name, context, color.image_id) == transparent_black &&
+                  ReadCachedTexel(name, context, color.image_id, {1023, 511, 0}) ==
+                      transparent_black &&
+                  ReadCachedTexel(name, context, color.image_id, {}, {1, 1, 1}, 0, 1) == stale,
+              "the clear of level 0 was dropped or reached another level");
+      Require(name, "bound level metadata expansion",
+              metadata_is(context, 0, level0_metadata, 0x5a) &&
+                  metadata_is(context, level0_metadata, metadata_size, 0xff),
+              "expansion missed level 0 or changed another level's metadata");
+
+      // Level 1 bound next, with its own clear key.
+      WriteMetadata(context, dcc_address + level1_metadata, 0x1000, 0x40404040u);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      registers.SetColorView(0, {.current_mip_level = 1});
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0);
+      Require(name, "second level clear",
+              ReadCachedTexel(name, context, color.image_id, {}, {1, 1, 1}, 0, 1) ==
+                      opaque_black &&
+                  ReadCachedTexel(name, context, color.image_id, {511, 255, 0}, {1, 1, 1}, 0,
+                                  1) == opaque_black &&
+                  ReadCachedTexel(name, context, color.image_id) == transparent_black,
+              "the clear of level 1 was dropped or changed level 0");
+      Require(name, "second level metadata expansion",
+              metadata_is(context, 0, level1_metadata, 0x5a) &&
+                  metadata_is(context, level1_metadata, metadata_size, 0xff),
+              "expansion of level 1 used another level's metadata");
+      sampled = color.desc;
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    {
+      // The same chain fast-cleared and sampled before any draw creates a fresh texture.
+      fill_guest();
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &cache = context.GetTextureCache();
+      context.MapMemory(base, allocation_size);
+      sampled.type = TextureCache::BindingType::Texture;
+      sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      sampled.view_info.base_level = 0;
+      sampled.view_info.level_count = 3;
+      auto id = cache.FindImage(sampled);
+      Require(name, "fresh sampled view", cache.FindTexture(id, sampled) != nullptr,
+              "the mip chain did not produce a sampled view");
+      Require(name, "fresh texture clear",
+              ReadCachedTexel(name, context, id) == transparent_black &&
+                  ReadCachedTexel(name, context, id, {1023, 511, 0}) == transparent_black &&
+                  ReadCachedTexel(name, context, id, {}, {1, 1, 1}, 0, 1) == stale,
+              "a fresh texture kept older resource bytes under its level 0 clear");
+      Require(name, "fresh texture leaves guest metadata",
+              metadata_is(context, 0, level0_metadata, 0x5a) &&
+                  metadata_is(context, level0_metadata, metadata_size, 0),
+              "a texture binding wrote to guest metadata");
+      // GPU contents win over keys that are still in the guest metadata.
+      WriteMetadata(context, dcc_address + level0_metadata, metadata_size - level0_metadata,
+                    0x80808080u);
+      const auto again = cache.FindImage(sampled);
+      (void)cache.FindTexture(again, sampled);
+      Require(name, "GPU-modified texture keeps contents",
+              again == id && ReadCachedTexel(name, context, again) == transparent_black,
+              "a texture written by the GPU was cleared again from stale metadata");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "mip chain mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "mip chain allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -52436,6 +52652,7 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckDccMipChainLayout();
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pkrtz-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, CvtPkrtzF16F32SubnormalRoundsTowardZero());
@@ -53358,6 +53575,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckDccMipChainClear();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -53400,6 +53618,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckDccMipChainClear();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
@@ -53708,6 +53927,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckDccMipChainClear();
     vulkan.CheckDepthBitsCopy();
     vulkan.CheckMsaaStorageClear();
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();

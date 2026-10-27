@@ -235,8 +235,18 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		TileSizeAlign metadata_size {};
 		const auto layers = volume ? depth : view.image_layers;
 		if (has_dcc) {
-			(void)TileGetDccSize(width, height, layers, bytes_per_element, levels,
-			                     rt.attrib3.tile_mode, metadata_size, rt.attrib.num_fragments);
+			if (!TileGetDccSize(width, height, layers, bytes_per_element, levels,
+			                    rt.attrib3.tile_mode, metadata_size, rt.attrib.num_fragments)) {
+				// Without a metadata range MaterializeColorClear cannot see guest fast clears.
+				static std::atomic<uint32_t> unsupported_count {0};
+				if (unsupported_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("RenderColorTarget: unsupported DCC layout, fast clears are ignored:"
+					     " base=0x%010" PRIx64 " %ux%u bpe=%u levels=%u layers=%u tile=%u"
+					     " fragments=%u\n",
+					     rt.base.addr, width, height, bytes_per_element, levels, layers,
+					     static_cast<uint32_t>(rt.attrib3.tile_mode), rt.attrib.num_fragments);
+				}
+			}
 			desc.info.metadata.dcc_alpha_msb = DccAlphaOnMsb(rt.info);
 		} else {
 			(void)TileGetCmaskSize(width, height, layers, levels, metadata_size);
