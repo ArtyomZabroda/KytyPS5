@@ -197,14 +197,15 @@ ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {
 			const auto opcode = inst.GetOpcode();
-			if (opcode == ValueOpcode::UMin32 || opcode == ValueOpcode::UMax32) {
+			if (opcode == ValueOpcode::UMin32 || opcode == ValueOpcode::UMax32 ||
+			    opcode == ValueOpcode::BitwiseOr32) {
 				const auto seed = WaveReductionMatcher(block, opcode).Match(inst, wave_size);
 				if (!seed.IsEmpty()) {
 					const auto position = std::find_if(block->begin(), block->end(),
 					                                  [&](const Inst& candidate) { return &candidate == &inst; });
-					const auto reduce    = opcode == ValueOpcode::UMin32
-					                           ? ValueOpcode::SubgroupUMinU32
-					                           : ValueOpcode::SubgroupUMaxU32;
+					const auto reduce    = opcode == ValueOpcode::UMin32   ? ValueOpcode::SubgroupUMinU32
+					                       : opcode == ValueOpcode::UMax32 ? ValueOpcode::SubgroupUMaxU32
+					                                                       : ValueOpcode::SubgroupBitwiseOrU32;
 					auto&      reduction = *block->PrependNewInst(position, reduce, {seed});
 					inst.ReplaceUsesWith(Value(&reduction));
 					stats.rewritten_reductions++;
