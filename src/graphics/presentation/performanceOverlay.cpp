@@ -18,6 +18,7 @@
 #include <optional>
 #include <stop_token>
 #include <thread>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -72,12 +73,21 @@ struct Snapshot {
 	Common::HostStats                   host;
 	std::optional<uint64_t>             device_memory;
 	uint64_t                            device_budget = 0;
-	std::array<GraphicContext::HeapUsage, VK_MAX_MEMORY_HEAPS> heaps {};
-	uint32_t                                                   heap_count = 0;
-	std::array<float, FRAME_HISTORY>                           history {};
-	size_t                                                     history_count = 0;
-	Clock::time_point                                          sample_time {};
-	LibKernel::Memory::DebugStats                              guest_memory;
+	std::array<GraphicContext::HeapUsage, VK_MAX_MEMORY_HEAPS>        heaps {};
+	uint32_t                                                          heap_count = 0;
+	std::array<float, FRAME_HISTORY>                                  history {};
+	size_t                                                            history_count = 0;
+	Clock::time_point                                                 sample_time {};
+	LibKernel::Memory::DebugStats                                     guest_memory;
+	std::array<double, Common::DebugCounters::READ_FAULT_SLOTS>       read_fault_rates {};
+	std::array<double, Common::DebugCounters::READ_FAULT_SLOTS>       read_fault_ns_rates {};
+	std::array<uint64_t, Common::DebugCounters::READ_FAULT_SLOTS>     read_fault_totals {};
+	std::array<uint64_t, Common::DebugCounters::READ_FAULT_SLOTS>     read_fault_ns_totals {};
+	std::array<double, Common::DebugCounters::FAULT_PHASE_SLOTS>      phase_fault_rates {};
+	std::array<double, Common::DebugCounters::FAULT_PHASE_SLOTS>      phase_fault_ns_rates {};
+	std::array<uint64_t, Common::DebugCounters::FAULT_PHASE_SLOTS>    phase_fault_totals {};
+	std::array<uint64_t, Common::DebugCounters::FAULT_PHASE_SLOTS>    phase_fault_ns_totals {};
+	std::array<const char*, Common::DebugCounters::FAULT_PHASE_SLOTS> phase_fault_names {};
 };
 
 std::mutex            g_frame_mutex;
@@ -316,6 +326,133 @@ void GpuActivityRows(const Snapshot& shown) {
 	Row("DCC/CMASK GPU checks", Fmt("%.0f/s", Rate(shown, Counter::ColorMetadataChecks)));
 }
 
+// Splits "CPU waiting on GPU" by caller. Only sites that waited in the last interval appear.
+void GpuWaitSiteRows(const Snapshot& shown) {
+	using Common::DebugCounters::GpuWaitSite;
+	static constexpr std::array<std::pair<GpuWaitSite, const char*>,
+	                            static_cast<size_t>(GpuWaitSite::Count)>
+	    SITES {{
+	        {GpuWaitSite::Present, "  present"},
+	        {GpuWaitSite::StreamBuffer, "  stream buffer wrap"},
+	        {GpuWaitSite::BufferReadback, "  buffer readback"},
+	        {GpuWaitSite::ColorMetadata, "  DCC/CMASK readback"},
+	        {GpuWaitSite::FaultBuffer, "  fault buffer"},
+	        {GpuWaitSite::Occlusion, "  occlusion queries"},
+	        {GpuWaitSite::Unmap, "  memory unmap"},
+	        {GpuWaitSite::Gds, "  GDS read"},
+	        {GpuWaitSite::Background, "  async callbacks (bg)"},
+	        {GpuWaitSite::Other, "  other"},
+	    }};
+	for (const auto& [site, label]: SITES) {
+		const auto count = Rate(shown, Common::DebugCounters::GpuWaitCount(site));
+		if (count <= 0.0) {
+			continue;
+		}
+		const auto ms = Rate(shown, Common::DebugCounters::GpuWaitDuration(site)) / 1e6;
+		Row(label, Fmt("%.0f ms/s  (%.0f waits/s, avg %.2f ms)", ms, count, ms / count));
+	}
+	const auto callback_waits = Rate(shown, Counter::PriorityCallbackWaits);
+	if (callback_waits > 0.0) {
+		const auto ms = Rate(shown, Counter::PriorityCallbackWaitNs) / 1e6;
+		Row("  waiting async callbacks",
+		    Fmt("%.0f ms/s  (%.0f waits/s, avg %.2f ms)", ms, callback_waits, ms / callback_waits));
+	}
+}
+
+// The PM4 packets during which the GPU thread read GPU-written memory, busiest first.
+void ReadFaultOriginRows(const Snapshot& shown) {
+	using Common::DebugCounters::READ_FAULT_SLOTS;
+	std::array<uint32_t, READ_FAULT_SLOTS> order {};
+	uint32_t                               used = 0;
+	for (uint32_t i = 0; i < READ_FAULT_SLOTS; i++) {
+		if (shown.read_fault_rates[i] > 0.0) {
+			order[used++] = i;
+		}
+	}
+	std::sort(order.begin(), order.begin() + used, [&](uint32_t a, uint32_t b) {
+		return shown.read_fault_ns_rates[a] > shown.read_fault_ns_rates[b];
+	});
+	for (uint32_t i = 0; i < std::min<uint32_t>(used, 4); i++) {
+		const auto slot  = order[i];
+		const auto label = slot == Common::DebugCounters::READ_FAULT_OTHER_THREAD
+		                       ? std::string("    other threads")
+		                   : slot == Common::DebugCounters::READ_FAULT_GPU_OUTSIDE
+		                       ? std::string("    GPU thread, no packet")
+		                       : Fmt("    PM4 op 0x%02X", slot);
+		Row(label.c_str(), Fmt("%.0f faults/s  %.0f ms/s", shown.read_fault_rates[slot],
+		                       shown.read_fault_ns_rates[slot] / 1e6));
+	}
+	// The same GPU-thread faults by draw phase.
+	using Common::DebugCounters::FAULT_PHASE_SLOTS;
+	std::array<uint32_t, FAULT_PHASE_SLOTS> phases {};
+	uint32_t                                phase_count = 0;
+	for (uint32_t i = 0; i < FAULT_PHASE_SLOTS; i++) {
+		if (shown.phase_fault_names[i] != nullptr && shown.phase_fault_rates[i] > 0.0) {
+			phases[phase_count++] = i;
+		}
+	}
+	std::sort(phases.begin(), phases.begin() + phase_count, [&](uint32_t a, uint32_t b) {
+		return shown.phase_fault_ns_rates[a] > shown.phase_fault_ns_rates[b];
+	});
+	for (uint32_t i = 0; i < std::min<uint32_t>(phase_count, 5); i++) {
+		const auto slot  = phases[i];
+		const auto label = Fmt("    phase %s", shown.phase_fault_names[slot]);
+		Row(label.c_str(), Fmt("%.0f faults/s  %.0f ms/s", shown.phase_fault_rates[slot],
+		                       shown.phase_fault_ns_rates[slot] / 1e6));
+	}
+}
+
+// Synchronous buffer readbacks by source. A call downloads only when its range holds
+// GPU-written bytes, and each download waits for all GPU work submitted before it.
+void BufferReadbackRows(const Snapshot& shown) {
+	using Common::DebugCounters::ReadbackSource;
+	using Common::DebugCounters::ReadbackStat;
+	static constexpr std::array<std::pair<ReadbackSource, const char*>,
+	                            static_cast<size_t>(ReadbackSource::Count)>
+	           SOURCES {{
+	               {ReadbackSource::ReadFault, "  readback: CPU read fault"},
+	               {ReadbackSource::Write, "  readback: CPU write"},
+	               {ReadbackSource::IndirectArgs, "  readback: indirect args"},
+	               {ReadbackSource::GpuThreadRead, "  readback: GPU-thread read"},
+	               {ReadbackSource::ColorMetadata, "  readback: DCC/CMASK"},
+	               {ReadbackSource::Retire, "  readback: buffer retire"},
+	               {ReadbackSource::Other, "  readback: other"},
+	           }};
+	const auto rate = [&](ReadbackSource source, ReadbackStat stat) {
+		return Rate(shown, Common::DebugCounters::ReadbackCounter(source, stat));
+	};
+	for (const auto& [source, label]: SOURCES) {
+		const auto calls = rate(source, ReadbackStat::Calls);
+		if (calls <= 0.0) {
+			continue;
+		}
+		const auto downloads = rate(source, ReadbackStat::Downloads);
+		const auto ms        = rate(source, ReadbackStat::WaitNs) / 1e6;
+		Row(label, Fmt("%.0f calls/s  %.0f waited  %.0f ms/s  %s", calls, downloads, ms,
+		               Throughput(rate(source, ReadbackStat::Bytes)).c_str()));
+		if (source == ReadbackSource::ReadFault) {
+			ReadFaultOriginRows(shown);
+		}
+	}
+	const auto split = Rate(shown, Counter::ReadbackSplitWaits);
+	if (split > 0.0) {
+		Row("  readback wait split",
+		    Fmt("submit %.0f ms/s, earlier work %.0f ms/s (%.1f behind), own %.0f ms/s",
+		        Rate(shown, Counter::ReadbackSplitSubmitNs) / 1e6,
+		        Rate(shown, Counter::ReadbackSplitBacklogNs) / 1e6,
+		        Rate(shown, Counter::ReadbackSplitBacklogTicks) / split,
+		        Rate(shown, Counter::ReadbackSplitCurrentNs) / 1e6));
+	}
+	const auto sync = Rate(shown, Counter::SyncGpuCommands);
+	if (sync > 0.0) {
+		const auto total_ms = Rate(shown, Counter::SyncGpuCommandNs) / 1e6;
+		const auto queue_ms = Rate(shown, Counter::SyncGpuCommandQueueNs) / 1e6;
+		Row("Sync GPU-thread calls",
+		    Fmt("%.0f/s  callers wait %.0f ms/s (avg %.2f ms), %.0f ms/s of it queued", sync,
+		        total_ms, total_ms / sync, queue_ms));
+	}
+}
+
 void CompilationRows(const Snapshot& shown) {
 	const auto row = [&](const char* label, Counter count_counter, Counter duration_counter,
 	                     uint64_t peak_ns) {
@@ -344,6 +481,29 @@ void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point 
 		shown.rates[i] =
 		    seconds > 0.0 ? static_cast<double>(value - shown.totals[i]) / seconds : 0.0;
 		shown.totals[i] = value;
+	}
+	for (uint32_t i = 0; i < Common::DebugCounters::READ_FAULT_SLOTS; i++) {
+		const auto count = Common::DebugCounters::GetReadFaults(i);
+		const auto ns    = Common::DebugCounters::GetReadFaultNs(i);
+		shown.read_fault_rates[i] =
+		    seconds > 0.0 ? static_cast<double>(count - shown.read_fault_totals[i]) / seconds : 0.0;
+		shown.read_fault_ns_rates[i] =
+		    seconds > 0.0 ? static_cast<double>(ns - shown.read_fault_ns_totals[i]) / seconds : 0.0;
+		shown.read_fault_totals[i]    = count;
+		shown.read_fault_ns_totals[i] = ns;
+	}
+	for (uint32_t i = 0; i < Common::DebugCounters::FAULT_PHASE_SLOTS; i++) {
+		const auto count = Common::DebugCounters::GetPhaseFaults(i);
+		const auto ns    = Common::DebugCounters::GetPhaseFaultNs(i);
+		shown.phase_fault_rates[i] =
+		    seconds > 0.0 ? static_cast<double>(count - shown.phase_fault_totals[i]) / seconds
+		                  : 0.0;
+		shown.phase_fault_ns_rates[i] =
+		    seconds > 0.0 ? static_cast<double>(ns - shown.phase_fault_ns_totals[i]) / seconds
+		                  : 0.0;
+		shown.phase_fault_totals[i]    = count;
+		shown.phase_fault_ns_totals[i] = ns;
+		shown.phase_fault_names[i]     = Common::DebugCounters::GetPhaseFaultName(i);
 	}
 	shown.shader_compile_peak_ns  = Common::DebugCounters::Get(Peak::ShaderCompileNs);
 	shown.pipeline_create_peak_ns = Common::DebugCounters::Get(Peak::PipelineCreateNs);
@@ -483,13 +643,34 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		}
 		const double fps = std::max(shown.fps, 1.0);
 		GpuActivityRows(shown);
+		GpuWaitSiteRows(shown);
+		BufferReadbackRows(shown);
 		Row("Instances", Fmt("%.0f/frame", Rate(shown, Counter::DrawInstances) / fps));
 		Row("Indirect draws", Fmt("%.0f/s", Rate(shown, Counter::IndirectDraws)));
+		Row("  NUM_INSTANCES from memory",
+		    Fmt("%.0f/s  (%.0f GPU-written, %.0f equal 1)", Rate(shown, Counter::NumInstancesReads),
+		        Rate(shown, Counter::NumInstancesReadsGpuDirty),
+		        Rate(shown, Counter::NumInstancesReadsOne)));
+		Row("Restart index scans",
+		    Fmt("%.0f/s  (%.0f GPU-written)", Rate(shown, Counter::RestartIndexScans),
+		        Rate(shown, Counter::RestartIndexScansGpuDirty)));
+		Row("SRT walker faults", Fmt("%.0f/s from backing  %.0f/s needed readback",
+		                             Rate(shown, Counter::SrtWalkerBackingLoads),
+		                             Rate(shown, Counter::SrtWalkerReadbacks)));
+		Row("Dispatch args read on CPU",
+		    Fmt("%.0f/s  (%.0f GPU-written)", Rate(shown, Counter::DispatchArgsReads),
+		        Rate(shown, Counter::DispatchArgsReadsGpuDirty)));
 		Row("Dispatches", Fmt("%.0f/frame  %.0f/s", Rate(shown, Counter::Dispatches) / fps,
 		                      Rate(shown, Counter::Dispatches)));
-		Row("Queue submits", Fmt("%.0f/s", Rate(shown, Counter::QueueSubmits)));
+		Row("Queue submits",
+		    Fmt("%.0f/s  (%.0f/s early, GPU idle)", Rate(shown, Counter::QueueSubmits),
+		        Rate(shown, Counter::EarlySubmits)));
 		const auto faults = Rate(shown, Counter::GpuFaults);
 		Row("Write-tracking faults", Fmt("%.0f/s", faults), LevelColor(faults, 20000, 100000));
+		Row("Image heap unmaps", Fmt("%.0f/frame  (%.0f buries, %.0f checks/frame)",
+		                             Rate(shown, Counter::ImageHeapUnmaps) / fps,
+		                             Rate(shown, Counter::ImageHeapBuries) / fps,
+		                             Rate(shown, Counter::ImageHeapBuryChecks) / fps));
 		CompilationRows(shown);
 		ImGui::EndTable();
 	}
@@ -510,10 +691,64 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		}
 		TransferRow(shown, "Texture transfers", Counter::TextureUploadBytes,
 		            Counter::TextureDownloadBytes);
+		{
+			const double fps       = std::max(shown.fps, 1.0);
+			const auto   per_frame = [&](Counter counter) { return Rate(shown, counter) / fps; };
+			const auto   bytes     = [&](Counter counter) {
+				return Bytes(static_cast<uint64_t>(per_frame(counter)));
+			};
+			const auto uploads   = per_frame(Counter::TextureUploads);
+			const auto gpu       = per_frame(Counter::TextureUploadsFromGpu);
+			const auto unchanged = per_frame(Counter::TextureUploadsUnchanged);
+			Row("Texture uploads", Fmt("%.0f/frame  (guest bytes per frame)", uploads));
+			Row("  new", Fmt("%.0f  %s", std::max(uploads - gpu - unchanged, 0.0),
+			                 bytes(Counter::TextureUploadNewBytes).c_str()));
+			Row("  from GPU",
+			    Fmt("%.0f  %s", gpu, bytes(Counter::TextureUploadFromGpuBytes).c_str()));
+			Row("  unchanged",
+			    Fmt("%.0f  %s", unchanged, bytes(Counter::TextureUploadUnchangedBytes).c_str()));
+			Row("Texture images",
+			    Fmt("%.0f created  %.0f freed /frame", per_frame(Counter::TextureImagesCreated),
+			        per_frame(Counter::TextureImagesFreed)));
+			Row("Texture shapes",
+			    Fmt("%.0f lookups  %.0f misses /frame", per_frame(Counter::TextureShapeLookups),
+			        per_frame(Counter::TextureShapeMisses)));
+			const auto per = [&](Counter part, Counter whole) {
+				return per_frame(part) / std::max(per_frame(whole), 1.0);
+			};
+			Row("Image region lookups",
+			    Fmt("%.0f/frame  (%.0f cached)  %.1f pages  %.1f owners  %.1f found /lookup",
+			        per_frame(Counter::ImageRegionLookups),
+			        per_frame(Counter::ImageRegionCacheHits),
+			        per(Counter::ImageRegionPages, Counter::ImageRegionLookups),
+			        per(Counter::ImageRegionOwnerChecks, Counter::ImageRegionLookups),
+			        per(Counter::ImageRegionMatches, Counter::ImageRegionLookups)));
+			Row("  FindImage",
+			    Fmt("%.0f/frame  %.1f candidates  %.1f same start /call  %.0f overlap /frame",
+			        per_frame(Counter::FindImageCalls),
+			        per(Counter::FindImageCandidates, Counter::FindImageCalls),
+			        per(Counter::FindImageSameStart, Counter::FindImageCalls),
+			        per_frame(Counter::FindImageOverlapResolves)));
+		}
 		Row("Texture evictions", Fmt("%.0f/s", Rate(shown, Counter::TextureEvictions)));
 		TransferRow(shown, "Buffer transfers", Counter::BufferUploadBytes,
 		            Counter::BufferDownloadBytes);
 		Row("Buffer evictions", Fmt("%.0f/s", Rate(shown, Counter::BufferEvictions)));
+		{
+			const double frames = std::max(shown.fps, 1.0);
+			Row("Buffer obtains", Fmt("%.0f/frame  (%.0f streamed, %.0f uploaded, %.0f written)",
+			                          Rate(shown, Counter::BufferObtains) / frames,
+			                          Rate(shown, Counter::BufferObtainStreamed) / frames,
+			                          Rate(shown, Counter::BufferObtainUploads) / frames,
+			                          Rate(shown, Counter::BufferObtainWritten) / frames));
+			Row("  clean reads", Fmt("%.0f/frame  (%.0f repeated in one command buffer)",
+			                         Rate(shown, Counter::BufferObtainCleanReads) / frames,
+			                         Rate(shown, Counter::BufferObtainCleanRepeats) / frames));
+		}
+		Row("Guest sparse reads",
+		    Fmt("%.0f/frame  (%.0f walked the mappings)",
+		        Rate(shown, Counter::GuestSparseReads) / std::max(shown.fps, 1.0),
+		        Rate(shown, Counter::GuestSparseReadMisses) / std::max(shown.fps, 1.0)));
 		ImGui::EndTable();
 	}
 }

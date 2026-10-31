@@ -20,7 +20,9 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+
 #include <queue>
+
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -50,26 +52,26 @@ struct Profile;
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {
-	bool                       negative_one_to_one      = false;
-	bool                       depth_clip_enable        = true;
-	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
+	bool                  negative_one_to_one = false;
+	bool                  depth_clip_enable   = true;
+	vk::PrimitiveTopology topology            = vk::PrimitiveTopology::ePointList;
 	// 0 without tessellation, 3 for a rectangle list, else the input control points.
-	uint32_t                   patch_control_points     = 0;
-	bool                       primitive_restart_enable = false;
-	uint32_t                   samples                  = 1;
-	bool                       sample_shading_enable    = false;
-	bool                       alpha_to_coverage_enable = false;
-	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
-	bool                       provoking_vtx_last                                 = false;
-	vk::PolygonMode            polygon_mode                                       = vk::PolygonMode::eFill;
-	uint8_t                    color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    color_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    color_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
-	uint8_t                    alpha_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    alpha_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
-	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	uint32_t        patch_control_points                               = 0;
+	bool            primitive_restart_enable                           = false;
+	uint32_t        samples                                            = 1;
+	bool            sample_shading_enable                              = false;
+	bool            alpha_to_coverage_enable                           = false;
+	uint32_t        color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
+	bool            provoking_vtx_last                                 = false;
+	vk::PolygonMode polygon_mode                                       = vk::PolygonMode::eFill;
+	uint8_t         color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
+	uint8_t         color_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
+	uint8_t         color_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
+	uint8_t         alpha_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
+	uint8_t         alpha_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
+	uint8_t         alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
+	bool            separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	bool            blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
 };
 
 struct PipelineRenderingState {
@@ -120,26 +122,26 @@ struct ShaderModule {
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	std::vector<uint32_t>                        function_code;
 	// VS or LS: the host format of each vertex input attribute.
-	std::vector<vk::Format>                      vertex_formats;
+	std::vector<vk::Format> vertex_formats;
 	// Rectangle-list PS: the parameters it reads.
-	std::vector<RectListParameter>               rect_parameters;
+	std::vector<RectListParameter> rect_parameters;
 };
 
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
 struct DrawRenderState {
-	RenderDepthInfo                      depth_info;
-	RenderColorInfo                      color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	uint32_t                             color_count                              = 0;
+	RenderDepthInfo depth_info;
+	RenderColorInfo color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint32_t        color_count                              = 0;
 	// Color targets the pixel program writes.
-	uint32_t                             mrt_mask                                 = 0;
+	uint32_t                             mrt_mask = 0;
 	vk::PrimitiveTopology                topology = vk::PrimitiveTopology::ePointList;
-	bool                                 primitive_restart_enable                 = false;
-	bool                                 ps_active                                = false;
+	bool                                 primitive_restart_enable = false;
+	bool                                 ps_active                = false;
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo                 ps_input_info;
 	// Input: the user-data slots a GPU-read indirect draw patches.
-	ShaderIndirectOffsets                indirect_offsets;
-	bool                                 indirect_draw = false;
+	ShaderIndirectOffsets indirect_offsets;
+	bool                  indirect_draw = false;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
@@ -185,6 +187,9 @@ public:
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		// What the layout was built from, so commits can be checked against it.
+		std::array<uint64_t, 4> stage_ids {};
+		std::vector<uint32_t>   set_bindings;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
@@ -201,11 +206,11 @@ private:
 
 	struct Program {
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
-		ShaderRecompiler::IR::ResourcePlan           resource_plan;
-		ShaderRecompiler::IR::ResourceSnapshot       resources;
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<ShaderModule>                    modules;
-		bool                                         skip_dispatch = false;
+		ShaderRecompiler::IR::ResourcePlan              resource_plan;
+		ShaderRecompiler::IR::ResourceSnapshot          resources;
+		ShaderRecompiler::IR::ResourceSpecialization    specialization;
+		std::vector<ShaderModule>                       modules;
+		bool                                            skip_dispatch = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
@@ -234,16 +239,16 @@ private:
 
 	using ModuleMap = std::unordered_map<uint64_t, const ShaderModule*>;
 
-	GraphicContext&                        m_graphics;
-	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
+	GraphicContext&                                         m_graphics;
+	ShaderRecompiler::IR::ImageHeapSource*                  m_image_heap;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
-	ProgramKey                             m_lookup_key;
-	vk::PipelineCache             m_driver_cache = nullptr;
-	std::filesystem::path         m_driver_cache_path;
+	ProgramKey                                                                        m_lookup_key;
+	vk::PipelineCache                     m_driver_cache = nullptr;
+	std::filesystem::path                 m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	bool                          m_driver_cache_dirty = false;
+	bool                                  m_driver_cache_dirty = false;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
@@ -253,12 +258,12 @@ private:
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
 	                               uint32_t& push_data_cursor);
-	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
-	                            ShaderRecompiler::CompileOptions  options,
-	                            ShaderRecompiler::TranslateResult translated,
-	                            uint32_t                          push_data_cursor);
-	void InitializeDriverCache();
-	void CheckpointDriverCache();
+	ShaderModule&       CompileModule(Program& program, const ProgramKey& key,
+	                                  ShaderRecompiler::CompileOptions  options,
+	                                  ShaderRecompiler::TranslateResult translated,
+	                                  uint32_t                          push_data_cursor);
+	void                InitializeDriverCache();
+	void                CheckpointDriverCache();
 
 	// pipelineSerialization.cpp
 	void WarmUp(const std::filesystem::path& path);
@@ -282,9 +287,9 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
 
 // Stages are indexed like GraphicsPipelineKey::stage_ids.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const GraphicsPipelineKey&                 key,
+                            const GraphicsPipelineKey&                key,
                             const std::array<const ShaderModule*, 4>& stages,
-                            vk::PipelineCache                          driver_cache);
+                            vk::PipelineCache                         driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderModule& module, vk::PipelineCache driver_cache);
 

@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <deque>
 #include <memory>
@@ -112,8 +113,18 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
+	// Measures how long the caller waits, including commands queued ahead of this one.
+	const Common::DebugCounters::ScopedTimer total(
+	    Common::DebugCounters::Counter::SyncGpuCommands,
+	    Common::DebugCounters::Counter::SyncGpuCommandNs);
+	const auto            queued = std::chrono::steady_clock::now();
 	std::binary_semaphore done {0};
-	SendCommand([operation = std::move(command), &done]() mutable {
+	SendCommand([operation = std::move(command), &done, queued]() mutable {
+		Common::DebugCounters::Add(
+		    Common::DebugCounters::Counter::SyncGpuCommandQueueNs,
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              std::chrono::steady_clock::now() - queued)
+		                              .count()));
 		operation();
 		done.release();
 	});
@@ -319,8 +330,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
-		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
-		     " size=%u\n",
+		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64 " size=%u\n",
 		     dst_address, value, num_bytes);
 	}
 }
@@ -401,8 +411,13 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	// Guest job threads spin while they wait for work; keep them from taking this core.
+	if (!Common::Thread::RaiseCurrentPriority()) {
+		Log::WriteToConsoleAndLog("GPU: could not raise the GPU thread priority.\n");
+	}
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	Common::DebugCounters::SetPm4Op(Common::DebugCounters::READ_FAULT_GPU_OUTSIDE);
 
 	for (;;) {
 		Submission                   submission;
@@ -529,9 +544,7 @@ bool GuestGpu::Process(Submission& submission) {
 				cp.BufferFlush();
 			}
 			break;
-		case SubmissionType::FlipPreparation:
-			cp.PrepareCpuFlip(submission.flip_request_id);
-			break;
+		case SubmissionType::FlipPreparation: cp.PrepareCpuFlip(submission.flip_request_id); break;
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
@@ -586,6 +599,21 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
 	g_current_execution->m_suspended = true;
+}
+
+static bool IsDrawOrDispatchPacket(uint32_t opcode) {
+	switch (opcode) {
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI: return true;
+		default: return false;
+	}
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
@@ -654,11 +682,17 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		Common::DebugCounters::SetPm4Op(opcode);
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		Common::DebugCounters::SetPm4Op(Common::DebugCounters::READ_FAULT_GPU_OUTSIDE);
+		Common::DebugCounters::SetDrawPhase(nullptr);
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
+		}
+		if (IsDrawOrDispatchPacket(opcode)) {
+			GetScheduler().SubmitIfGpuIdle();
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
@@ -706,8 +740,19 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 
 uint32_t CommandProcessor::NumInstances() {
 	if (m_num_instances_addr != 0) {
+		namespace Counters = Common::DebugCounters;
+		auto&      buffers = m_renderer.GetBufferCache();
+		const bool dirty =
+		    Counters::Enabled() && buffers.HasGpuDirtyBytes(m_num_instances_addr, sizeof(uint32_t));
 		m_num_instances      = *reinterpret_cast<const uint32_t*>(m_num_instances_addr);
 		m_num_instances_addr = 0;
+		Counters::Add(Counters::Counter::NumInstancesReads);
+		if (dirty) {
+			Counters::Add(Counters::Counter::NumInstancesReadsGpuDirty);
+		}
+		if (m_num_instances == 1) {
+			Counters::Add(Counters::Counter::NumInstancesReadsOne);
+		}
 	}
 	return m_num_instances;
 }
@@ -718,15 +763,13 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	uint64_t value = 0;
 
 	switch (op) {
-		case 0x00:
-			m_predicate_skip = false;
-			return;
+		case 0x00: m_predicate_skip = false; return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			m_renderer.GetOcclusionQueries().Publish();
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
-			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
+			const auto*        results   = reinterpret_cast<const volatile uint64_t*>(address);
 			for (uint32_t db = 0; db < 16u; db++) {
 				const auto begin = results[db * 2u];
 				const auto end   = results[db * 2u + 1u];
@@ -758,8 +801,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		if (log_count.fetch_add(1) < 128) {
 			LOGF("\t bool predication: addr=0x%016" PRIx64 ", value=0x%016" PRIx64
 			     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
-			     reinterpret_cast<uint64_t>(address), value, condition,
-			     m_predicate_skip ? 1u : 0u, wait_op);
+			     reinterpret_cast<uint64_t>(address), value, condition, m_predicate_skip ? 1u : 0u,
+			     wait_op);
 		}
 	}
 }
@@ -794,8 +837,7 @@ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters
 		if (location == Pm4::SH_NOP) {
 			return;
 		}
-		EXIT_NOT_IMPLEMENTED(location >= Pm4::SH_NUM ||
-		                     g_hw_sh_indirect_func[location] == nullptr);
+		EXIT_NOT_IMPLEMENTED(location >= Pm4::SH_NUM || g_hw_sh_indirect_func[location] == nullptr);
 		g_hw_sh_indirect_func[location](cp, location, value);
 	};
 	write(registers.vertex_offset, vertex_offset);
@@ -925,7 +967,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}
 
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode, IsAsyncComputeQueue());
+		                                              thread_group_y, thread_group_z, mode,
+		                                              IsAsyncComputeQueue());
 	}
 }
 
@@ -937,6 +980,12 @@ void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+		namespace Counters = Common::DebugCounters;
+		Counters::Add(Counters::Counter::DispatchArgsReads);
+		if (Counters::Enabled() && m_renderer.GetBufferCache().HasGpuDirtyBytes(
+		                               args_addr, sizeof(vk::DispatchIndirectCommand))) {
+			Counters::Add(Counters::Counter::DispatchArgsReadsGpuDirty);
+		}
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
 		DispatchDirect(args->x, args->y, args->z, mode);
 		return;
@@ -1011,7 +1060,11 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
 		case 2: write_label(&data, sizeof(data)); break;
 		case 5: {
-			GetScheduler().Finish();
+			{
+				const Common::DebugCounters::ScopedGpuWaitSite wait_site(
+				    Common::DebugCounters::GpuWaitSite::Gds);
+				GetScheduler().Finish();
+			}
 			const auto gds = static_cast<uint32_t>(data);
 			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
 			              static_cast<uint32_t*>(address), gds & 0xffffu, gds >> 16u);

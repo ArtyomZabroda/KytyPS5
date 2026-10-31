@@ -12,9 +12,13 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <bitset>
+#include <chrono>
 #include <map>
+#include <optional>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -32,7 +36,7 @@ struct TextureCacheTestAccess;
 namespace BcAlias {
 [[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
 [[nodiscard]] bool Publish(TextureCache& cache, Image& image);
-void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+void               Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 } // namespace BcAlias
 
 class TextureCache {
@@ -98,9 +102,9 @@ private:
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
 	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
-		using FuncReturn = typename std::invoke_result<Func, uint64_t>::type;
+		using FuncReturn                   = typename std::invoke_result<Func, uint64_t>::type;
 		static constexpr bool RETURNS_BOOL = std::is_same_v<FuncReturn, bool>;
-		const uint64_t page_end = (address + size - 1) >> ImagePageTable::kPageBits;
+		const uint64_t        page_end     = (address + size - 1) >> ImagePageTable::kPageBits;
 		for (uint64_t page = address >> ImagePageTable::kPageBits; page <= page_end; ++page) {
 			if constexpr (RETURNS_BOOL) {
 				if (func(page)) {
@@ -112,11 +116,24 @@ private:
 		}
 	}
 
-	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
-	void                      RegisterImage(ImageId id);
-	void                      UnregisterImage(ImageId id);
-	void                      DeleteImage(ImageId id);
-	void                      FreeImage(ImageId id);
+	[[nodiscard]] ImageId InsertImage(const ImageInfo& info);
+	void                  RegisterImage(ImageId id);
+	void                  UnregisterImage(ImageId id);
+	void                  DeleteImage(ImageId id);
+	// Why an image left the cache, for the churn diagnostics.
+	enum class FreeReason : uint8_t {
+		Other,
+		Gc,
+		Unmap,
+		Overlap,
+		DepthOverlap,
+		BcAlias,
+		Expand,
+		Mips,
+		Stencil,
+		Count
+	};
+	void                      FreeImage(ImageId id, FreeReason reason = FreeReason::Other);
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
@@ -139,13 +156,12 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
-	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
-	                                                uint32_t metadata_base_layer);
-	void                        InitializeImage(ImageId id);
-	[[nodiscard]] bool          CanDownload(const Image& image) const;
-	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
-	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
-	                   uint64_t destination_size, uint32_t levels);
+	void MaterializeColorClear(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer);
+	void InitializeImage(ImageId id);
+	[[nodiscard]] bool CanDownload(const Image& image) const;
+	void               UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void               DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
+	                                 uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
@@ -154,39 +170,80 @@ private:
 	// Caller holds m_lock and ends rendering. Begins rendering `layers` layers of one color mip
 	// through a `format` view, clearing them or, when `clear` is null, loading them; returns the
 	// render area.
-	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
-	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
+	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level, uint32_t layer,
+	                               uint32_t layers, const vk::ClearValue* clear,
 	                               vk::CommandBuffer command);
-	void PrepareImageCopy(Image& image);
-	void RefreshCopySource(ImageId id);
-	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
-	void               CopyImage(ImageId destination, ImageId source);
+	void       PrepareImageCopy(Image& image);
+	void       RefreshCopySource(ImageId id);
+	[[nodiscard]] bool    CopyD16(Image& destination, Image& source);
+	void                  CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	void               RecordUpload(const Image& image);
+	void               RecordChurn(const Image& image, std::optional<FreeReason> reason);
+	void               ReportUploads();
 
-	GraphicContext&                                   m_graphics;
-	CommandScheduler&                                 m_scheduler;
-	TrackingSpinLock                                  m_lock;
-	PageManager&                                      m_page_manager;
-	BlitHelper                                        m_blit_helper;
-	TileManager                                       m_tiler;
-	BufferCache&                                      m_buffer_cache;
-	Common::SlotVector<Image>                         m_slot_images;
-	ImagePageTable                                    m_image_page_table;
+	// Upload diagnostics while the performance panel is visible, keyed by guest address.
+	struct UploadSample {
+		uint64_t   hash      = 0;
+		uint64_t   size      = 0;
+		uint32_t   uploads   = 0; // Since the last report.
+		uint32_t   unchanged = 0;
+		uint32_t   reasons   = 0; // UploadReason bits of the unchanged uploads.
+		uint32_t   width     = 0;
+		uint32_t   height    = 0;
+		uint32_t   tile_mode = 0;
+		vk::Format format    = vk::Format::eUndefined;
+	};
+	// Image creations and frees at one guest address since the last report.
+	struct ChurnSample {
+		uint32_t                                                     created = 0;
+		std::array<uint32_t, static_cast<size_t>(FreeReason::Count)> freed {};
+		uint64_t                                                     size   = 0;
+		uint32_t                                                     width  = 0;
+		uint32_t                                                     height = 0;
+		vk::Format format = vk::Format::eUndefined;
+	};
+
+	GraphicContext&           m_graphics;
+	CommandScheduler&         m_scheduler;
+	TrackingSpinLock          m_lock;
+	PageManager&              m_page_manager;
+	BlitHelper                m_blit_helper;
+	TileManager               m_tiler;
+	BufferCache&              m_buffer_cache;
+	Common::SlotVector<Image> m_slot_images;
+	ImagePageTable            m_image_page_table;
+	// Recent region searches. Their results depend only on the query and the page index, which
+	// changes only when an image is registered or unregistered; each change bumps the generation.
+	struct RegionQuery {
+		uint64_t                generation   = 0;
+		uint64_t                address      = 0;
+		uint64_t                size         = 0;
+		bool                    page_overlap = false;
+		uint32_t                count        = 0;
+		std::array<ImageId, 16> ids {};
+	};
+	mutable std::array<RegionQuery, 256>              m_region_queries {};
+	uint64_t                                          m_region_generation = 1;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
-	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
-	uint64_t         m_gc_tick                = 0;
-	bool             m_readback_linear_images = false;
-	bool             m_readback_tiled_images  = false;
+	uint64_t                                   m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
+	uint64_t                                   m_gc_tick                = 0;
+	bool                                       m_readback_linear_images = false;
+	bool                                       m_readback_tiled_images  = false;
+	std::unordered_map<uint64_t, UploadSample> m_upload_samples;
+	std::unordered_map<uint64_t, ChurnSample>  m_churn_samples;
+	std::vector<uint8_t>                       m_upload_scratch;
+	std::chrono::steady_clock::time_point      m_upload_report {};
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

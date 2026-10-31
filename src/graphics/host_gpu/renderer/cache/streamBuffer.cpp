@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -63,13 +64,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
 	vk::BufferCreateInfo buffer_info {};
-	buffer_info.size        = size;
-	buffer_info.usage       = flags;
+	buffer_info.size  = size;
+	buffer_info.usage = flags;
 
-	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	const bool              with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	VmaAllocationCreateInfo allocation_info {};
-	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
+	allocation_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
@@ -77,9 +77,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	const auto        result        = static_cast<vk::Result>(
+	    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+	                    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
 	}
@@ -120,8 +120,7 @@ bool Buffer::IsInBounds(uint64_t address, uint64_t size) const noexcept {
 void Buffer::Flush(uint64_t offset, uint64_t size) {
 	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
-		const auto result =
-		    vmaFlushAllocation(m_graphics->allocator, m_allocation, offset, size);
+		const auto result = vmaFlushAllocation(m_graphics->allocator, m_allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
 }
@@ -320,6 +319,8 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
 			return false;
 		}
+		const Common::DebugCounters::ScopedGpuWaitSite wait_site(
+		    Common::DebugCounters::GpuWaitSite::StreamBuffer);
 		Scheduler().Wait(watch.tick);
 		if (Usage() == MemoryUsage::Download) {
 			Scheduler().WaitPriorityOperations(watch.tick);

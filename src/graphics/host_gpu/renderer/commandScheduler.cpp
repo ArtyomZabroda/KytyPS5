@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <optional>
 
@@ -192,16 +193,51 @@ void CommandScheduler::Finish() {
 	PopPendingOperations();
 }
 
+// Nanoseconds since `start`, which moves to now.
+static uint64_t LapNs(std::chrono::steady_clock::time_point& start) {
+	const auto now     = std::chrono::steady_clock::now();
+	const auto elapsed = now - start;
+	start              = now;
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+}
+
 void CommandScheduler::Wait(uint64_t tick) {
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
+		namespace Counters = Common::DebugCounters;
+		// Readbacks wait for earlier submissions, then for the one holding their copy.
+		const bool split = Counters::Enabled() &&
+		                   Counters::CurrentGpuWaitSite() == Counters::GpuWaitSite::BufferReadback;
+		Counters::ReadbackSplit               times;
+		std::chrono::steady_clock::time_point start;
+		if (split) {
+			m_master.Refresh();
+			const auto done     = m_master.KnownGpuTick();
+			times.backlog_ticks = tick - 1 > done ? tick - 1 - done : 0;
+			start               = std::chrono::steady_clock::now();
+		}
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
+		if (split) {
+			times.submit_ns = LapNs(start);
+			m_master.Wait(tick - 1);
+			times.backlog_ns = LapNs(start);
+		}
 		m_master.Wait(tick);
+		if (split) {
+			times.current_ns = LapNs(start);
+			Counters::Add(Counters::Counter::ReadbackSplitWaits);
+			Counters::Add(Counters::Counter::ReadbackSplitSubmitNs, times.submit_ns);
+			Counters::Add(Counters::Counter::ReadbackSplitBacklogNs, times.backlog_ns);
+			Counters::Add(Counters::Counter::ReadbackSplitCurrentNs, times.current_ns);
+			Counters::Add(Counters::Counter::ReadbackSplitBacklogTicks, times.backlog_ticks);
+			Counters::t_last_readback_split = times;
+		}
 		BeginNext();
 	} else {
 		m_master.Wait(tick);
@@ -261,6 +297,8 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	const Common::DebugCounters::ScopedGpuWaitSite wait_site(
+	    Common::DebugCounters::GpuWaitSite::Background);
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
@@ -299,12 +337,19 @@ void CommandScheduler::DrainPriorityOperations() {
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
-	m_operation_available.wait(lock, [this, tick] {
+	const auto       done = [this, tick] {
 		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
 		const bool queued_before_or_at =
 		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
 		return !active_before_or_at && !queued_before_or_at;
-	});
+	};
+	if (done()) {
+		return;
+	}
+	const Common::DebugCounters::ScopedTimer timer(
+	    Common::DebugCounters::Counter::PriorityCallbackWaits,
+	    Common::DebugCounters::Counter::PriorityCallbackWaitNs);
+	m_operation_available.wait(lock, done);
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
@@ -336,7 +381,24 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
+	m_command_begin = std::chrono::steady_clock::now();
 	return m_command;
+}
+
+void CommandScheduler::SubmitIfGpuIdle() {
+	// Each submit costs tens of microseconds; batches shorter than this are not worth one.
+	constexpr auto MinRecording = std::chrono::milliseconds(1);
+	if (!Active() || m_command.IsInvalid() ||
+	    std::chrono::steady_clock::now() - m_command_begin < MinRecording) {
+		return;
+	}
+	// While the GPU still runs earlier submissions it has work, and the batch keeps growing.
+	m_master.Refresh();
+	if (m_master.KnownGpuTick() + 1 < CurrentTick()) {
+		return;
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::EarlySubmits);
+	Flush();
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {

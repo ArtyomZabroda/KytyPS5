@@ -153,13 +153,13 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	g_unresolved_stub_thunk_offset += thunk_size;
 
 	uint8_t bytes[thunk_size] = {
-	    0x48, 0x83, 0xec, 0x08,               // sub rsp, 8
-	    0x48, 0xbf, 0, 0, 0, 0, 0, 0, 0, 0, // mov rdi, record_id
-	    0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, UnresolvedImportStub
-	    0xff, 0xd0,                           // call rax
-	    0x48, 0x83, 0xc4, 0x08,               // add rsp, 8
-	    0x0f, 0x57, 0xc0,                     // xorps xmm0, xmm0
-	    0xc3,                                 // ret
+	    0x48, 0x83, 0xec, 0x08,                   // sub rsp, 8
+	    0x48, 0xbf, 0,    0,    0, 0, 0, 0, 0, 0, // mov rdi, record_id
+	    0x48, 0xb8, 0,    0,    0, 0, 0, 0, 0, 0, // mov rax, UnresolvedImportStub
+	    0xff, 0xd0,                               // call rax
+	    0x48, 0x83, 0xc4, 0x08,                   // add rsp, 8
+	    0x0f, 0x57, 0xc0,                         // xorps xmm0, xmm0
+	    0xc3,                                     // ret
 	};
 	const auto target = reinterpret_cast<uint64_t>(UnresolvedImportStub);
 	std::memcpy(bytes + 6, &record_id, sizeof(record_id));
@@ -669,12 +669,31 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// SRT walker loads read descriptor tables on the GPU thread. A page that also holds
+		// GPU-written bytes faults on every read; clean bytes come from the backing store
+		// without waiting for the GPU. GPU-written bytes still take the readback below.
+		if (const auto length =
+		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address);
+		    length != 0 && access == GpuAccess::Read) {
+			namespace Emulator  = Loader::X64InstructionEmulator;
+			const auto address  = Emulator::ReadGpr(info->native_context, 10);
+			uint32_t   value    = 0;
+			const bool in_range = info->access_violation_vaddr >= address &&
+			                      info->access_violation_vaddr - address < sizeof(value);
+			if (in_range && Libs::LibKernel::Memory::TryReadCleanBufferBacking(address, &value,
+			                                                                   sizeof(value))) {
+				Emulator::CompleteLoad32(info->native_context, length, value);
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::SrtWalkerBackingLoads);
+				return true;
+			}
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::SrtWalkerReadbacks);
+		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
-		if (const auto length =
-		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
+		if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
+		        info->exception_address)) {
 			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
 			return true;
 		}
@@ -882,10 +901,10 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	if (!ri.resolved) {
 		const bool weak = ri.bind == BindType::Weak || !program->fail_if_global_not_resolved;
 		if (!weak) {
-			LOGF("Stubbed: %s\n",
-			     fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value, ri.name,
-			                 magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
-			                 ri.dbg_name).c_str());
+			LOGF("Stubbed: %s\n", fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr,
+			                                  ri.value, ri.name, magic_enum::enum_name(ri.type),
+			                                  magic_enum::enum_name(ri.bind), ri.dbg_name)
+			                          .c_str());
 		}
 		if (ri.type == SymbolType::Object) {
 			value = g_invalid_memory;
@@ -907,10 +926,10 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	if (program->dbg_print_reloc && patched && !ri.bind_self &&
 	    (ri.bind == BindType::Global || ri.bind == BindType::Weak ||
 	     ri.type == SymbolType::TlsModule)) {
-		LOGF("Relocate: %s\n",
-		     fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value, ri.name,
-		                 magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
-		                 ri.dbg_name).c_str());
+		LOGF("Relocate: %s\n", fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr,
+		                                   ri.value, ri.name, magic_enum::enum_name(ri.type),
+		                                   magic_enum::enum_name(ri.bind), ri.dbg_name)
+		                           .c_str());
 	}
 	return ri.resolved;
 }
@@ -1126,15 +1145,15 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 
 	for (auto* importer: m_programs) {
 		const auto& info = *importer->dynamic_info;
-		const auto rela_count =
+		const auto  rela_count =
 		    static_cast<uint32_t>(info.rela_table_total_size / sizeof(Elf64_Rela));
 		ForEachRelocation(importer, [&](Elf64_Rela* r, uint32_t index, bool jmprela) {
 			const auto bit_index = (jmprela ? rela_count : 0) + index;
 			auto&      bits      = importer->rela_bits[bit_index >> 3u];
 			const auto mask      = 1u << (bit_index & 7u);
 			const auto type      = r->GetType();
-			if ((bits & mask) == 0 || (type != R_X86_64_64 && type != R_X86_64_GLOB_DAT &&
-			                           type != R_X86_64_JUMP_SLOT)) {
+			if ((bits & mask) == 0 ||
+			    (type != R_X86_64_64 && type != R_X86_64_GLOB_DAT && type != R_X86_64_JUMP_SLOT)) {
 				return;
 			}
 			const auto& symbol = info.symbol_table[r->GetSymbol()];
@@ -1267,7 +1286,8 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 #endif
 
 	// The runtime automatically loads libc; other PRXs are requested by the application.
-	const auto libc_path = Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_module/libc.prx");
+	const auto libc_path =
+	    Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_module/libc.prx");
 	auto* libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
 	RelocateAll();
 
@@ -1285,8 +1305,8 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 
 	if (auto entry = GetEntry(); entry != 0) {
 		const auto& arguments = Config::GetGuestArguments();
-		const auto params_size = offsetof(EntryParams, argv) +
-		                         (arguments.size() + 2) * sizeof(const char*);
+		const auto  params_size =
+		    offsetof(EntryParams, argv) + (arguments.size() + 2) * sizeof(const char*);
 		auto* params = reinterpret_cast<EntryParams*>(
 		    (reinterpret_cast<uintptr_t>(main_stack_top) - params_size - 0x100u) &
 		    ~static_cast<uintptr_t>(0x0f));
@@ -1388,7 +1408,7 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 
 			if (rec == nullptr) {
 				for (auto* p: m_programs) {
-					const auto& libs = p->dynamic_info->export_libs;
+					const auto& libs    = p->dynamic_info->export_libs;
 					const auto& modules = p->dynamic_info->export_modules;
 					if (p->export_symbols == nullptr ||
 					    std::find(libs.begin(), libs.end(), *l) == libs.end() ||
@@ -1690,7 +1710,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
-	program->mapped_size = program->base_size_aligned + tls_handler_size;
+	program->mapped_size   = program->base_size_aligned + tls_handler_size;
 	const bool emulate_amd = Config::AmdCpuEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
@@ -1815,10 +1835,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    !function_starts.empty();
 		const auto module_name = Common::PathToString(program->file_name.filename());
 		if (!have_function_starts) {
-			Log::WriteToConsoleAndLog(
-			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
-			                module_name));
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "{}: {} not patched (function boundaries unavailable)\n",
+			    emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection", module_name));
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
@@ -1833,8 +1852,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
 				     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
-				     module_name.c_str(),
-				     result.function_count, result.red_zone_function_count,
+				     module_name.c_str(), result.function_count, result.red_zone_function_count,
 				     result.memory_instruction_count, result.patched_memory_instruction_count,
 				     result.short_memory_instruction_count,
 				     result.stack_dependent_memory_instruction_count,
@@ -1964,7 +1982,7 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	GetDynValue(elf, &program->dynamic_info->rela_table_entry_size, DT_RELAENT);
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->rela_table_total_size % sizeof(Elf64_Rela) != 0 ||
 	                     program->dynamic_info->jmprela_table_size % sizeof(Elf64_Rela) != 0);
-	const auto rela_count = program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rela);
+	const auto rela_count    = program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rela);
 	const auto jmprela_count = program->dynamic_info->jmprela_table_size / sizeof(Elf64_Rela);
 	program->rela_bits.resize((rela_count + jmprela_count + 7u) / 8u);
 
@@ -2027,8 +2045,8 @@ void RuntimeLinker::Relocate(Program* program) {
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->rela_table == nullptr);
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->symbol_table == nullptr);
 
-	const auto rela_count = static_cast<uint32_t>(
-	    program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rela));
+	const auto rela_count =
+	    static_cast<uint32_t>(program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rela));
 
 	ForEachRelocation(program, [&](Elf64_Rela* r, uint32_t index, bool jmprela) {
 		const auto bit_index = (jmprela ? rela_count : 0) + index;

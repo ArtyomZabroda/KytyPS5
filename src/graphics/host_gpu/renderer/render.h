@@ -12,6 +12,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -28,6 +29,22 @@ struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 class RenderContext;
 class CommandScheduler;
+
+// The T# dwords and the shader's use of them, which together fix a texture's image description.
+using TextureShapeKey = std::array<uint32_t, 14>;
+
+struct TextureShapeKeyHash {
+	[[nodiscard]] size_t operator()(const TextureShapeKey& key) const noexcept;
+};
+
+struct TextureShape {
+	TextureCache::ImageDesc desc;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	bool                    shader_conversion = false;
+	// Metadata, view and storage checks follow the heap mapping test, as they did per draw.
+	bool complete = false;
+};
 struct RenderExecutorTestAccess;
 
 enum class CommandBufferDebugOp : uint32_t {
@@ -161,19 +178,20 @@ public:
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                    bool async_compute);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
 	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
-	void                           FindBuffers(std::span<PreparedBindings* const> stages);
-	void                           RebindBuffers(PreparedBindings& bindings);
-	void                           RebindImages(PreparedBindings& bindings);
+	void FindBuffers(std::span<PreparedBindings* const> stages);
+	void RebindBuffers(PreparedBindings& bindings);
+	void RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
-	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 
 private:
@@ -187,17 +205,16 @@ private:
 	};
 
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-	                             std::span<RenderColorInfo> colors);
+	                             std::span<RenderColorInfo>         colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                   const DrawEmitInfo& emit, DrawRenderState& state);
-	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
-	                                          const DrawCallInfo& draw,
-	                                          uint32_t            render_target_slice_offset,
+	                                    const DrawEmitInfo& emit, DrawRenderState& state);
+	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                          uint32_t         render_target_slice_offset,
 	                                          DrawRenderState& state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, const DrawEmitInfo& emit,
@@ -207,27 +224,29 @@ private:
 	                                               vk::ImageAspectFlags& feedback_aspects,
 	                                               std::span<PreparedBindings* const> stages = {});
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
-	                                              uint32_t render_target_slice_offset);
+	                                              uint32_t       render_target_slice_offset);
 	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
-	                                                       uint32_t render_target_slice_offset);
+	                                                        uint32_t       render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
-	                                        CommandBuffer& command, uint32_t group_x,
-	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	                                         CommandBuffer& command, uint32_t group_x,
+	                                         uint32_t group_y, uint32_t group_z, uint32_t mode);
 
-	RenderContext&                        m_context;
-	GraphicsBindings                     m_graphics_bindings;
-	PreparedBindings                     m_compute_bindings;
-	std::vector<ImageId>                  m_bound_images;
-	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
-	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
-	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
-	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	RenderContext&       m_context;
+	GraphicsBindings     m_graphics_bindings;
+	PreparedBindings     m_compute_bindings;
+	std::vector<ImageId> m_bound_images;
+	// Draws bind the same textures every frame; their descriptions depend on nothing else.
+	std::unordered_map<TextureShapeKey, TextureShape, TextureShapeKeyHash> m_texture_shapes;
+	std::vector<vk::DescriptorImageInfo>                                   m_descriptor_images;
+	std::vector<vk::WriteDescriptorSet>                                    m_descriptor_writes;
+	vk::DescriptorSetLayout m_pssr_descriptor_layout = nullptr;
+	vk::PipelineLayout      m_pssr_pipeline_layout   = nullptr;
+	vk::Pipeline            m_pssr_pipeline          = nullptr;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

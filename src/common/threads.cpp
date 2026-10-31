@@ -235,6 +235,14 @@ bool Thread::IsMainThread() {
 	return g_main_thread == std::this_thread::get_id();
 }
 
+bool Thread::RaiseCurrentPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0;
+#else
+	return false;
+#endif
+}
+
 std::string Thread::GetId() const {
 	std::stringstream ss;
 	ss << m_thread->m_thread.get_id();

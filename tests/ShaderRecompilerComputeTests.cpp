@@ -280,14 +280,14 @@ struct TextureCacheTestAccess {
     cache.m_lru_cache = {};
     cache.m_slot_images.ForEach([&](ImageId id, Image &image) {
       if (image.registered) {
-        image.tick_accessed_last = cache.m_scheduler.CurrentTick();
+        image.frame_accessed_last = tick;
         live.push_back(id);
       }
     });
     for (const auto id : oldest) {
       const auto owner = cache.m_slot_images.try_get(id);
       if (owner != nullptr && owner->registered) {
-        owner->tick_accessed_last = 0;
+        owner->frame_accessed_last = 0;
         owner->lru_id = cache.m_lru_cache.Insert(id, 0);
       }
     }
@@ -5396,7 +5396,8 @@ public:
       };
       const auto draw = [&] {
         heap.Rebind(executor);
-        heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+        heap.Commit(scheduler.Current());
+        heap.Bind(scheduler.Current().Handle(), vk::PipelineBindPoint::eCompute, layout);
         scheduler.Finish();
         heap.BeginDraw();
       };
@@ -5491,7 +5492,8 @@ public:
       heap.Rebind(executor);
       const auto freed = ImageHeapTestAccess::ImageOf(heap, filtered.slots[72]);
       textures.UnmapMemory(base + 0x10000u + 13u * 0x1000u, 0x1000u);
-      heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+      heap.Commit(scheduler.Current());
+      heap.Bind(scheduler.Current().Handle(), vk::PipelineBindPoint::eCompute, layout);
       Require(name, "freed image layout",
               !textures.GetImage(freed).registered &&
                   textures.GetImage(freed).backing.state.layout ==

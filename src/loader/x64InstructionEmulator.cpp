@@ -4,10 +4,10 @@
 
 #include <Zydis/Zydis.h>
 #include <bit>
+#include <cpuid.h>
 #include <cstring>
 #include <emmintrin.h>
 #include <xmmintrin.h>
-#include <cpuid.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -424,7 +424,7 @@ struct Context {
 			return; // An absent AVX component restores zeroes.
 		}
 		DWORD size = 0;
-		auto* ymm = static_cast<M128A*>(LocateXStateFeature(native, XSTATE_AVX, &size));
+		auto* ymm  = static_cast<M128A*>(LocateXStateFeature(native, XSTATE_AVX, &size));
 		if (ymm != nullptr && size >= (index + 1u) * sizeof(M128A)) {
 			ymm[index] = {};
 		}
@@ -475,8 +475,8 @@ struct Context {
 		if (index >= 16 || native->uc_mcsize < sizeof(_STRUCT_MCONTEXT_AVX64)) {
 			return;
 		}
-		auto* avx = reinterpret_cast<_STRUCT_MCONTEXT_AVX64*>(native->uc_mcontext);
-		auto* ymmh = &avx->__fs.__fpu_ymmh0;
+		auto* avx   = reinterpret_cast<_STRUCT_MCONTEXT_AVX64*>(native->uc_mcontext);
+		auto* ymmh  = &avx->__fs.__fpu_ymmh0;
 		ymmh[index] = {};
 	}
 #else
@@ -826,6 +826,17 @@ void SkipLoad(void* native_context, size_t length) {
 	Context context {static_cast<decltype(Context::native)>(native_context)};
 	context.Gpr(0) = 0;
 	context.Advance(length);
+}
+
+void CompleteLoad32(void* native_context, size_t length, uint32_t value) {
+	Context context {static_cast<decltype(Context::native)>(native_context)};
+	context.Gpr(0) = value;
+	context.Advance(length);
+}
+
+uint64_t ReadGpr(void* native_context, uint8_t index) {
+	Context context {static_cast<decltype(Context::native)>(native_context)};
+	return static_cast<uint64_t>(context.Gpr(index));
 }
 
 } // namespace Loader::X64InstructionEmulator

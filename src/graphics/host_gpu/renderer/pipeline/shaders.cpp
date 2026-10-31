@@ -65,24 +65,24 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 	return vk::BlendOp::eAdd;
 }
 
-static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
+static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>&    descriptor_bindings,
                               const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                              vk::ShaderStageFlagBits              stage) {
+                              vk::ShaderStageFlagBits                         stage) {
 	for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 		const auto index = std::countr_zero(mask);
-		const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
-		descriptor_bindings.push_back(
-		    {ShaderRecompiler::IR::NativeBinding(program.stage, kind), NativeDescriptorType(kind),
-		     program.bindings.descriptor_counts[index], stage, nullptr});
+		const auto kind  = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
+		descriptor_bindings.push_back({ShaderRecompiler::IR::NativeBinding(program.stage, kind),
+		                               NativeDescriptorType(kind),
+		                               program.bindings.descriptor_counts[index], stage, nullptr});
 	}
 }
 
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
-	uint64_t descriptor_count = 0;
-	uint64_t storage_buffers = 0;
-	uint64_t samplers = 0;
+	const auto&              limits           = graphics.GetPhysicalDeviceProperties().limits;
+	uint64_t                 descriptor_count = 0;
+	uint64_t                 storage_buffers  = 0;
+	uint64_t                 samplers         = 0;
 	std::array<uint64_t, 32> stage_buffers {}, stage_resources {}, stage_samplers {};
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
@@ -90,19 +90,22 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 		const bool sampler = binding.descriptorType == vk::DescriptorType::eSampler;
 		if (storage) storage_buffers += binding.descriptorCount;
 		if (sampler) samplers += binding.descriptorCount;
-		for (auto stages = static_cast<uint32_t>(binding.stageFlags); stages != 0; stages &= stages - 1u) {
+		for (auto stages = static_cast<uint32_t>(binding.stageFlags); stages != 0;
+		     stages &= stages - 1u) {
 			const auto stage = std::countr_zero(stages);
 			if (storage) stage_buffers[stage] += binding.descriptorCount;
-			if (sampler) stage_samplers[stage] += binding.descriptorCount;
+			if (sampler)
+				stage_samplers[stage] += binding.descriptorCount;
 			else
 				stage_resources[stage] += binding.descriptorCount;
 			if (stage_buffers[stage] > limits.maxPerStageDescriptorStorageBuffers ||
 			    stage_resources[stage] > limits.maxPerStageResources ||
 			    stage_samplers[stage] > limits.maxPerStageDescriptorSamplers) {
 				EXIT("native descriptor stage %u exceeds device limits: buffers=%" PRIu64
-				     "/%u resources=%" PRIu64 "/%u samplers=%" PRIu64 "/%u\n", stage, stage_buffers[stage],
-				     limits.maxPerStageDescriptorStorageBuffers, stage_resources[stage], limits.maxPerStageResources,
-				     stage_samplers[stage], limits.maxPerStageDescriptorSamplers);
+				     "/%u resources=%" PRIu64 "/%u samplers=%" PRIu64 "/%u\n",
+				     stage, stage_buffers[stage], limits.maxPerStageDescriptorStorageBuffers,
+				     stage_resources[stage], limits.maxPerStageResources, stage_samplers[stage],
+				     limits.maxPerStageDescriptorSamplers);
 			}
 		}
 	}
@@ -111,10 +114,15 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 		     storage_buffers, limits.maxDescriptorSetStorageBuffers);
 	}
 	if (samplers > limits.maxDescriptorSetSamplers) {
-		EXIT("native sampler descriptors exceed device limit: %" PRIu64 "/%u\n",
-		     samplers, limits.maxDescriptorSetSamplers);
+		EXIT("native sampler descriptors exceed device limit: %" PRIu64 "/%u\n", samplers,
+		     limits.maxDescriptorSetSamplers);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	pipeline.set_bindings.clear();
+	for (const auto& binding: bindings) {
+		pipeline.set_bindings.push_back(binding.binding);
+	}
+	std::ranges::sort(pipeline.set_bindings);
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors
@@ -128,9 +136,9 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const GraphicsPipelineKey&                 key,
+                            const GraphicsPipelineKey&                key,
                             const std::array<const ShaderModule*, 4>& stages,
-                            vk::PipelineCache                          driver_cache) {
+                            vk::PipelineCache                         driver_cache) {
 	const auto& rendering     = key.rendering;
 	const auto& vertex_input  = key.vertex_input;
 	const auto& static_params = key.static_params;
@@ -228,19 +236,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 #if !defined(__APPLE__)
 	// The DB clamps depth to the viewport range after polygon offset is applied.
 	rasterizer.depthClampEnable = VK_TRUE;
-	rasterizer.pNext = &clip_ext;
+	rasterizer.pNext            = &clip_ext;
 #endif
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex {};
 	EXIT_NOT_IMPLEMENTED(static_params.provoking_vtx_last &&
 	                     !graphics.provoking_vertex_last_enabled);
 	if (graphics.provoking_vertex_last_enabled) {
 		provoking_vertex.provokingVertexMode = static_params.provoking_vtx_last
-		    ? vk::ProvokingVertexModeEXT::eLastVertex : vk::ProvokingVertexModeEXT::eFirstVertex;
-		provoking_vertex.pNext = rasterizer.pNext;
-		rasterizer.pNext = &provoking_vertex;
+		                                           ? vk::ProvokingVertexModeEXT::eLastVertex
+		                                           : vk::ProvokingVertexModeEXT::eFirstVertex;
+		provoking_vertex.pNext               = rasterizer.pNext;
+		rasterizer.pNext                     = &provoking_vertex;
 	}
 	rasterizer.polygonMode = static_params.polygon_mode;
-	rasterizer.lineWidth = 1.0f;
+	rasterizer.lineWidth   = 1.0f;
 
 	vk::PipelineMultisampleStateCreateInfo multisampling {};
 	multisampling.sampleShadingEnable  = static_params.sample_shading_enable ? VK_TRUE : VK_FALSE;
@@ -261,9 +270,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		    GetBlendFactor(static_params.color_destblend[i]);
 		color_blend_attachment[i].colorBlendOp = GetBlendOp(static_params.color_comb_fcn[i]);
 		color_blend_attachment[i].srcAlphaBlendFactor =
-		    (static_params.separate_alpha_blend[i]
-		         ? GetBlendFactor(static_params.alpha_srcblend[i])
-		         : color_blend_attachment[i].srcColorBlendFactor);
+		    (static_params.separate_alpha_blend[i] ? GetBlendFactor(static_params.alpha_srcblend[i])
+		                                           : color_blend_attachment[i].srcColorBlendFactor);
 		color_blend_attachment[i].dstAlphaBlendFactor =
 		    (static_params.separate_alpha_blend[i]
 		         ? GetBlendFactor(static_params.alpha_destblend[i])
@@ -303,6 +311,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		}
 	}
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	pipeline.stage_ids = key.stage_ids;
 	const vk::PushConstantRange push_constants {graphics_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
@@ -331,22 +340,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
 
 	std::vector<vk::DynamicState> dynamic_states {
-	    vk::DynamicState::eViewportWithCount,
-	    vk::DynamicState::eScissorWithCount,
-	    vk::DynamicState::eLineWidth,
-	    vk::DynamicState::eCullMode,
-	    vk::DynamicState::eFrontFace,
-	    vk::DynamicState::eDepthTestEnable,
-	    vk::DynamicState::eDepthWriteEnable,
-	    vk::DynamicState::eDepthCompareOp,
-	    vk::DynamicState::eDepthBiasEnable,
-	    vk::DynamicState::eDepthBias,
-	    vk::DynamicState::eStencilTestEnable,
-	    vk::DynamicState::eStencilOp,
-	    vk::DynamicState::eStencilCompareMask,
-	    vk::DynamicState::eStencilReference,
-	    vk::DynamicState::eStencilWriteMask,
-	    vk::DynamicState::eBlendConstants,
+	    vk::DynamicState::eViewportWithCount,  vk::DynamicState::eScissorWithCount,
+	    vk::DynamicState::eLineWidth,          vk::DynamicState::eCullMode,
+	    vk::DynamicState::eFrontFace,          vk::DynamicState::eDepthTestEnable,
+	    vk::DynamicState::eDepthWriteEnable,   vk::DynamicState::eDepthCompareOp,
+	    vk::DynamicState::eDepthBiasEnable,    vk::DynamicState::eDepthBias,
+	    vk::DynamicState::eStencilTestEnable,  vk::DynamicState::eStencilOp,
+	    vk::DynamicState::eStencilCompareMask, vk::DynamicState::eStencilReference,
+	    vk::DynamicState::eStencilWriteMask,   vk::DynamicState::eBlendConstants,
 	};
 #if !defined(__APPLE__)
 	dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
@@ -378,14 +379,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	tessellation_state.patchControlPoints = static_params.patch_control_points;
 	pipeline_info.pTessellationState =
 	    static_params.patch_control_points != 0 ? &tessellation_state : nullptr;
-	pipeline_info.pViewportState          = &viewport_state;
-	pipeline_info.pRasterizationState     = &rasterizer;
-	pipeline_info.pMultisampleState       = &multisampling;
-	pipeline_info.pDepthStencilState      = (with_depth ? &depth_stencil_info : nullptr);
-	pipeline_info.pColorBlendState        = &color_blending;
-	pipeline_info.pDynamicState           = &dynamic_state;
-	pipeline_info.layout                  = pipeline.pipeline_layout;
-	pipeline_info.basePipelineIndex       = -1;
+	pipeline_info.pViewportState      = &viewport_state;
+	pipeline_info.pRasterizationState = &rasterizer;
+	pipeline_info.pMultisampleState   = &multisampling;
+	pipeline_info.pDepthStencilState  = (with_depth ? &depth_stencil_info : nullptr);
+	pipeline_info.pColorBlendState    = &color_blending;
+	pipeline_info.pDynamicState       = &dynamic_state;
+	pipeline_info.layout              = pipeline.pipeline_layout;
+	pipeline_info.basePipelineIndex   = -1;
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
@@ -393,10 +394,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
 		     " topology=%" PRIu32 " color_mask=0x%08" PRIx32
 		     " depth=%s blend=%s dyn_states=%" PRIu32 "\n",
-		     key.stage_ids[0], key.stage_ids[3],
-		     static_cast<uint32_t>(static_params.topology), static_params.color_mask[0],
-		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
-		     dynamic_state.dynamicStateCount);
+		     key.stage_ids[0], key.stage_ids[3], static_cast<uint32_t>(static_params.topology),
+		     static_params.color_mask[0], (with_depth ? "true" : "false"),
+		     (static_params.blend_enable[0] ? "true" : "false"), dynamic_state.dynamicStateCount);
 	}
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
@@ -417,9 +417,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
 	comp_shader_stage_info.module = module.module;
 	comp_shader_stage_info.pName  = "main";
-	const auto wave_size = module.info.wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+	const auto wave_size          = module.info.wave_size;
+	if (graphics.compute_subgroup_size_control_enabled && wave_size >= graphics.min_subgroup_size &&
+	    wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
@@ -428,6 +428,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	AddLayoutBindings(descriptor_bindings, module.info, vk::ShaderStageFlagBits::eCompute);
 	pipeline.uses_image_heap = module.info.info.uses_image_heap;
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	pipeline.stage_ids = {module.id, 0, 0, 0};
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
@@ -441,7 +442,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 
 	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                                  &pipeline.pipeline_layout);
+	                                                   &pipeline.pipeline_layout);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	vk::ComputePipelineCreateInfo info {};
@@ -454,8 +455,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
-	                                                &pipeline.pipeline);
+	result =
+	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 

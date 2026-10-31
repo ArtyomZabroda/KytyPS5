@@ -1,12 +1,16 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
 
 namespace Libs::Graphics {
 
@@ -67,7 +71,32 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		namespace Counters = Common::DebugCounters;
+		const auto slot    = Counters::CurrentPm4Op();
+		const auto phase   = Counters::CurrentDrawPhase();
+		const auto start   = Counters::Enabled() ? std::chrono::steady_clock::now()
+		                                         : std::chrono::steady_clock::time_point {};
+		{
+			const Counters::ScopedReadbackSource source(Counters::ReadbackSource::ReadFault);
+			m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		}
+		if (start != std::chrono::steady_clock::time_point {}) {
+			const auto ns =
+			    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                              std::chrono::steady_clock::now() - start)
+			                              .count());
+			Counters::AddReadFault(slot, ns);
+			if (slot != Counters::READ_FAULT_OTHER_THREAD) {
+				Counters::AddPhaseFault(phase, ns);
+			}
+		}
+		if (slot != Counters::READ_FAULT_OTHER_THREAD) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+				LOGF("GPU-thread read fault: op=0x%02" PRIx32 " phase=%s addr=0x%016" PRIx64 "\n",
+				     slot, phase, fault_vaddr);
+			}
+		}
 	}
 	return true;
 }
@@ -105,11 +134,12 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	const auto unmap = [this, vaddr, size] {
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
-			const auto tick = m_command_scheduler.CurrentTick();
+		if (m_command_scheduler.Active() && (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		                                     m_texture_cache.IsRegionRegistered(vaddr, size) ||
+		                                     m_command_scheduler.HasPendingPriorityOperations())) {
+			const auto                                     tick = m_command_scheduler.CurrentTick();
+			const Common::DebugCounters::ScopedGpuWaitSite wait_site(
+			    Common::DebugCounters::GpuWaitSite::Unmap);
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}

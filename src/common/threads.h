@@ -35,6 +35,10 @@ public:
 	static void SleepNano(uint64_t nanos);
 	static bool IsMainThread();
 
+	// Raises the calling thread above normal priority so busy guest threads do not take
+	// its core. Returns false when the host refuses or does not support it.
+	static bool RaiseCurrentPriority();
+
 	// Get current thread id
 	// Once a thread has finished, the id may be reused by another thread.
 	static std::string GetThreadId();

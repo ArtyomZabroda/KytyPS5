@@ -50,6 +50,8 @@ struct PreparedBindings {
 
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
+// Logs the calling thread's last descriptor commit: its pipeline, stage modules and bindings.
+void                                  LogLastBindingCommit();
 [[nodiscard]] vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture,
                                                     uint32_t              element = 0);
 
@@ -64,9 +66,9 @@ template <typename T>
 }
 
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
-                                                   bool r128 = false);
-void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
-                            const ShaderTextureResource& descriptor, uint64_t size);
+                                                   bool                         r128 = false);
+void               ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                                          const ShaderTextureResource& descriptor, uint64_t size);
 
 } // namespace Libs::Graphics
 

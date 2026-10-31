@@ -7,9 +7,12 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
+
 #include <queue>
+
 #include <thread>
 #include <vector>
 
@@ -32,22 +35,26 @@ public:
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
-	void                      Shutdown();
-	void                      Wait(uint64_t tick);
-	void                      PopPendingOperations();
-	void                      DrainPriorityOperations();
-	void                      WaitPriorityOperations(uint64_t tick);
+	void Shutdown();
+	void Wait(uint64_t tick);
+	void PopPendingOperations();
+	void DrainPriorityOperations();
+	void WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	// Called between guest packets after a draw or dispatch. Guest command buffers can hold a
+	// whole frame; without this the GPU idles until the next readback or flush, which then waits
+	// for all of the recorded work.
+	void SubmitIfGpuIdle();
 
-	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
-	void                           CheckActive() const;
-	CommandBuffer&                 Current();
-	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
-	[[nodiscard]] bool             IsFree(uint64_t tick);
+	[[nodiscard]] bool     Active() const noexcept { return m_command.m_registers != nullptr; }
+	void                   CheckActive() const;
+	CommandBuffer&         Current();
+	[[nodiscard]] uint64_t CurrentTick() const noexcept { return m_master.CurrentTick(); }
+	[[nodiscard]] bool     IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
@@ -87,20 +94,21 @@ private:
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
-	MasterSemaphore              m_master;
-	RenderContext&               m_context;
-	GraphicContext&              m_graphics;
-	CommandPool                  m_command_pool;
-	CommandBuffer                m_command;
-	DynamicState                 m_dynamic_state;
-	std::queue<PendingOperation> m_pending_operations;
-	std::queue<PendingOperation> m_priority_operations;
-	std::mutex                   m_operation_mutex;
-	std::condition_variable      m_operation_available;
-	std::jthread                 m_priority_thread;
-	bool                         m_priority_active      = false;
-	uint64_t                     m_priority_active_tick = 0;
-	OperationState               m_operation_state      = OperationState::Open;
+	MasterSemaphore                       m_master;
+	RenderContext&                        m_context;
+	GraphicContext&                       m_graphics;
+	CommandPool                           m_command_pool;
+	CommandBuffer                         m_command;
+	DynamicState                          m_dynamic_state;
+	std::chrono::steady_clock::time_point m_command_begin;
+	std::queue<PendingOperation>          m_pending_operations;
+	std::queue<PendingOperation>          m_priority_operations;
+	std::mutex                            m_operation_mutex;
+	std::condition_variable               m_operation_available;
+	std::jthread                          m_priority_thread;
+	bool                                  m_priority_active      = false;
+	uint64_t                              m_priority_active_tick = 0;
+	OperationState                        m_operation_state      = OperationState::Open;
 };
 
 } // namespace Libs::Graphics

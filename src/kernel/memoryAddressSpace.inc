@@ -282,8 +282,24 @@ public:
 			g_test_backing_read(vaddr, size);
 		}
 #endif
+		// Draws read the same small buffers every frame, each usually inside one mapping, and
+		// a draw's buffers sit in several mappings.
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestSparseReads);
+		auto& hints = t_read_hints;
+		for (const auto& hint: hints.entries) {
+			if (hint.generation == m_generation && vaddr >= hint.vaddr &&
+			    vaddr + size <= hint.vaddr + hint.size) {
+				std::memcpy(data, m_backing_base + (hint.backing_offset + vaddr - hint.vaddr), size);
+				return true;
+			}
+		}
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestSparseReadMisses);
 		CopySparseRange(m_maps, vaddr, data, size,
-		                [this](const auto& entry, uint64_t start) {
+		                [&](const auto& entry, uint64_t start) {
+			                if (entry.vaddr <= vaddr && vaddr + size <= entry.vaddr + entry.size) {
+				                hints.entries[hints.next++ % hints.entries.size()] = {
+				                    m_generation, entry.vaddr, entry.size, entry.backing_offset};
+			                }
 			                return m_backing_base + (entry.backing_offset + start - entry.vaddr);
 		                },
 		                gap);
@@ -322,12 +338,14 @@ public:
 
 		{
 			std::lock_guard lock(m_mutex);
+			m_generation = NextGeneration();
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #else
 		std::lock_guard lock(m_mutex);
+		m_generation = NextGeneration();
 		void* mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			return false;
@@ -348,6 +366,7 @@ public:
 		std::vector<MapEntry> targets;
 		{
 			std::lock_guard lock(m_mutex);
+			m_generation = NextGeneration();
 			auto            current = vaddr;
 			while (current < end) {
 				MapEntry entry {};
@@ -404,6 +423,7 @@ public:
 		MapEntry old {};
 		{
 			std::lock_guard lock(m_mutex);
+			m_generation = NextGeneration();
 			auto            next = m_maps.upper_bound(vaddr);
 			if (next != m_maps.begin()) {
 				auto entry = std::prev(next);
@@ -430,6 +450,7 @@ public:
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
+				m_generation = NextGeneration();
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
@@ -469,6 +490,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+		m_generation = NextGeneration();
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #else
@@ -479,6 +501,7 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
+		m_generation = NextGeneration();
 		RemoveMappingsUnlocked(vaddr, size);
 
 		return true;
@@ -672,10 +695,32 @@ private:
 	int m_fd = -1;
 #endif
 
+	// The last mappings a thread read through, valid until the maps next change. Generations
+	// are unique across stores and never 0, so a hint never outlives its store's maps.
+	struct ReadHint {
+		uint64_t generation;
+		uint64_t vaddr;
+		uint64_t size;
+		uint64_t backing_offset;
+	};
+
+	struct ReadHints {
+		std::array<ReadHint, 32> entries;
+		uint32_t                next;
+	};
+
+	static uint64_t NextGeneration() {
+		static std::atomic<uint64_t> next {1};
+		return next.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	static inline thread_local ReadHints t_read_hints;
+
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	uint64_t                     m_generation = NextGeneration();
 };
 
 class GuestAddressSpace {
@@ -777,10 +822,16 @@ public:
 
 	template <bool copy_private>
 	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
-		if (data == nullptr || !Owns(vaddr, size)) {
+		if (data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
+		// One shared lock for the ownership test and the copy; draws copy many small buffers.
 		std::shared_lock lock(m_mutex);
+		if (!std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
+			    return vaddr >= range.first && vaddr + size <= range.first + range.second;
+		    })) {
+			return false;
+		}
 		if constexpr (!copy_private) {
 			if (OverlapsPrivateUnlocked(vaddr, size)) {
 				return false;
