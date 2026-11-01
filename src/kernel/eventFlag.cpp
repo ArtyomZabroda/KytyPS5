@@ -2,6 +2,8 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -9,9 +11,53 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+#include <thread>
+
 namespace Libs::LibKernel::EventFlag {
 
 LIB_NAME("libkernel", "libkernel");
+
+namespace {
+
+// Guests poll event flags (zero-timeout waits) in loops. On the console every poll is a system
+// call; here a failed poll returns in about 0.1 us, so such a loop spins, and the job threads it
+// feeds never get idle long enough to sleep. Wwise's audio thread does this while it waits for its
+// next tick. After repeated failed polls of one flag, give up the CPU: first yield, then sleep
+// briefly. A successful poll or a different flag resets the count.
+constexpr uint32_t POLL_SPIN_FAILURES  = 16;
+constexpr uint32_t POLL_YIELD_FAILURES = 64;
+constexpr uint32_t POLL_SLEEP_MICROS   = 50;
+
+struct PollBackoff {
+	const void* flag     = nullptr;
+	uint32_t    failures = 0;
+};
+
+thread_local PollBackoff t_poll_backoff;
+
+void OnEventFlagPoll(const void* flag, bool success) {
+	auto& state = t_poll_backoff;
+	if (success) {
+		state = {};
+		return;
+	}
+	if (state.flag != flag) {
+		state = {flag, 1};
+		return;
+	}
+	if (++state.failures <= POLL_SPIN_FAILURES || !Config::PollBackoffEnabled()) {
+		return;
+	}
+	if (state.failures <= POLL_YIELD_FAILURES) {
+		Common::DebugCounters::CountHleCall("Event flag poll backoff: yield");
+		std::this_thread::yield();
+	} else {
+		Common::DebugCounters::CountHleCall("Event flag poll backoff: sleep");
+		Common::Thread::SleepMicro(POLL_SLEEP_MICROS);
+	}
+}
+
+} // namespace
 
 class KernelEventFlagPrivate {
 public:
@@ -297,7 +343,11 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 	}
 
 	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
+	const bool poll   = timeout != nullptr && *timeout == 0;
 	auto       result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
+	if (poll) {
+		OnEventFlagPoll(ef, result == KernelEventFlagPrivate::Result::Ok);
+	}
 
 	int ret = OK;
 
@@ -326,6 +376,7 @@ int KYTY_SYSV_ABI KernelPollEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 
 	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
 	auto       result = ef->Poll(bit_pattern, mode.wait, mode.clear, result_pat);
+	OnEventFlagPoll(ef, result == KernelEventFlagPrivate::Result::Ok);
 
 	int ret = OK;
 

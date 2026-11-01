@@ -485,6 +485,68 @@ inline void AddPhaseFault(const char* phase, uint64_t ns) noexcept {
 	return Detail::g_fault_phase_ns[slot].load(std::memory_order_relaxed);
 }
 
+// Guest HLE calls by function. Names are string literals (usually __func__), compared by address.
+// Each slot also keeps a mask of the threads that called it, sampled on every 64th call.
+constexpr uint32_t HLE_CALL_SLOTS = 1024;
+
+namespace Detail {
+inline std::atomic<const char*> g_hle_call_names[HLE_CALL_SLOTS] {};
+inline std::atomic<uint64_t>    g_hle_call_counts[HLE_CALL_SLOTS] {};
+inline std::atomic<uint64_t>    g_hle_call_threads[HLE_CALL_SLOTS] {};
+inline std::atomic<uint32_t>    g_hle_thread_bits {0};
+inline thread_local uint32_t    t_hle_calls      = 0;
+inline thread_local uint64_t    t_hle_thread_bit = 0;
+} // namespace Detail
+
+inline void CountHleCall(const char* name) noexcept {
+	if (!Enabled()) {
+		return;
+	}
+	const auto hash = static_cast<uint32_t>(
+	    ((reinterpret_cast<uintptr_t>(name) >> 3u) * 0x9e3779b97f4a7c15ull) >> 40u);
+	for (uint32_t probe = 0; probe < 32; probe++) {
+		const auto  slot    = (hash + probe) % HLE_CALL_SLOTS;
+		auto&       entry   = Detail::g_hle_call_names[slot];
+		const char* current = entry.load(std::memory_order_acquire);
+		if (current == nullptr) {
+			const char* expected = nullptr;
+			if (entry.compare_exchange_strong(expected, name, std::memory_order_acq_rel,
+			                                  std::memory_order_acquire)) {
+				current = name;
+			} else {
+				current = expected;
+			}
+		}
+		if (current != name) {
+			continue;
+		}
+		Detail::g_hle_call_counts[slot].fetch_add(1, std::memory_order_relaxed);
+		if ((Detail::t_hle_calls++ & 63u) == 0) {
+			if (Detail::t_hle_thread_bit == 0) {
+				Detail::t_hle_thread_bit =
+				    1ull << (Detail::g_hle_thread_bits.fetch_add(1, std::memory_order_relaxed) %
+				             64u);
+			}
+			Detail::g_hle_call_threads[slot].fetch_or(Detail::t_hle_thread_bit,
+			                                          std::memory_order_relaxed);
+		}
+		return;
+	}
+}
+
+[[nodiscard]] inline const char* GetHleCallName(uint32_t slot) noexcept {
+	return Detail::g_hle_call_names[slot].load(std::memory_order_acquire);
+}
+
+[[nodiscard]] inline uint64_t GetHleCalls(uint32_t slot) noexcept {
+	return Detail::g_hle_call_counts[slot].load(std::memory_order_relaxed);
+}
+
+// Threads that called the slot since the previous take, from sampled calls.
+[[nodiscard]] inline uint64_t TakeHleCallThreads(uint32_t slot) noexcept {
+	return Detail::g_hle_call_threads[slot].exchange(0, std::memory_order_relaxed);
+}
+
 [[nodiscard]] inline uint64_t Get(Counter counter) noexcept {
 	return Detail::g_counters[static_cast<int>(counter)].load(std::memory_order_relaxed);
 }

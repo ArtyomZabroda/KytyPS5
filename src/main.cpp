@@ -13,10 +13,10 @@
 #include <charconv>
 #include <cstdio>
 #include <filesystem>
-#include <string_view>
-#include <vector>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
+#include <string_view>
+#include <vector>
 
 using namespace Common;
 using namespace Emulator;
@@ -48,20 +48,24 @@ static void PrintUsage() {
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --addcont-dir <dir>                  Add-ons (DLC) folder (default: none).\n");
-	::printf(
-	    "  --addcont <label>[=<dir>]            Add-on (DLC) by entitlement label with its data in\n"
-	    "                                       <dir>, or license only without <dir>. Repeatable.\n");
+	::printf("  --addcont <label>[=<dir>]            Add-on (DLC) by entitlement label with its "
+	         "data in\n"
+	         "                                       <dir>, or license only without <dir>. "
+	         "Repeatable.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf(
 	    "  --user-name <name>                   Local user name (1-16 bytes). Default: Kyty.\n");
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
 	         Config::DEFAULT_USER_ID);
-	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
+	::printf(
+	    "  --mic <name>                        Capture from this microphone; omit for silence.\n");
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
-	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
-	::printf("  --keyboard-player <0-4>             Keyboard player; 0 shares player 1 with the gamepad. Default: 0.\n");
+	::printf(
+	    "  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
+	::printf("  --keyboard-player <0-4>             Keyboard player; 0 shares player 1 with the "
+	         "gamepad. Default: 0.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -74,7 +78,8 @@ static void PrintUsage() {
 	    "  --stretch                            Stretch the image to the window. Default: off.\n");
 	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
-	::printf("  --trinity                            Enable experimental PS5 Pro mode for supported titles\n"
+	::printf("  --trinity                            Enable experimental PS5 Pro mode for "
+	         "supported titles\n"
 	         "                                       (PSSR uses linear scaling). Default: off.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
@@ -85,8 +90,10 @@ static void PrintUsage() {
 	::printf("  --gpu-assisted-validation            Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
-	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
-	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
+	::printf("  --shader-cache                       Keep compiled shaders and pipelines between "
+	         "boots.\n");
+	::printf(
+	    "  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
@@ -98,15 +105,20 @@ static void PrintUsage() {
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
-	::printf("  --readback-linear-images             Read back writable linear images on submit.\n");
-	::printf("  --readback-tiled-images              Read back small writable tiled images on submit.\n");
-	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
-	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
 	::printf(
-	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
+	    "  --readback-linear-images             Read back writable linear images on submit.\n");
+	::printf("  --readback-tiled-images              Read back small writable tiled images on "
+	         "submit.\n");
+	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
+	::printf(
+	    "  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
+	::printf("  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
-	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
+	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported "
+	         "games.\n");
+	::printf("  --no-poll-backoff                    Let failed event-flag polls spin instead of "
+	         "yielding.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -160,7 +172,7 @@ static bool ParseControllerColor(const std::string& value, Config::ControllerCol
 	if (value.size() != 7 || value[0] != '#') {
 		return false;
 	}
-	uint32_t rgb = 0;
+	uint32_t rgb      = 0;
 	auto [end, error] = std::from_chars(value.data() + 1, value.data() + value.size(), rgb, 16);
 	if (error != std::errc {} || end != value.data() + value.size()) {
 		return false;
@@ -228,6 +240,7 @@ static constexpr Flag FLAGS[] = {
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
     {"--skip-notice-screen", &ConfigOptions::skip_notice_screen},
+    {"--no-poll-backoff", &ConfigOptions::poll_backoff_enabled, false},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
 #endif
@@ -245,7 +258,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
-		if (const auto* flag = std::ranges::find(FLAGS, arg, &Flag::name); flag != std::end(FLAGS)) {
+		if (const auto* flag = std::ranges::find(FLAGS, arg, &Flag::name);
+		    flag != std::end(FLAGS)) {
 			options.config.*flag->field = flag->value;
 			continue;
 		}
@@ -302,7 +316,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("--game-patch can only be specified once\n");
 				return false;
 			}
-			value = Common::FixFilenameSlash(value);
+			value           = Common::FixFilenameSlash(value);
 			const auto path = Common::PathFromUtf8(value);
 
 			if (!Common::File::IsFileExisting(path)) {
@@ -471,30 +485,30 @@ static int Main(int argc, char* argv[]) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 int wmain(int argc, wchar_t* argv[]) {
-    std::vector<std::string> utf8_args;
-    utf8_args.reserve(static_cast<size_t>(argc));
+	std::vector<std::string> utf8_args;
+	utf8_args.reserve(static_cast<size_t>(argc));
 
-    for (int index = 0; index < argc; index++) {
-        const std::wstring_view wide(argv[index]);
-        const std::u16string utf16(wide.begin(), wide.end());
+	for (int index = 0; index < argc; index++) {
+		const std::wstring_view wide(argv[index]);
+		const std::u16string    utf16(wide.begin(), wide.end());
 
-        utf8_args.push_back(Common::Utf16ToUtf8(utf16));
-    }
+		utf8_args.push_back(Common::Utf16ToUtf8(utf16));
+	}
 
-    std::vector<char*> utf8_argv;
-    utf8_argv.reserve(utf8_args.size());
+	std::vector<char*> utf8_argv;
+	utf8_argv.reserve(utf8_args.size());
 
-    for (auto& argument: utf8_args) {
-        utf8_argv.push_back(argument.data());
-    }
+	for (auto& argument: utf8_args) {
+		utf8_argv.push_back(argument.data());
+	}
 
-    return Main(argc, utf8_argv.data());
+	return Main(argc, utf8_argv.data());
 }
 
 #else
 
 int main(int argc, char* argv[]) {
-    return Main(argc, argv);
+	return Main(argc, argv);
 }
 
 #endif

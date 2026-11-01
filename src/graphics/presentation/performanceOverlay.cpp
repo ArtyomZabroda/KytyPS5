@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
@@ -88,6 +89,10 @@ struct Snapshot {
 	std::array<uint64_t, Common::DebugCounters::FAULT_PHASE_SLOTS>    phase_fault_totals {};
 	std::array<uint64_t, Common::DebugCounters::FAULT_PHASE_SLOTS>    phase_fault_ns_totals {};
 	std::array<const char*, Common::DebugCounters::FAULT_PHASE_SLOTS> phase_fault_names {};
+	std::array<double, Common::DebugCounters::HLE_CALL_SLOTS>         hle_call_rates {};
+	std::array<uint64_t, Common::DebugCounters::HLE_CALL_SLOTS>       hle_call_totals {};
+	std::array<uint32_t, Common::DebugCounters::HLE_CALL_SLOTS>       hle_call_threads {};
+	std::array<const char*, Common::DebugCounters::HLE_CALL_SLOTS>    hle_call_names {};
 };
 
 std::mutex            g_frame_mutex;
@@ -540,6 +545,15 @@ void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point 
 		shown.phase_fault_ns_totals[i] = ns;
 		shown.phase_fault_names[i]     = Common::DebugCounters::GetPhaseFaultName(i);
 	}
+	for (uint32_t i = 0; i < Common::DebugCounters::HLE_CALL_SLOTS; i++) {
+		const auto count = Common::DebugCounters::GetHleCalls(i);
+		shown.hle_call_rates[i] =
+		    seconds > 0.0 ? static_cast<double>(count - shown.hle_call_totals[i]) / seconds : 0.0;
+		shown.hle_call_totals[i] = count;
+		shown.hle_call_threads[i] =
+		    static_cast<uint32_t>(std::popcount(Common::DebugCounters::TakeHleCallThreads(i)));
+		shown.hle_call_names[i] = Common::DebugCounters::GetHleCallName(i);
+	}
 	shown.shader_compile_peak_ns  = Common::DebugCounters::Get(Peak::ShaderCompileNs);
 	shown.pipeline_create_peak_ns = Common::DebugCounters::Get(Peak::PipelineCreateNs);
 	shown.sample_time             = now;
@@ -596,6 +610,8 @@ void DrawCompact(const Snapshot& shown) {
 	ImGui::EndTable();
 }
 
+void HleCallRows(const Snapshot& shown);
+
 void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 	const auto& host = shown.host;
 	if (BeginSection("Frames")) {
@@ -650,7 +666,32 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 		    Fmt("%.0f/s  (%llu total)", unresolved,
 		        static_cast<unsigned long long>(Total(shown, Counter::UnresolvedImportCalls))),
 		    unresolved > 0.0 ? MEDIUM : GOOD);
+		HleCallRows(shown);
 		ImGui::EndTable();
+	}
+}
+
+// The guest's most frequent HLE calls. Waiting loops show up as yield, zero sleeps,
+// clock reads or polls at very high rates.
+void HleCallRows(const Snapshot& shown) {
+	std::array<uint32_t, Common::DebugCounters::HLE_CALL_SLOTS> slots {};
+	uint32_t                                                    count = 0;
+	double                                                      total = 0.0;
+	for (uint32_t i = 0; i < Common::DebugCounters::HLE_CALL_SLOTS; i++) {
+		if (shown.hle_call_names[i] != nullptr && shown.hle_call_rates[i] > 0.0) {
+			slots[count++] = i;
+			total += shown.hle_call_rates[i];
+		}
+	}
+	Row("HLE calls", Fmt("%.0f/s", total));
+	const auto shown_count = std::min<uint32_t>(count, 12);
+	std::partial_sort(
+	    slots.begin(), slots.begin() + shown_count, slots.begin() + count,
+	    [&](uint32_t a, uint32_t b) { return shown.hle_call_rates[a] > shown.hle_call_rates[b]; });
+	for (uint32_t i = 0; i < shown_count; i++) {
+		const auto slot = slots[i];
+		Row(Fmt("  %.28s", shown.hle_call_names[slot]).c_str(),
+		    Fmt("%.0f/s  %u threads", shown.hle_call_rates[slot], shown.hle_call_threads[slot]));
 	}
 }
 

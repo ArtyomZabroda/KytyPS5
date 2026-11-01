@@ -349,15 +349,15 @@ struct PthreadMutexPrivate {
 		Waiter*                 previous = nullptr;
 		Waiter*                 next     = nullptr;
 	};
-	uint8_t                 reserved[256];
-	std::string             name;
-	std::mutex              m;
-	Pthread                 owner     = nullptr;
-	uint32_t                count     = 0;
-	int                     type      = 1;
-	int                     pprotocol = PTHREAD_PRIO_NONE;
-	Waiter*                 first_waiter = nullptr;
-	Waiter*                 last_waiter  = nullptr;
+	uint8_t     reserved[256];
+	std::string name;
+	std::mutex  m;
+	Pthread     owner        = nullptr;
+	uint32_t    count        = 0;
+	int         type         = 1;
+	int         pprotocol    = PTHREAD_PRIO_NONE;
+	Waiter*     first_waiter = nullptr;
+	Waiter*     last_waiter  = nullptr;
 };
 
 struct PthreadMutexattrPrivate {
@@ -392,23 +392,23 @@ struct PthreadGuestData {
 static_assert(sizeof(PthreadGuestData) == 4096);
 
 struct PthreadPrivate {
-	PthreadGuestData      guest;
-	std::string           name;
-	pthread_t             p;
-	PthreadAttr           attr;
-	pthread_entry_func_t  entry;
-	void*                 arg;
-	int                   unique_id;
-	std::atomic_bool      detached;
-	std::atomic_bool      almost_done;
-	std::atomic_bool      free;
-	uint64_t              host_thread_id;
-	uintptr_t             guest_host_rbx;
-	uintptr_t             guest_host_rsp;
-	uintptr_t             guest_host_rbp;
-	uint64_t              cond_sequence = 0;
+	PthreadGuestData        guest;
+	std::string             name;
+	pthread_t               p;
+	PthreadAttr             attr;
+	pthread_entry_func_t    entry;
+	void*                   arg;
+	int                     unique_id;
+	std::atomic_bool        detached;
+	std::atomic_bool        almost_done;
+	std::atomic_bool        free;
+	uint64_t                host_thread_id;
+	uintptr_t               guest_host_rbx;
+	uintptr_t               guest_host_rsp;
+	uintptr_t               guest_host_rbp;
+	uint64_t                cond_sequence = 0;
 	std::condition_variable cond_cv;
-	std::atomic<uint64_t> pending_signal_mask {0};
+	std::atomic<uint64_t>   pending_signal_mask {0};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -459,11 +459,11 @@ struct PthreadCondattrPrivate {
 };
 
 struct PthreadCondPrivate {
-	uint8_t                 reserved[256];
-	std::string             name;
-	std::mutex              m;
-	KernelClockid           clock_id = KERNEL_CLOCK_REALTIME;
-	std::vector<Pthread>    waiters;
+	uint8_t              reserved[256];
+	std::string          name;
+	std::mutex           m;
+	KernelClockid        clock_id = KERNEL_CLOCK_REALTIME;
+	std::vector<Pthread> waiters;
 };
 
 static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
@@ -1249,8 +1249,8 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
                                   const char* name);
 static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 
-static void NativeMutexRemoveWaiter(PthreadMutexPrivate* mutex,
-                                     PthreadMutexPrivate::Waiter* waiter) {
+static void NativeMutexRemoveWaiter(PthreadMutexPrivate*         mutex,
+                                    PthreadMutexPrivate::Waiter* waiter) {
 	if (waiter->previous != nullptr) {
 		waiter->previous->next = waiter->next;
 	} else {
@@ -1302,12 +1302,11 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 	} else {
 		mutex->first_waiter = &waiter;
 	}
-	mutex->last_waiter = &waiter;
-	const auto deadline = timeout_us != nullptr
-	                          ? std::chrono::steady_clock::now() +
-	                                std::chrono::microseconds(*timeout_us)
-	                          : std::chrono::steady_clock::time_point::max();
-	int result = OK;
+	mutex->last_waiter  = &waiter;
+	const auto deadline = timeout_us != nullptr ? std::chrono::steady_clock::now() +
+	                                                  std::chrono::microseconds(*timeout_us)
+	                                            : std::chrono::steady_clock::time_point::max();
+	int        result   = OK;
 	while (mutex->owner != self) {
 		const auto now = std::chrono::steady_clock::now();
 		if (now >= deadline) {
@@ -1315,8 +1314,8 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 			result = ETIMEDOUT;
 			break;
 		}
-		waiter.cv.wait_until(lock, std::min(deadline, now +
-		    std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+		waiter.cv.wait_until(
+		    lock, std::min(deadline, now + std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
 		if (mutex->owner != self) {
 			lock.unlock();
 			KernelDispatchPendingSignalForCurrentThread();
@@ -1785,7 +1784,7 @@ int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexTrylock(PthreadMutex* mutex) {
-	// PRINT_NAME();
+	Common::DebugCounters::CountHleCall("PthreadMutexTrylock");
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3646,6 +3645,7 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 }
 
 void KYTY_SYSV_ABI PthreadYield() {
+	Common::DebugCounters::CountHleCall("PthreadYield");
 	SchedulerBackoffOnce();
 }
 
@@ -3692,6 +3692,7 @@ int KYTY_SYSV_ABI KernelClockGetres(KernelClockid clock_id, KernelTimespec* tp) 
 }
 
 int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp) {
+	Common::DebugCounters::CountHleCall("KernelClockGettime");
 	// Called constantly by Python frame/timer code.
 
 	if (tp == nullptr) {
@@ -3723,7 +3724,7 @@ int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp)
 }
 
 int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
-	// PRINT_NAME();
+	Common::DebugCounters::CountHleCall("KernelGettimeofday");
 
 	if (tp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
@@ -3844,10 +3845,12 @@ uint64_t KYTY_SYSV_ABI KernelGetTscFrequency() {
 }
 
 uint64_t KYTY_SYSV_ABI KernelReadTsc() {
+	Common::DebugCounters::CountHleCall("KernelReadTsc");
 	return KernelReadTscNative();
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
+	Common::DebugCounters::CountHleCall("KernelGetProcessTime");
 	const auto frequency = KernelGetTscFrequencyNative();
 	if (frequency == 0) {
 		return static_cast<uint64_t>(Loader::Timer::GetTimeMs() * 1000.0);
@@ -3859,6 +3862,7 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter() {
+	Common::DebugCounters::CountHleCall("KernelGetProcessTimeCounter");
 	return KernelGetElapsedTsc();
 }
 
@@ -3877,6 +3881,9 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	Common::DebugCounters::CountHleCall(microseconds == 0     ? "KernelUsleep(0)"
+	                                    : microseconds < 1000 ? "KernelUsleep(<1 ms)"
+	                                                          : "KernelUsleep(>=1 ms)");
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }
@@ -3903,6 +3910,9 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 	uint64_t nanos =
 	    static_cast<uint64_t>(rqtp->tv_sec) * 1000000000ull + static_cast<uint64_t>(rqtp->tv_nsec);
 
+	Common::DebugCounters::CountHleCall(nanos == 0        ? "KernelNanosleep(0)"
+	                                    : nanos < 1000000 ? "KernelNanosleep(<1 ms)"
+	                                                      : "KernelNanosleep(>=1 ms)");
 	SleepNanoWithSignalPoll(nanos);
 
 	if (rmtp != nullptr) {
