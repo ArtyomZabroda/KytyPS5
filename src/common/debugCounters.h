@@ -103,6 +103,9 @@ enum class Counter {
 	ReadbackSplitBacklogNs,    // Waiting for submissions made before it.
 	ReadbackSplitCurrentNs,    // Waiting for that command buffer itself.
 	ReadbackSplitBacklogTicks, // Submissions the GPU had not finished when the readback began.
+	SubmissionsStarted,        // Guest submissions the GPU thread took from its queues.
+	SubmissionQueueNs, // Their time between the guest's submit and the GPU thread taking them.
+	SubmissionBacklog, // Sum of submissions still queued behind each one taken.
 	// Guest memory the GPU thread reads directly on the CPU while it builds draws and dispatches.
 	NumInstancesReads,         // Instance counts taken from the last indirect draw record.
 	NumInstancesReadsGpuDirty, // Of those, records whose dword was written by the GPU.
@@ -131,6 +134,10 @@ enum class Counter {
 	BufferEvictions,
 	BufferObtains,            // Guest buffer ranges prepared for draws and dispatches.
 	BufferObtainStreamed,     // Of those, small CPU-written ranges copied to the stream buffer.
+	BufferStreamBytes,        // Bytes those ranges copied.
+	BufferStreamReuses,       // Of those ranges, ones answered with an earlier copy.
+	BufferStreamReuseChecks,  // Earlier copies checked against the guest bytes.
+	BufferStreamReuseMisses,  // Of those, copies whose bytes differed.
 	BufferObtainUploads,      // Of those, ranges that uploaded CPU-written pages.
 	BufferObtainWritten,      // Of those, ranges the shader writes.
 	BufferObtainCleanReads,   // Of those, read-only ranges with nothing to upload.
@@ -270,6 +277,9 @@ inline void AddSince(Counter counter, std::chrono::steady_clock::time_point star
 
 // Set once on the GPU thread, so shared code can attribute its time to that thread.
 inline thread_local bool t_gpu_thread = false;
+
+// F9: graphics draws return without rendering, to measure how fast the guest runs without them.
+inline std::atomic<bool> g_skip_draws {false};
 
 class ScopedTimer final {
 public:

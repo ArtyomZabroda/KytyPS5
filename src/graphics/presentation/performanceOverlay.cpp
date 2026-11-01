@@ -315,7 +315,10 @@ void TransferRow(const Snapshot& shown, const char* label, Counter upload, Count
 
 void GpuActivityRows(const Snapshot& shown) {
 	const auto draws = Rate(shown, Counter::Draws);
-	Row("Draw calls", Fmt("%.0f/frame  %.0f/s", draws / std::max(shown.fps, 1.0), draws));
+	Row("Draw calls",
+	    Fmt("%.0f/frame  %.0f/s%s", draws / std::max(shown.fps, 1.0), draws,
+	        Common::DebugCounters::g_skip_draws.load(std::memory_order_relaxed) ? "  SKIPPED (F9)"
+	                                                                            : ""));
 	{
 		const auto share = [&](Counter counter, double total) {
 			return total > 0.0 ? 100.0 * Rate(shown, counter) / total : 0.0;
@@ -467,6 +470,13 @@ void BufferReadbackRows(const Snapshot& shown) {
 		        Rate(shown, Counter::ReadbackSplitBacklogNs) / 1e6,
 		        Rate(shown, Counter::ReadbackSplitBacklogTicks) / split,
 		        Rate(shown, Counter::ReadbackSplitCurrentNs) / 1e6));
+	}
+	const auto started = Rate(shown, Counter::SubmissionsStarted);
+	if (started > 0.0) {
+		Row("GPU thread queue",
+		    Fmt("%.0f submits/s  avg %.2f ms queued  %.1f waiting behind", started,
+		        Rate(shown, Counter::SubmissionQueueNs) / 1e6 / started,
+		        Rate(shown, Counter::SubmissionBacklog) / started));
 	}
 	const auto sync = Rate(shown, Counter::SyncGpuCommands);
 	if (sync > 0.0) {
@@ -786,6 +796,12 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 			                          Rate(shown, Counter::BufferObtainStreamed) / frames,
 			                          Rate(shown, Counter::BufferObtainUploads) / frames,
 			                          Rate(shown, Counter::BufferObtainWritten) / frames));
+			Row("  streamed",
+			    Fmt("%.0f KB/frame copied  %.0f reused  %.0f verified  %.0f mismatches /frame",
+			        Rate(shown, Counter::BufferStreamBytes) / frames / 1024.0,
+			        Rate(shown, Counter::BufferStreamReuses) / frames,
+			        Rate(shown, Counter::BufferStreamReuseChecks) / frames,
+			        Rate(shown, Counter::BufferStreamReuseMisses) / frames));
 			Row("  clean reads", Fmt("%.0f/frame  (%.0f repeated in one command buffer)",
 			                         Rate(shown, Counter::BufferObtainCleanReads) / frames,
 			                         Rate(shown, Counter::BufferObtainCleanRepeats) / frames));

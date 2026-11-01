@@ -9,6 +9,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -61,6 +62,8 @@ private:
 		bool                      started         = false;
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
+		// When the guest submitted it, while debug counters are enabled.
+		std::chrono::steady_clock::time_point enqueued {};
 	};
 
 	void              Enqueue(Submission submission);

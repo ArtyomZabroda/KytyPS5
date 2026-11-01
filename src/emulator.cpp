@@ -31,6 +31,12 @@
 #include <filesystem>
 #include <thread>
 
+#if defined(KYTY_PGO_GENERATE)
+// Instrumented PGO builds: the profile runtime writes its data from atexit, which quick_exit
+// skips.
+extern "C" int __llvm_profile_write_file(void);
+#endif
+
 namespace Emulator {
 
 static void PrintSystemInfo() {
@@ -142,6 +148,11 @@ static void Execute(const std::filesystem::path& game_patch) {
 	    },
 	    &patch_path);
 	Libs::Graphics::WindowRun();
+#if defined(KYTY_PGO_GENERATE)
+	if (__llvm_profile_write_file() != 0) {
+		Log::WriteToConsoleAndLog("PGO: could not write the profile.\n");
+	}
+#endif
 	std::quick_exit(0);
 }
 

@@ -1,12 +1,11 @@
 #include "graphics/presentation/window/hostInput.h"
 
-#include <SDL3/SDL.h>
-
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "libs/controller.h"
 
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -112,14 +111,14 @@ struct PadDefault {
 };
 
 constexpr std::array PAD_DEFAULTS = {
-    PadDefault {"Cross", "South"},         PadDefault {"Circle", "East"},
-    PadDefault {"Square", "West"},         PadDefault {"Triangle", "North"},
-    PadDefault {"Options", "Start"},       PadDefault {"L3", "LeftStick"},
-    PadDefault {"R3", "RightStick"},       PadDefault {"L1", "LeftShoulder"},
-    PadDefault {"R1", "RightShoulder"},    PadDefault {"L2", "LeftTrigger"},
-    PadDefault {"R2", "RightTrigger"},     PadDefault {"Up", "DpadUp"},
-    PadDefault {"Down", "DpadDown"},       PadDefault {"Left", "DpadLeft"},
-    PadDefault {"Right", "DpadRight"},     PadDefault {"TouchPad", "Touchpad"},
+    PadDefault {"Cross", "South"},      PadDefault {"Circle", "East"},
+    PadDefault {"Square", "West"},      PadDefault {"Triangle", "North"},
+    PadDefault {"Options", "Start"},    PadDefault {"L3", "LeftStick"},
+    PadDefault {"R3", "RightStick"},    PadDefault {"L1", "LeftShoulder"},
+    PadDefault {"R1", "RightShoulder"}, PadDefault {"L2", "LeftTrigger"},
+    PadDefault {"R2", "RightTrigger"},  PadDefault {"Up", "DpadUp"},
+    PadDefault {"Down", "DpadDown"},    PadDefault {"Left", "DpadLeft"},
+    PadDefault {"Right", "DpadRight"},  PadDefault {"TouchPad", "Touchpad"},
     PadDefault {"GyroToggle", "Back"},
 };
 
@@ -169,13 +168,13 @@ struct GamepadTouchPadState {
 	uint64_t last_poll = 0;
 };
 
-constexpr int   GAMEPAD_TOUCHPAD_POLL_MS = 8;
+constexpr int   GAMEPAD_TOUCHPAD_POLL_MS  = 8;
 constexpr int   GAMEPAD_TOUCHPAD_DEADZONE = 18;
 constexpr float GAMEPAD_TOUCHPAD_SPEED    = 0.8f;
 
-MouseTouchPadState   g_mouse_touchpad;
-GamepadTouchPadState g_gamepad_touchpad;
-std::mutex           g_touchpad_mutex;
+MouseTouchPadState                           g_mouse_touchpad;
+GamepadTouchPadState                         g_gamepad_touchpad;
+std::mutex                                   g_touchpad_mutex;
 std::unordered_map<int, std::array<bool, 2>> g_pad_trigger_pressed;
 
 std::size_t ControlFromName(std::string_view name) {
@@ -255,7 +254,8 @@ public:
 
 			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_F1 ||
 			                      binding.key == SDLK_F2 || binding.key == SDLK_F7 ||
-			                      binding.key == SDLK_F8 || binding.key == SDLK_F11;
+			                      binding.key == SDLK_F8 || binding.key == SDLK_F9 ||
+			                      binding.key == SDLK_F11;
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				EXIT("Invalid input mapping: %s\n", value.c_str());
@@ -314,10 +314,12 @@ private:
 
 	void AddPadEntry(std::string_view entry, const std::string& original) {
 		const auto split   = entry.find('=');
-		const auto control = split != std::string_view::npos ? ControlFromName(entry.substr(0, split))
-		                                                     : INVALID_CONTROL;
-		const auto source  = split != std::string_view::npos ? SourceFromName(entry.substr(split + 1))
-		                                                     : INVALID_SOURCE;
+		const auto control = split != std::string_view::npos
+		                         ? ControlFromName(entry.substr(0, split))
+		                         : INVALID_CONTROL;
+		const auto source  = split != std::string_view::npos
+		                         ? SourceFromName(entry.substr(split + 1))
+		                         : INVALID_SOURCE;
 		if (control == INVALID_CONTROL || source == INVALID_SOURCE) {
 			EXIT("Invalid input mapping: %s\n", original.c_str());
 		}
@@ -341,16 +343,16 @@ private:
 		m_bindings[m_size++] = binding;
 	}
 
-	std::array<Binding, CONTROL_INFO.size()> m_bindings {};
+	std::array<Binding, CONTROL_INFO.size()>    m_bindings {};
 	std::array<std::size_t, PAD_SOURCES.size()> m_pad_controls = [] {
 		std::array<std::size_t, PAD_SOURCES.size()> a {};
 		a.fill(INVALID_CONTROL);
 		return a;
 	}();
-	bool                                     m_custom = false;
-	bool                                     m_custom_pad = false;
-	std::size_t                              m_size              = 0;
-	float                                    m_mouse_sensitivity = 1.0f;
+	bool        m_custom            = false;
+	bool        m_custom_pad        = false;
+	std::size_t m_size              = 0;
+	float       m_mouse_sensitivity = 1.0f;
 };
 
 const InputMap& GetInputMap() {
@@ -637,11 +639,13 @@ void ApplyPadControl(int id, std::size_t control, std::size_t source, bool down)
 		if (down) {
 			HostInputToggleGamepadTouchPad(id);
 		}
-	} else if (info.button == Controller::PAD_BUTTON_CROSS && HostInputGamepadDrawButton(id, down)) {
+	} else if (info.button == Controller::PAD_BUTTON_CROSS &&
+	           HostInputGamepadDrawButton(id, down)) {
 		return;
 	} else if (info.button == Controller::PAD_BUTTON_TOUCH_PAD) {
 		// Real touchpads report their own finger position; other inputs emulate a click.
-		if (source != PAD_SOURCES.size() && PAD_SOURCES[source].button != SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+		if (source != PAD_SOURCES.size() &&
+		    PAD_SOURCES[source].button != SDL_GAMEPAD_BUTTON_TOUCHPAD) {
 			Controller::SetTouchPad(id, 0, down, info.touch_x != 0.0f ? info.touch_x : 0.5f, 0.5f);
 		}
 		Controller::SetButton(id, Controller::PAD_BUTTON_TOUCH_PAD, down);
@@ -670,24 +674,25 @@ int PollGamepadTouchPad(uint64_t now_ms) {
 			return static_cast<int>(g_gamepad_touchpad.next_poll - now_ms);
 		}
 
-		const float dt = g_gamepad_touchpad.last_poll == 0 || now_ms <= g_gamepad_touchpad.last_poll
-		                     ? 0.008f
-		                     : std::min(static_cast<float>(now_ms - g_gamepad_touchpad.last_poll) *
-		                                    0.001f,
-		                                0.05f);
+		const float dt =
+		    g_gamepad_touchpad.last_poll == 0 || now_ms <= g_gamepad_touchpad.last_poll
+		        ? 0.008f
+		        : std::min(static_cast<float>(now_ms - g_gamepad_touchpad.last_poll) * 0.001f,
+		                   0.05f);
 		g_gamepad_touchpad.last_poll = now_ms;
 		g_gamepad_touchpad.next_poll = now_ms + GAMEPAD_TOUCHPAD_POLL_MS;
 		const auto velocity          = [](int axis) {
-            const int offset = axis - 128;
-            if (std::abs(offset) <= GAMEPAD_TOUCHPAD_DEADZONE) {
-                return 0.0f;
-            }
-            const int adjusted =
-                offset > 0 ? offset - GAMEPAD_TOUCHPAD_DEADZONE : offset + GAMEPAD_TOUCHPAD_DEADZONE;
-            return static_cast<float>(adjusted) / static_cast<float>(127 - GAMEPAD_TOUCHPAD_DEADZONE);
+			const int offset = axis - 128;
+			if (std::abs(offset) <= GAMEPAD_TOUCHPAD_DEADZONE) {
+				return 0.0f;
+			}
+			const int adjusted = offset > 0 ? offset - GAMEPAD_TOUCHPAD_DEADZONE
+			                                : offset + GAMEPAD_TOUCHPAD_DEADZONE;
+			return static_cast<float>(adjusted) /
+			       static_cast<float>(127 - GAMEPAD_TOUCHPAD_DEADZONE);
 		};
-		const float old_x = g_gamepad_touchpad.x;
-		const float old_y = g_gamepad_touchpad.y;
+		const float old_x    = g_gamepad_touchpad.x;
+		const float old_y    = g_gamepad_touchpad.y;
 		g_gamepad_touchpad.x = std::clamp(
 		    old_x + velocity(g_gamepad_touchpad.x_axis) * GAMEPAD_TOUCHPAD_SPEED * dt, 0.0f, 1.0f);
 		g_gamepad_touchpad.y = std::clamp(
@@ -715,8 +720,8 @@ void HostInputPadButton(int id, int button, bool down) {
 }
 
 void HostInputPadTrigger(int id, bool left, int value) {
-	const auto  source     = left ? LEFT_TRIGGER_SOURCE : RIGHT_TRIGGER_SOURCE;
-	const auto  control    = GetInputMap().PadControl(source);
+	const auto source  = left ? LEFT_TRIGGER_SOURCE : RIGHT_TRIGGER_SOURCE;
+	const auto control = GetInputMap().PadControl(source);
 	if (control == INVALID_CONTROL) {
 		return;
 	}
@@ -726,8 +731,8 @@ void HostInputPadTrigger(int id, bool left, int value) {
 	} else if (info.button == Controller::PAD_BUTTON_R2) {
 		Controller::SetAxis(id, Controller::Axis::TriggerRight, value);
 	} else {
-		auto& state = g_pad_trigger_pressed[id][left ? 0 : 1];
-		const bool down = state ? value > 32 : value > 96;
+		auto&      state = g_pad_trigger_pressed[id][left ? 0 : 1];
+		const bool down  = state ? value > 32 : value > 96;
 		if (down != state) {
 			state = down;
 			ApplyPadControl(id, control, source, down);
@@ -835,7 +840,7 @@ void HostInputSetTouchPadMode(bool enabled) {
 	if (!enabled) {
 		float x = 0;
 		float y = 0;
-		(void) SDL_GetMouseState(&x, &y);
+		(void)SDL_GetMouseState(&x, &y);
 		HostInputMouseTouchPad(false, x, y);
 	}
 	bool show_system_cursor = false;
@@ -878,10 +883,10 @@ void HostInputToggleGamepadTouchPad(int id) {
 		HostInputSetTouchPadMode(false);
 	}
 
-	const auto stick = GamepadLeftStick(id);
-	bool  enabled = false;
-	float x       = 0.5f;
-	float y       = 0.5f;
+	const auto stick   = GamepadLeftStick(id);
+	bool       enabled = false;
+	float      x       = 0.5f;
+	float      y       = 0.5f;
 	{
 		std::scoped_lock lock(g_touchpad_mutex);
 		if (g_gamepad_touchpad.enabled && g_gamepad_touchpad.id != id) {
@@ -898,9 +903,9 @@ void HostInputToggleGamepadTouchPad(int id) {
 			g_gamepad_touchpad.next_poll = g_gamepad_touchpad.last_poll + GAMEPAD_TOUCHPAD_POLL_MS;
 			g_mouse_touchpad.gesture++;
 		} else {
-			x                          = g_gamepad_touchpad.x;
-			y                          = g_gamepad_touchpad.y;
-			g_gamepad_touchpad         = {};
+			x                  = g_gamepad_touchpad.x;
+			y                  = g_gamepad_touchpad.y;
+			g_gamepad_touchpad = {};
 		}
 		g_mouse_touchpad.revision++;
 	}
@@ -948,7 +953,8 @@ bool HostInputGamepadAxis(int id, bool horizontal, int value) {
 	if (!g_gamepad_touchpad.enabled || g_gamepad_touchpad.id != id) {
 		return false;
 	}
-	(horizontal ? g_gamepad_touchpad.x_axis : g_gamepad_touchpad.y_axis) = std::clamp(value, 0, 255);
+	(horizontal ? g_gamepad_touchpad.x_axis : g_gamepad_touchpad.y_axis) =
+	    std::clamp(value, 0, 255);
 	g_gamepad_touchpad.next_poll = SDL_GetTicks();
 	return true;
 }

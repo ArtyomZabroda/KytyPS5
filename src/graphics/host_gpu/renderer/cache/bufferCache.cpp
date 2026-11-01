@@ -22,6 +22,7 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -464,6 +465,10 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 namespace {
 
+// Guest bytes of a stream copy that records or checks its hash; streamed ranges fit in one
+// caching page.
+thread_local std::array<uint8_t, BufferCache::CACHING_PAGESIZE> t_streamed_bytes;
+
 // Set when SynchronizeBuffer records an upload, so ObtainBuffer can count clean ranges.
 thread_local bool t_synchronize_uploaded = false;
 
@@ -568,6 +573,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			Common::DebugCounters::Add(Counter::BufferObtainWritten);
 		}
 	}
+	if (is_written) {
+		ForgetStreamedCopies();
+	}
 
 	// Read before the checks below: a CPU write after this point advances the generation, so a
 	// range recorded with it is never answered from the cache after that write.
@@ -605,14 +613,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    m_memory_tracker.IsRegionOnlyCpuModified(vaddr, size)) {
-		const auto alignment = std::max<uint64_t>(
-		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
-		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
-		if (mapped != nullptr) {
-			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
-				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
-			}
-			m_stream_buffer.Commit();
+		const auto streamed = [&](uint64_t offset) -> std::pair<Buffer*, uint64_t> {
 			Common::DebugCounters::Add(Counter::BufferObtainStreamed);
 			if (cached_id) {
 				report_mismatch("streamed", {});
@@ -621,6 +622,52 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				*clean = {};
 			}
 			return {&m_stream_buffer, offset};
+		};
+		const auto read_guest = [&](void* destination) {
+			if (!LibKernel::Memory::CopySparseMemory(vaddr, destination, size)) {
+				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			}
+		};
+		// The stream buffer reuses no space its current command buffer allocated.
+		const auto tick      = m_scheduler.CurrentTick();
+		const auto slot_hash = (vaddr ^ (size * 0x9e3779b97f4a7c15ull)) * 0xff51afd7ed558ccdull;
+		auto&      copy      = m_streamed_copies[(slot_hash >> 32u) % m_streamed_copies.size()];
+		if (m_streamed_copy_reuse && copy.vaddr == vaddr && copy.size == size &&
+		    copy.tick == tick && copy.epoch == m_stream_epoch) {
+			bool same = true;
+			if (copy.check) {
+				// The stream buffer may be uncached device memory, so the guest bytes are
+				// compared by hash rather than read back.
+				Common::DebugCounters::Add(Counter::BufferStreamReuseChecks);
+				read_guest(t_streamed_bytes.data());
+				same       = XXH3_64bits(t_streamed_bytes.data(), size) == copy.hash;
+				copy.check = false;
+				if (!same) {
+					ReportStreamedCopyMismatch(vaddr, size);
+				}
+			}
+			if (same) {
+				Common::DebugCounters::Add(Counter::BufferStreamReuses);
+				return streamed(copy.offset);
+			}
+		}
+		const auto alignment = std::max<uint64_t>(
+		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
+		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+		if (mapped != nullptr) {
+			const bool check = (++m_streamed_copy_count & 15u) == 0;
+			uint64_t   hash  = 0;
+			if (check) {
+				read_guest(t_streamed_bytes.data());
+				hash = XXH3_64bits(t_streamed_bytes.data(), size);
+				std::memcpy(mapped, t_streamed_bytes.data(), size);
+			} else {
+				read_guest(mapped);
+			}
+			m_stream_buffer.Commit();
+			Common::DebugCounters::Add(Counter::BufferStreamBytes, size);
+			copy = {vaddr, size, tick, m_stream_epoch, offset, hash, check};
+			return streamed(offset);
 		}
 	}
 
@@ -686,7 +733,20 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	    });
 }
 
+void BufferCache::ReportStreamedCopyMismatch(uint64_t vaddr, uint64_t size) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferStreamReuseMisses);
+	m_streamed_copy_reuse = false;
+	if (m_streamed_copy_mismatches < 64) {
+		++m_streamed_copy_mismatches;
+		LOGF_COLOR(Log::Color::BrightRed,
+		           "BufferCache: stream copy reuse mismatch #%u: 0x%016" PRIx64 "+0x%" PRIx64
+		           ", reuse disabled\n",
+		           m_streamed_copy_mismatches, vaddr, size);
+	}
+}
+
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
+	ForgetStreamedCopies();
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");
 	}
@@ -715,6 +775,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
+	ForgetStreamedCopies();
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
 	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||

@@ -311,6 +311,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	if (dw_num == 0) {
 		return;
 	}
+	m_renderer.GetBufferCache().ForgetStreamedCopies();
 
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
@@ -327,6 +328,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
+	m_renderer.GetBufferCache().ForgetStreamedCopies();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
@@ -394,6 +396,7 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	submission.enqueued = Common::DebugCounters::TimerStart();
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -473,6 +476,12 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
 				has_submission    = true;
+				if (submission.enqueued != std::chrono::steady_clock::time_point {} &&
+				    !submission.started) {
+					Counters::Add(Counters::Counter::SubmissionsStarted);
+					Counters::AddSince(Counters::Counter::SubmissionQueueNs, submission.enqueued);
+					Counters::Add(Counters::Counter::SubmissionBacklog, gpu->m_submission_count);
+				}
 			}
 		}
 		if (should_stop) {
@@ -1054,6 +1063,7 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	const auto write_label = [this, address](const void* value, uint64_t size) {
 		const auto vaddr   = reinterpret_cast<uint64_t>(address);
 		auto&      buffers = m_renderer.GetBufferCache();
+		buffers.ForgetStreamedCopies();
 		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
 		    buffers.HasGpuDirtyBytes(vaddr, size) ||
 		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
@@ -1143,6 +1153,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     "\n",
 				     event_index, event_address);
 			}
+			m_renderer.GetBufferCache().ForgetStreamedCopies();
 			if (auto& queries = m_renderer.GetOcclusionQueries(); queries.Enabled()) {
 				queries.Dump(event_address);
 				break;
@@ -1176,6 +1187,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		LOGF("CommandProcessor::Flip()\n");
 	}
 	m_renderer.GetOcclusionQueries().Publish();
+	m_renderer.GetBufferCache().ForgetStreamedCopies();
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
