@@ -316,10 +316,35 @@ void TransferRow(const Snapshot& shown, const char* label, Counter upload, Count
 void GpuActivityRows(const Snapshot& shown) {
 	const auto draws = Rate(shown, Counter::Draws);
 	Row("Draw calls", Fmt("%.0f/frame  %.0f/s", draws / std::max(shown.fps, 1.0), draws));
+	{
+		const auto share = [&](Counter counter, double total) {
+			return total > 0.0 ? 100.0 * Rate(shown, counter) / total : 0.0;
+		};
+		Row("  same as last draw",
+		    Fmt("pipeline %.0f%%  targets %.0f%%  everything %.0f%%",
+		        share(Counter::DrawSamePipeline, draws), share(Counter::DrawSameTargets, draws),
+		        share(Counter::DrawSameAll, draws)));
+		const auto stages = Rate(shown, Counter::StageBinds);
+		Row("  stage same as last",
+		    Fmt("shader %.0f%%  descriptors %.0f%%  images %.0f%%  ranges %.0f%%  "
+		        "buffers %.0f%%  data %.0f%%  all %.0f%%",
+		        share(Counter::StageSameShader, stages), share(Counter::StageSameSnapshot, stages),
+		        share(Counter::StageSameImages, stages), share(Counter::StageSameRanges, stages),
+		        share(Counter::StageSameBuffers, stages), share(Counter::StageSameData, stages),
+		        share(Counter::StageSameAll, stages)));
+	}
 	// Includes present pacing waits, so a high value alone is not a stall.
 	Row("CPU waiting on GPU",
 	    Fmt("%.0f ms/s  (%.0f waits/s)", Rate(shown, Counter::GpuWaitNs) / 1e6,
 	        Rate(shown, Counter::GpuWaits)));
+	// Percent of each second: ns/s divided by 1e7.
+	Row("GPU thread time",
+	    Fmt("PM4 %.0f%%  calls %.0f%%  idle %.0f%%  blocked %.0f%% (%.0f/s)",
+	        Rate(shown, Counter::GpuThreadPm4Ns) / 1e7, Rate(shown, Counter::GpuThreadCallNs) / 1e7,
+	        Rate(shown, Counter::GpuThreadIdleNs) / 1e7,
+	        Rate(shown, Counter::GpuThreadBlockedNs) / 1e7, Rate(shown, Counter::GpuThreadBlocks)));
+	Row("  waiting on GPU", Fmt("%.0f%% of the second, inside PM4 and calls",
+	                            Rate(shown, Counter::GpuThreadGpuWaitNs) / 1e7));
 	Row("DCC/CMASK readbacks",
 	    Fmt("%.0f ms/s  (%.0f/s)", Rate(shown, Counter::ColorMetadataReadbackNs) / 1e6,
 	        Rate(shown, Counter::ColorMetadataReadbacks)));
@@ -666,7 +691,11 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		    Fmt("%.0f/s  (%.0f/s early, GPU idle)", Rate(shown, Counter::QueueSubmits),
 		        Rate(shown, Counter::EarlySubmits)));
 		const auto faults = Rate(shown, Counter::GpuFaults);
-		Row("Write-tracking faults", Fmt("%.0f/s", faults), LevelColor(faults, 20000, 100000));
+		Row("Write-tracking faults",
+		    Fmt("%.0f/s  (handler %.1f us avg, %.0f ms/s)", faults,
+		        faults > 0.0 ? Rate(shown, Counter::GpuFaultNs) / faults / 1e3 : 0.0,
+		        Rate(shown, Counter::GpuFaultNs) / 1e6),
+		    LevelColor(faults, 20000, 100000));
 		Row("Image heap unmaps", Fmt("%.0f/frame  (%.0f buries, %.0f checks/frame)",
 		                             Rate(shown, Counter::ImageHeapUnmaps) / fps,
 		                             Rate(shown, Counter::ImageHeapBuries) / fps,
@@ -729,6 +758,22 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 			        per(Counter::FindImageCandidates, Counter::FindImageCalls),
 			        per(Counter::FindImageSameStart, Counter::FindImageCalls),
 			        per_frame(Counter::FindImageOverlapResolves)));
+			Row("    by kind",
+			    Fmt("%.0f textures  %.0f storage  %.0f color  %.0f depth /frame",
+			        per_frame(Counter::FindImageTextures), per_frame(Counter::FindImageStorage),
+			        per_frame(Counter::FindImageColorTargets),
+			        per_frame(Counter::FindImageDepthTargets)));
+			Row("    cache hits", Fmt("%.0f/frame  (%.0f calls on DCC/CMASK images)",
+			                          per_frame(Counter::FindImageCacheHits),
+			                          per_frame(Counter::ColorClearMaterializes)));
+			Row("    verified",
+			    Fmt("%.0f/frame  %.0f mismatches/frame", per_frame(Counter::FindImageVerifies),
+			        per_frame(Counter::FindImageMismatches)));
+			Row("    metadata reads",
+			    Fmt("%.0f guest slices  %.0f verified calls  %.0f mismatches /frame",
+			        per_frame(Counter::ColorClearGuestReads),
+			        per_frame(Counter::ColorClearGuestChecks),
+			        per_frame(Counter::ColorClearGuestMismatch)));
 		}
 		Row("Texture evictions", Fmt("%.0f/s", Rate(shown, Counter::TextureEvictions)));
 		TransferRow(shown, "Buffer transfers", Counter::BufferUploadBytes,
@@ -744,6 +789,13 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 			Row("  clean reads", Fmt("%.0f/frame  (%.0f repeated in one command buffer)",
 			                         Rate(shown, Counter::BufferObtainCleanReads) / frames,
 			                         Rate(shown, Counter::BufferObtainCleanRepeats) / frames));
+			Row("  clean read cache", Fmt("%.0f hits/frame  %.0f verified  %.0f mismatches /frame",
+			                              Rate(shown, Counter::BufferObtainCleanHits) / frames,
+			                              Rate(shown, Counter::BufferObtainCleanChecks) / frames,
+			                              Rate(shown, Counter::BufferObtainCleanMisses) / frames));
+			Row("Tracking locks", Fmt("%.0f contended  %.0f yields /frame",
+			                          Rate(shown, Counter::TrackingLockContended) / frames,
+			                          Rate(shown, Counter::TrackingLockYields) / frames));
 		}
 		Row("Guest sparse reads",
 		    Fmt("%.0f/frame  (%.0f walked the mappings)",

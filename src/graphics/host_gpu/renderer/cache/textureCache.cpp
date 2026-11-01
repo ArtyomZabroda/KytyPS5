@@ -36,6 +36,25 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+// Every input FindImage's choice depends on, besides the cache state.
+TextureCache::FindImageKey MakeFindImageKey(const TextureCache::ImageDesc& desc,
+                                            bool                           exact_format) {
+	const auto& info = desc.info;
+	return {info.data.address,
+	        info.data.size,
+	        (uint64_t {static_cast<uint32_t>(info.pixel_format)} << 32u) |
+	            static_cast<uint32_t>(info.guest_format),
+	        (uint64_t {info.extent.width} << 32u) | info.extent.height,
+	        (uint64_t {info.extent.depth} << 32u) | info.resources.levels,
+	        (uint64_t {info.resources.layers} << 32u) | info.samples,
+	        (uint64_t {info.bytes_per_block} << 32u) | static_cast<uint32_t>(info.tile_mode),
+	        (uint64_t {static_cast<uint32_t>(info.type)} << 32u) |
+	            (uint64_t {static_cast<uint8_t>(desc.type)} << 24u) |
+	            (uint64_t {desc.heap} << 16u) | (uint64_t {info.bgra16} << 8u) |
+	            uint64_t {exact_format}};
+}
+
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 
@@ -1225,6 +1244,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::ColorClearMaterializes);
 	const auto  range = desc.info.metadata.range;
 	const auto& view  = desc.view_info;
 	{
@@ -1270,7 +1290,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const GuestRange viewed {range.address + slice_size * first + mip.offset,
 	                         slice_size * (count - 1) + mip.size};
 	const auto       run = [&](uint32_t slice) { return viewed.address + slice_size * slice; };
-	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
+	const bool       gpu_modified = m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size);
+	if (gpu_modified) {
 		std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
 		uint32_t                                                      keys = 0;
 		for (uint32_t key = 0; key < clears.size(); key++) {
@@ -1348,22 +1369,59 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		    Common::DebugCounters::ReadbackSource::ColorMetadata);
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
 	}
+	// The tracker read-protects only GPU-dirty pages, and the guest view of GPU memory is its
+	// backing store, so without GPU writes read the metadata through the guest address instead
+	// of locking the address space for each copy. Every 16th call also reads the backing and
+	// compares; a mismatch turns guest reads off.
+	namespace Counters = Common::DebugCounters;
+	const bool direct  = !gpu_modified && m_color_clear_direct.load(std::memory_order_relaxed);
+	const bool verify  = direct && (++m_color_clear_reads & 15u) == 0;
+	if (verify) {
+		Counters::Add(Counters::Counter::ColorClearGuestChecks);
+	}
+	thread_local std::vector<uint8_t> color_clear_bytes;
+	auto&                             bytes = color_clear_bytes;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = run(slice);
+		const auto guest   = reinterpret_cast<const uint8_t*>(address);
 		uint8_t    code    = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
-			EXIT("TextureCache: failed to read color metadata backing\n");
+		if (direct) {
+			Counters::Add(Counters::Counter::ColorClearGuestReads);
+			code = *reinterpret_cast<const volatile uint8_t*>(guest);
+		}
+		if (!direct || verify) {
+			uint8_t backing = 0;
+			if (!LibKernel::Memory::TryReadBacking(address, &backing, sizeof(backing))) {
+				EXIT("TextureCache: failed to read color metadata backing\n");
+			}
+			if (verify && backing != code) {
+				ReportColorClearMismatch("code", address, code, backing);
+			}
+			code = backing;
 		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
-		std::vector<uint8_t> bytes(mip.size);
-		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read color metadata slice\n");
+		// Every byte equals the first one when the slice equals itself shifted by one byte.
+		bool uniform = false;
+		if (direct) {
+			uniform = guest[0] == code &&
+			          (mip.size == 1 || std::memcmp(guest, guest + 1, mip.size - 1) == 0);
 		}
-		if (!std::all_of(bytes.begin(), bytes.end(),
-		                 [code](uint8_t byte) { return byte == code; })) {
+		if (!direct || verify) {
+			bytes.resize(mip.size);
+			if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), mip.size)) {
+				EXIT("TextureCache: failed to read color metadata slice\n");
+			}
+			const bool backing = std::all_of(bytes.begin(), bytes.begin() + mip.size,
+			                                 [code](uint8_t byte) { return byte == code; });
+			if (verify && backing != uniform) {
+				ReportColorClearMismatch("uniform", address, uniform ? 1u : 0u, backing ? 1u : 0u);
+			}
+			uniform = backing;
+		}
+		if (!uniform) {
 			continue;
 		}
 		{
@@ -1382,10 +1440,23 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
-			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
-			m_buffer_cache.InvalidateMemory(address, bytes.size());
-			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			bytes.assign(mip.size, uint8_t {0xff});
+			m_buffer_cache.InvalidateMemory(address, mip.size);
+			LibKernel::Memory::WriteBacking(address, bytes.data(), mip.size);
 		}
+	}
+}
+
+void TextureCache::ReportColorClearMismatch(const char* what, uint64_t address, uint32_t guest,
+                                            uint32_t backing) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::ColorClearGuestMismatch);
+	m_color_clear_direct.store(false, std::memory_order_relaxed);
+	const auto number = m_color_clear_mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (number <= 64) {
+		LOGF_COLOR(Log::Color::BrightRed,
+		           "TextureCache: color metadata guest read mismatch #%u (%s) at 0x%016" PRIx64
+		           ": guest %u, backing %u; guest reads are off\n",
+		           number, what, address, guest, backing);
 	}
 }
 
@@ -1456,12 +1527,187 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 			}
 			depth.stencil_ids.push_back(association);
 		}
-		record.info                 = plane;
-		record.depth_id             = depth_id;
+		record.info     = plane;
+		record.depth_id = depth_id;
+		++m_image_generation;
 		record.stencil_subresources = depth.stencil_subresources;
 	}
 
 	return association;
+}
+
+// The full lookup behind FindImage. Records the result in the request's slot when no step had a
+// side effect that a repeat would need to redo. Returns no image for a heap lookup to retry.
+ImageId TextureCache::FindImageLocked(ImageDesc& desc, bool exact_format, const FindImageKey& key,
+                                      FindImageResult& slot) {
+	ImageId    result {};
+	const auto candidates  = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+	bool       block_alias = false;
+	bool       cacheable   = true;
+	if (Common::DebugCounters::Enabled()) {
+		using Common::DebugCounters::Counter;
+		Common::DebugCounters::Add(Counter::FindImageCalls);
+		Common::DebugCounters::Add(Counter::FindImageCandidates, candidates.size());
+		Common::DebugCounters::Add(
+		    Counter::FindImageSameStart,
+		    std::count_if(candidates.begin(), candidates.end(), [&](ImageId id) {
+			    return m_slot_images[id].info.data.address == desc.info.data.address;
+		    }));
+	}
+
+	for (const auto id: candidates) {
+		const auto& image = m_slot_images[id];
+		// Stencil descriptors name the associated plane; its depth owner supplies
+		// the native image and the canonical guest tiling.
+		if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+		    image.depth_id && image.info.data == desc.info.data &&
+		    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
+		    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
+		    image.info.resources.levels >= desc.info.resources.levels &&
+		    image.info.resources.layers >= desc.info.resources.layers &&
+		    desc.info.bytes_per_block == 1 &&
+		    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
+			result = id;
+			break;
+		}
+		if (SameBacking(image.info, desc.info, exact_format)) {
+			result = id;
+		} else if (image.SafeToDownload() && BcAlias::Matches(desc.info, image.info)) {
+			block_alias = true;
+		}
+	}
+
+	int32_t view_mip   = -1;
+	int32_t view_layer = -1;
+	if (!result) {
+		cacheable = false;
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::FindImageOverlapResolves);
+		for (const auto candidate: candidates) {
+			view_mip                = -1;
+			view_layer              = -1;
+			const auto& merged_info = result ? m_slot_images[result].info : desc.info;
+			const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
+			if (overlap.image) {
+				result     = overlap.image;
+				view_mip   = overlap.mip;
+				view_layer = overlap.layer;
+			}
+		}
+		// PS5: image heaps hold a descriptor per dynamic-resolution extent of a render target,
+		// and only one extent at an address holds data, so heap lookups create no second one.
+		if (!result && desc.heap &&
+		    std::any_of(candidates.begin(), candidates.end(), [&](ImageId id) {
+			    const auto* image = m_slot_images.try_get(id);
+			    return image != nullptr && image->registered &&
+			           image->heap_refs.load(std::memory_order_relaxed) != 0u &&
+			           image->info.data.address == desc.info.data.address &&
+			           image->info.type == desc.info.type && image->info.extent != desc.info.extent;
+		    })) {
+			return {};
+		}
+	} else if (block_alias) {
+		cacheable = false;
+		for (const auto candidate: candidates) {
+			const auto& owner = m_slot_images[candidate];
+			if (candidate != result && owner.registered && !owner.IsCpuDirty() &&
+			    BcAlias::Matches(m_slot_images[result].info, owner.info)) {
+				BcAlias::Resolve(*this, candidate, result);
+			}
+		}
+	}
+
+	if (result && !m_slot_images[result].depth_id) {
+		auto& resolved = m_slot_images[result];
+		if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
+			cacheable = false;
+			result    = {};
+		} else if (resolved.info.resources < desc.info.resources) {
+			cacheable = false;
+			FreeImage(result, FreeReason::Mips);
+			result = {};
+		}
+	}
+	if (!result) {
+		cacheable      = false;
+		result         = InsertImage(desc.info);
+		auto& inserted = m_slot_images[result];
+		if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address, inserted.info.data.size)) {
+			inserted.MarkBufferModified();
+		}
+	}
+	auto& image = m_slot_images[result];
+	if (view_mip >= 0) {
+		desc.view_info.base_level = static_cast<uint32_t>(view_mip);
+	}
+	if (view_layer >= 0) {
+		desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
+	}
+	image.frame_accessed_last = m_gc_tick;
+	TouchImage(image);
+	// A block-compatible alias would be resolved again once its owner becomes downloadable.
+	cacheable = cacheable && std::none_of(candidates.begin(), candidates.end(), [&](ImageId id) {
+		            const auto& owner = m_slot_images[id];
+		            return id != result && (BcAlias::Matches(desc.info, owner.info) ||
+		                                    BcAlias::Matches(image.info, owner.info));
+	            });
+	if (cacheable) {
+		slot = {key, m_region_generation, m_image_generation, result};
+	}
+	return result;
+}
+
+// Repeats the choice FindImageLocked made when it stored a result, without its side effects.
+// Returns why a full lookup would not answer with the cached image, or nullptr if it would.
+const char* TextureCache::VerifyFindImageHit(const ImageDesc& desc, bool exact_format,
+                                             ImageId cached, ImageId& expected) const {
+	expected               = {};
+	const auto candidates  = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+	bool       block_alias = false;
+	for (const auto id: candidates) {
+		const auto& image = m_slot_images[id];
+		if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+		    image.depth_id && image.info.data == desc.info.data &&
+		    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
+		    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
+		    image.info.resources.levels >= desc.info.resources.levels &&
+		    image.info.resources.layers >= desc.info.resources.layers &&
+		    desc.info.bytes_per_block == 1 &&
+		    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
+			expected = id;
+			break;
+		}
+		if (SameBacking(image.info, desc.info, exact_format)) {
+			expected = id;
+		} else if (image.SafeToDownload() && BcAlias::Matches(desc.info, image.info)) {
+			block_alias = true;
+		}
+	}
+	if (!expected) {
+		return "no same-backing image";
+	}
+	if (block_alias) {
+		return "block-compatible alias to resolve";
+	}
+	const auto& image = m_slot_images[expected];
+	if (!image.depth_id) {
+		if (exact_format && image.info.pixel_format != desc.info.pixel_format) {
+			return "exact format differs";
+		}
+		if (image.info.resources < desc.info.resources) {
+			return "too few mips or layers";
+		}
+	}
+	if (std::any_of(candidates.begin(), candidates.end(), [&](ImageId id) {
+		    const auto& owner = m_slot_images[id];
+		    return id != expected && (BcAlias::Matches(desc.info, owner.info) ||
+		                              BcAlias::Matches(image.info, owner.info));
+	    })) {
+		return "block-compatible alias present";
+	}
+	if (expected != cached) {
+		return "different image";
+	}
+	return nullptr;
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
@@ -1472,110 +1718,80 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ValidateImageDesc(desc);
 	EXIT_IF(desc.info.data.Empty());
 	const auto metadata_base_layer = desc.view_info.base_layer;
+	const auto key                 = MakeFindImageKey(desc, exact_format);
+	auto&      slot =
+	    m_find_image_results[XXH3_64bits(key.data(), sizeof(key)) % m_find_image_results.size()];
+	if (Common::DebugCounters::Enabled()) {
+		using Common::DebugCounters::Counter;
+		switch (desc.type) {
+			case BindingType::Texture:
+				Common::DebugCounters::Add(Counter::FindImageTextures);
+				break;
+			case BindingType::Storage: Common::DebugCounters::Add(Counter::FindImageStorage); break;
+			case BindingType::RenderTarget:
+				Common::DebugCounters::Add(Counter::FindImageColorTargets);
+				break;
+			case BindingType::DepthTarget:
+				Common::DebugCounters::Add(Counter::FindImageDepthTargets);
+				break;
+			default: break;
+		}
+	}
 
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
-		bool block_alias = false;
-		if (Common::DebugCounters::Enabled()) {
-			using Common::DebugCounters::Counter;
-			Common::DebugCounters::Add(Counter::FindImageCalls);
-			Common::DebugCounters::Add(Counter::FindImageCandidates, candidates.size());
-			Common::DebugCounters::Add(
-			    Counter::FindImageSameStart,
-			    std::count_if(candidates.begin(), candidates.end(), [&](ImageId id) {
-				    return m_slot_images[id].info.data.address == desc.info.data.address;
-			    }));
-		}
-
-		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			// Stencil descriptors name the associated plane; its depth owner supplies
-			// the native image and the canonical guest tiling.
-			if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
-			    image.depth_id && image.info.data == desc.info.data &&
-			    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
-			    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
-			    image.info.resources.levels >= desc.info.resources.levels &&
-			    image.info.resources.layers >= desc.info.resources.layers &&
-			    desc.info.bytes_per_block == 1 &&
-			    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
-				result = id;
-				break;
+		if (slot.region_generation == m_region_generation &&
+		    slot.image_generation == m_image_generation && slot.key == key) {
+			// The same request against the same images: repeat the earlier choice and its
+			// bookkeeping, then fall through to the color clear like the full lookup.
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::FindImageCacheHits);
+			result = slot.result;
+			ImageId     expected {};
+			const char* mismatch = nullptr;
+			if ((++m_find_image_hits & 15u) == 0) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::FindImageVerifies);
+				mismatch = VerifyFindImageHit(desc, exact_format, result, expected);
 			}
-			if (SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
-			} else if (image.SafeToDownload() && BcAlias::Matches(desc.info, image.info)) {
-				block_alias = true;
-			}
-		}
-
-		int32_t view_mip   = -1;
-		int32_t view_layer = -1;
-		if (!result) {
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::FindImageOverlapResolves);
-			for (const auto candidate: candidates) {
-				view_mip                = -1;
-				view_layer              = -1;
-				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
-				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
-				if (overlap.image) {
-					result     = overlap.image;
-					view_mip   = overlap.mip;
-					view_layer = overlap.layer;
+			if (mismatch != nullptr) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::FindImageMismatches);
+				if (m_find_image_mismatches < 64) {
+					++m_find_image_mismatches;
+					const auto& cached = m_slot_images[result].info;
+					LOGF_COLOR(Log::Color::BrightRed,
+					           "TextureCache: FindImage cache mismatch #%u (%s): request "
+					           "0x%016" PRIx64 "+0x%" PRIx64 " %ux%ux%u levels=%u layers=%u "
+					           "%s guest=%u tile=%u binding=%u exact=%d heap=%d; cached id=%u "
+					           "0x%016" PRIx64 "+0x%" PRIx64 " %ux%u %s; expected id=%u\n",
+					           m_find_image_mismatches, mismatch, desc.info.data.address,
+					           desc.info.data.size, desc.info.extent.width, desc.info.extent.height,
+					           desc.info.extent.depth, desc.info.resources.levels,
+					           desc.info.resources.layers,
+					           vk::to_string(desc.info.pixel_format).c_str(),
+					           static_cast<uint32_t>(desc.info.guest_format),
+					           static_cast<uint32_t>(desc.info.tile_mode),
+					           static_cast<uint32_t>(desc.type), exact_format ? 1 : 0,
+					           desc.heap ? 1 : 0, result.index, cached.data.address,
+					           cached.data.size, cached.extent.width, cached.extent.height,
+					           vk::to_string(cached.pixel_format).c_str(), expected.index);
 				}
+				// Answer this request with the full lookup; it stores a fresh result if valid.
+				slot.region_generation = 0;
+				result                 = FindImageLocked(desc, exact_format, key, slot);
+				if (!result) {
+					return {};
+				}
+			} else {
+				auto& image               = m_slot_images[result];
+				image.frame_accessed_last = m_gc_tick;
+				TouchImage(image);
 			}
-			// PS5: image heaps hold a descriptor per dynamic-resolution extent of a render target,
-			// and only one extent at an address holds data, so heap lookups create no second one.
-			if (!result && desc.heap &&
-			    std::any_of(candidates.begin(), candidates.end(), [&](ImageId id) {
-				    const auto* image = m_slot_images.try_get(id);
-				    return image != nullptr && image->registered &&
-				           image->heap_refs.load(std::memory_order_relaxed) != 0u &&
-				           image->info.data.address == desc.info.data.address &&
-				           image->info.type == desc.info.type &&
-				           image->info.extent != desc.info.extent;
-			    })) {
+		} else {
+			result = FindImageLocked(desc, exact_format, key, slot);
+			if (!result) {
 				return {};
 			}
-		} else if (block_alias) {
-			for (const auto candidate: candidates) {
-				const auto& owner = m_slot_images[candidate];
-				if (candidate != result && owner.registered && !owner.IsCpuDirty() &&
-				    BcAlias::Matches(m_slot_images[result].info, owner.info)) {
-					BcAlias::Resolve(*this, candidate, result);
-				}
-			}
 		}
-
-		if (result && !m_slot_images[result].depth_id) {
-			auto& resolved = m_slot_images[result];
-			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
-				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
-				FreeImage(result, FreeReason::Mips);
-				result = {};
-			}
-		}
-		if (!result) {
-			result         = InsertImage(desc.info);
-			auto& inserted = m_slot_images[result];
-			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
-			                                    inserted.info.data.size)) {
-				inserted.MarkBufferModified();
-			}
-		}
-		auto& image = m_slot_images[result];
-		if (view_mip >= 0) {
-			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
-		}
-		if (view_layer >= 0) {
-			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
-		}
-		image.frame_accessed_last = m_gc_tick;
-		TouchImage(image);
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&

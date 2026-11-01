@@ -21,6 +21,26 @@ enum class Counter {
 	EarlySubmits, // Of those, recorded work handed to an idle GPU between guest packets.
 	GpuWaits,     // CPU blocked on a GPU timeline semaphore.
 	GpuWaitNs,
+	// Graphics draws and their shader stages compared with the previous draw.
+	DrawSamePipeline,  // Same host pipeline.
+	DrawSameTargets,   // Same color and depth target images.
+	DrawSameAll,       // Same pipeline, targets, and every stage's bindings.
+	StageBinds,        // Shader stages bound by draws.
+	StageSameShader,   // Of those, the slot's previous stage ran the same shader.
+	StageSameSnapshot, // And read the same descriptors, SRT and user data.
+	StageSameImages,   // And bound the same image views.
+	StageSameRanges,   // And the same guest buffer ranges.
+	StageSameBuffers,  // And the same host buffer descriptors (handle, offset, range).
+	StageSameData,     // And the same shader data dwords.
+	StageSameAll,      // And the same images, buffers, data and samplers.
+	// Where the GPU thread's wall time goes. Idle and blocked time sit between work items;
+	// GPU waits happen inside PM4 processing or synchronous calls.
+	GpuThreadIdleNs,    // No submission or call queued.
+	GpuThreadBlockedNs, // Every queued submission waits on a memory condition.
+	GpuThreadBlocks,    // Waits of that kind.
+	GpuThreadPm4Ns,     // Processing guest command buffers.
+	GpuThreadCallNs,    // Running calls other threads sent to the GPU thread.
+	GpuThreadGpuWaitNs, // Of PM4 and call time, blocked on GPU timeline semaphores.
 	// GPU waits by call site, as count and duration pairs in GpuWaitSite order.
 	GpuWaitOther,
 	GpuWaitOtherNs,
@@ -94,6 +114,7 @@ enum class Counter {
 	SrtWalkerBackingLoads,     // Faulting SRT walker loads of clean bytes, served from the backing.
 	SrtWalkerReadbacks,        // Faulting SRT walker loads of GPU-written bytes, downloaded first.
 	GpuFaults,                 // Guest writes to GPU-tracked memory.
+	GpuFaultNs,                // Handler time of those, without the host's exception dispatch.
 	ShadersCompiled,
 	ShaderCompileNs,
 	PipelinesCreated,
@@ -114,6 +135,11 @@ enum class Counter {
 	BufferObtainWritten,      // Of those, ranges the shader writes.
 	BufferObtainCleanReads,   // Of those, read-only ranges with nothing to upload.
 	BufferObtainCleanRepeats, // Of those, ranges already prepared in the same command buffer.
+	BufferObtainCleanHits,    // Read-only ranges answered from the clean read cache.
+	BufferObtainCleanChecks,  // Clean read cache hits checked against the full path.
+	BufferObtainCleanMisses,  // Of those, hits the full path answered differently.
+	TrackingLockContended,    // Tracker and texture cache spin locks found held on entry.
+	TrackingLockYields,       // Times their waiters gave the processor away.
 	ImageHeapUnmaps,          // Guest unmaps that reach the image heaps.
 	ImageHeapBuries,          // Draws and dispatches that bury image heap elements after unmaps.
 	ImageHeapBuryChecks,      // Element-range overlap tests while burying.
@@ -125,19 +151,30 @@ enum class Counter {
 	TextureUploadFromGpuBytes,
 	TextureImagesCreated,
 	TextureImagesFreed,
-	TextureShapeLookups,    // Texture descriptors resolved for draws and dispatches.
-	TextureShapeMisses,     // Of those, T# encodings whose image description was computed anew.
-	GuestSparseReads,       // Guest memory copies through the direct-memory backing.
-	GuestSparseReadMisses,  // Of those, copies that walked the backing mappings.
-	ImageRegionLookups,     // Texture cache searches of the image page index.
-	ImageRegionCacheHits,   // Of those, answered from a recent identical search.
-	ImageRegionPages,       // Index pages those searches visited.
-	ImageRegionOwnerChecks, // Image overlap tests on those pages, duplicates included.
-	ImageRegionMatches,     // Distinct images the searches returned.
-	FindImageCalls,
+	TextureShapeLookups,      // Texture descriptors resolved for draws and dispatches.
+	TextureShapeMisses,       // Of those, T# encodings whose image description was computed anew.
+	GuestSparseReads,         // Guest memory copies through the direct-memory backing.
+	GuestSparseReadMisses,    // Of those, copies that walked the backing mappings.
+	ImageRegionLookups,       // Texture cache searches of the image page index.
+	ImageRegionCacheHits,     // Of those, answered from a recent identical search.
+	ImageRegionPages,         // Index pages those searches visited.
+	ImageRegionOwnerChecks,   // Image overlap tests on those pages, duplicates included.
+	ImageRegionMatches,       // Distinct images the searches returned.
+	FindImageCalls,           // Full lookups, not answered from the result cache.
 	FindImageCandidates,      // Overlapping images FindImage weighed.
 	FindImageSameStart,       // Of those, images that start at the requested address.
 	FindImageOverlapResolves, // Calls with no same-backing image, which resolved overlaps.
+	FindImageTextures,        // FindImage calls for sampled textures.
+	FindImageStorage,         // FindImage calls for storage images.
+	FindImageColorTargets,    // FindImage calls for color render targets.
+	FindImageDepthTargets,    // FindImage calls for depth render targets.
+	FindImageCacheHits,       // Calls answered from the FindImage result cache.
+	FindImageVerifies,        // Cache hits checked against the full lookup's choice.
+	FindImageMismatches,      // Of those, hits the full lookup would have answered differently.
+	ColorClearMaterializes,   // FindImage calls on DCC/CMASK images that inspect the metadata.
+	ColorClearGuestReads,     // Metadata slices read through the guest address.
+	ColorClearGuestChecks,    // Calls that also read the backing to compare.
+	ColorClearGuestMismatch,  // Of those, slices where guest and backing bytes differed.
 	// Presentation.
 	FlipsRequested,
 	FlipsRejected, // Guest flip queue was full.
@@ -215,6 +252,24 @@ inline void Add(Counter counter, uint64_t value = 1) noexcept {
 	}
 	Detail::g_counters[static_cast<int>(counter)].fetch_add(value, std::memory_order_relaxed);
 }
+
+// Adds the nanoseconds since `start`, a time taken while counters were enabled.
+inline void AddSince(Counter counter, std::chrono::steady_clock::time_point start) noexcept {
+	if (start == std::chrono::steady_clock::time_point {} || !Enabled()) {
+		return;
+	}
+	Add(counter, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                       std::chrono::steady_clock::now() - start)
+	                                       .count()));
+}
+
+// A start time for AddSince, or none while counters are off.
+[[nodiscard]] inline std::chrono::steady_clock::time_point TimerStart() noexcept {
+	return Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+}
+
+// Set once on the GPU thread, so shared code can attribute its time to that thread.
+inline thread_local bool t_gpu_thread = false;
 
 class ScopedTimer final {
 public:

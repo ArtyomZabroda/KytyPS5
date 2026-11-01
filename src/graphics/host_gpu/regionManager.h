@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -25,7 +26,9 @@
 #undef MemoryBarrier
 #elif defined(__APPLE__)
 #include <pthread.h>
+#include <sched.h>
 #elif defined(__linux__)
+#include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -36,15 +39,9 @@ class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
+		if (m_lock.test_and_set(std::memory_order_acquire)) [[unlikely]] {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-#if defined(__x86_64__) || defined(_M_X64)
-			_mm_pause();
-#elif defined(_M_ARM64)
-			__yield();
-#elif defined(__aarch64__)
-			asm volatile("yield");
-#endif
+			LockContended();
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
@@ -55,9 +52,54 @@ public:
 	}
 
 private:
+	// Spins before giving the processor away: a holder that the host preempted can only
+	// release the lock once it runs again, and guest threads outnumber the host processors.
+	static constexpr uint32_t SPINS_BEFORE_YIELD = 64;
+
+	void LockContended() noexcept {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TrackingLockContended);
+		for (uint32_t spins = 0;;) {
+			// Wait on reads, so the holder's cache line is not written until the lock is free.
+			if (!m_lock.test(std::memory_order_relaxed) &&
+			    !m_lock.test_and_set(std::memory_order_acquire)) {
+				return;
+			}
+			if (spins < SPINS_BEFORE_YIELD) {
+				spins++;
+				Pause();
+			} else {
+				GiveUpProcessor();
+			}
+		}
+	}
+
+	static void Pause() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+		_mm_pause();
+#elif defined(_M_ARM64)
+		__yield();
+#elif defined(__aarch64__)
+		asm volatile("yield");
+#endif
+	}
+
+	static void GiveUpProcessor() noexcept {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TrackingLockYields);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Unlike Sleep(0), this also runs lower-priority threads, such as a guest thread
+		// preempted by the raised GPU thread; it returns at once when none is ready.
+		if (SwitchToThread() == 0) {
+			Pause();
+		}
+#else
+		sched_yield();
+#endif
+	}
+
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		return GetCurrentThreadId();
+		static thread_local const uint32_t tid = GetCurrentThreadId();
+		return tid;
 #elif defined(__APPLE__)
 		// mach thread port is a nonzero per-thread id (0 is the "no owner" sentinel).
 		static thread_local const uint32_t tid =
@@ -92,6 +134,11 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+	// Advances whenever pages of the region become CPU-dirty, so a range seen clean at one
+	// generation is still clean while the generation stays the same.
+	[[nodiscard]] uint64_t CpuDirtyGeneration() const {
+		return m_cpu_dirty_generation.load(std::memory_order_acquire);
+	}
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
@@ -114,6 +161,9 @@ public:
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
+			if constexpr (source == DirtySource::Cpu) {
+				m_cpu_dirty_generation.fetch_add(1, std::memory_order_acq_rel);
+			}
 		} else {
 			bits.UnsetRange(start, end);
 		}
@@ -194,6 +244,7 @@ private:
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	std::atomic<uint64_t> m_cpu_dirty_generation {1};
 };
 
 } // namespace Libs::Graphics

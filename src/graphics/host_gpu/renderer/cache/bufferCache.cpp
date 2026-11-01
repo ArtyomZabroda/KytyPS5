@@ -103,7 +103,8 @@ void BufferCache::Unregister(BufferId id) {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
-	auto&                buffer = m_slot_buffers[id];
+	auto& buffer = m_slot_buffers[id];
+	m_buffers_generation++;
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
 	        !PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
@@ -568,9 +569,42 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
+	// Read before the checks below: a CPU write after this point advances the generation, so a
+	// range recorded with it is never answered from the cache after that write.
+	CleanRead* clean            = nullptr;
+	uint64_t   dirty_generation = 0;
+	BufferId   cached_id {};
+	if (!is_written && !is_texel_buffer) {
+		dirty_generation = m_memory_tracker.CpuDirtyGeneration(vaddr, size);
+		const auto hash  = (vaddr ^ (size * 0x9e3779b97f4a7c15ull)) * 0xff51afd7ed558ccdull;
+		clean            = &m_clean_reads[(hash >> 32u) % m_clean_reads.size()];
+		if (dirty_generation != 0 && clean->vaddr == vaddr && clean->size == size &&
+		    clean->dirty_generation == dirty_generation &&
+		    clean->buffers_generation == m_buffers_generation) {
+			// Every 16th hit takes the full path and compares.
+			if ((++m_clean_read_hits & 15u) != 0) {
+				Common::DebugCounters::Add(Counter::BufferObtainCleanHits);
+				auto& buffer = m_slot_buffers[clean->id];
+				TouchBuffer(buffer);
+				return {&buffer, buffer.Offset(vaddr)};
+			}
+			Common::DebugCounters::Add(Counter::BufferObtainCleanChecks);
+			cached_id = clean->id;
+		}
+	}
+	const auto report_mismatch = [&](const char* reason, BufferId found) {
+		Common::DebugCounters::Add(Counter::BufferObtainCleanMisses);
+		if (m_clean_read_mismatches < 64) {
+			++m_clean_read_mismatches;
+			LOGF_COLOR(Log::Color::BrightRed,
+			           "BufferCache: clean read cache mismatch #%u (%s): 0x%016" PRIx64
+			           "+0x%" PRIx64 " cached id=%u found id=%u\n",
+			           m_clean_read_mismatches, reason, vaddr, size, cached_id.index, found.index);
+		}
+	};
+
 	if (!is_written && size <= CACHING_PAGESIZE &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	    m_memory_tracker.IsRegionOnlyCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
@@ -580,6 +614,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			}
 			m_stream_buffer.Commit();
 			Common::DebugCounters::Add(Counter::BufferObtainStreamed);
+			if (cached_id) {
+				report_mismatch("streamed", {});
+			}
+			if (clean != nullptr && clean->vaddr == vaddr && clean->size == size) {
+				*clean = {};
+			}
 			return {&m_stream_buffer, offset};
 		}
 	}
@@ -604,6 +644,17 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
+	}
+	if (cached_id) {
+		if (cached_id != id) {
+			report_mismatch("different buffer", id);
+		} else if (t_synchronize_uploaded) {
+			report_mismatch("uploaded", id);
+		}
+	}
+	// After this call the range is clean: anything CPU-dirty was just uploaded.
+	if (clean != nullptr && dirty_generation != 0) {
+		*clean = {vaddr, size, dirty_generation, m_buffers_generation, id};
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

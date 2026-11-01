@@ -688,8 +688,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::SrtWalkerReadbacks);
 		}
+		const auto fault_start = Common::DebugCounters::TimerStart();
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+			Common::DebugCounters::AddSince(Common::DebugCounters::Counter::GpuFaultNs,
+			                                fault_start);
 			return true;
 		}
 		if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(

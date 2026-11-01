@@ -25,10 +25,23 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// !IsRegionGpuModified && IsRegionCpuModified, taking each region lock once.
+	[[nodiscard]] bool IsRegionOnlyCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// CPU-dirty generation of the region holding the range, or 0 when the range spans regions
+	// or its region is not tracked yet.
+	[[nodiscard]] uint64_t CpuDirtyGeneration(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || vaddr / TRACKER_REGION_SIZE != (vaddr + size - 1) / TRACKER_REGION_SIZE ||
+		    vaddr / TRACKER_REGION_SIZE >= REGION_COUNT) {
+			return 0;
+		}
+		const auto* manager =
+		    m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		return manager != nullptr ? manager->CpuDirtyGeneration() : 0;
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {

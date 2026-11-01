@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <map>
@@ -49,6 +50,8 @@ public:
 		BindingType   type = BindingType::Texture;
 		bool          heap = false; // PS5: resolved for a resident image heap.
 	};
+	// The ImageDesc inputs FindImage's choice depends on.
+	using FindImageKey = std::array<uint64_t, 8>;
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	             BufferCache& buffer_cache);
@@ -228,8 +231,32 @@ private:
 		uint32_t                count        = 0;
 		std::array<ImageId, 16> ids {};
 	};
-	mutable std::array<RegionQuery, 256>              m_region_queries {};
-	uint64_t                                          m_region_generation = 1;
+	mutable std::array<RegionQuery, 256> m_region_queries {};
+	uint64_t                             m_region_generation = 1;
+	// Recent FindImage results. A result stays valid while no image is registered, unregistered
+	// or re-associated with a depth image; each of those bumps one of the two generations.
+	struct FindImageResult {
+		FindImageKey key {};
+		uint64_t     region_generation = 0;
+		uint64_t     image_generation  = 0;
+		ImageId      result;
+	};
+	std::array<FindImageResult, 1024> m_find_image_results {};
+	uint64_t                          m_image_generation = 1;
+	[[nodiscard]] ImageId             FindImageLocked(ImageDesc& desc, bool exact_format,
+	                                                  const FindImageKey& key, FindImageResult& slot);
+	// Every 16th cache hit repeats the side-effect-free part of the full lookup and compares.
+	uint32_t                  m_find_image_hits       = 0;
+	uint32_t                  m_find_image_mismatches = 0;
+	[[nodiscard]] const char* VerifyFindImageHit(const ImageDesc& desc, bool exact_format,
+	                                             ImageId cached, ImageId& expected) const;
+	// MaterializeColorClear reads metadata through guest addresses until a backing comparison
+	// disagrees.
+	std::atomic<bool>     m_color_clear_direct {true};
+	uint32_t              m_color_clear_reads = 0;
+	std::atomic<uint32_t> m_color_clear_mismatches {0};
+	void ReportColorClearMismatch(const char* what, uint64_t address, uint32_t guest,
+	                              uint32_t backing);
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

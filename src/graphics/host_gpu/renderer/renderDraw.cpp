@@ -43,10 +43,162 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// Diagnostics: how much of a draw's bindings equals the previous draw's. Runs on the GPU
+// thread, and only while counters are enabled.
+class RepeatHash {
+public:
+	template <typename T>
+	void Add(const T& value) {
+		static_assert(std::is_trivially_copyable_v<T>);
+		AddBytes(&value, sizeof(value));
+	}
+	template <typename T>
+	void AddRange(std::span<const T> values) {
+		static_assert(std::is_trivially_copyable_v<T>);
+		Add(values.size());
+		AddBytes(values.data(), values.size_bytes());
+	}
+	[[nodiscard]] uint64_t Value() const { return m_hash; }
+
+private:
+	void AddBytes(const void* data, size_t size) {
+		const auto* bytes = static_cast<const uint8_t*>(data);
+		for (size_t i = 0; i < size; i++) {
+			m_hash = (m_hash ^ bytes[i]) * 0x100000001b3ull;
+		}
+	}
+	uint64_t m_hash = 0xcbf29ce484222325ull;
+};
+
+struct StageRepeatState {
+	const void* module   = nullptr;
+	uint64_t    snapshot = 0;
+	uint64_t    images   = 0;
+	uint64_t    ranges   = 0;
+	uint64_t    buffers  = 0;
+	uint64_t    data     = 0;
+	uint64_t    samplers = 0;
+	bool        valid    = false;
+};
+
+struct DrawRepeatState {
+	std::array<StageRepeatState, 4> stages {};
+	const void*                     pipeline = nullptr;
+	uint64_t                        targets  = 0;
+};
+
+DrawRepeatState g_draw_repeats;
+
+StageRepeatState HashStage(const PreparedBindings& prepared) {
+	StageRepeatState state;
+	state.module          = prepared.runtime->module;
+	state.valid           = true;
+	const auto& resources = *prepared.runtime->resources;
+	{
+		RepeatHash hash;
+		hash.AddRange(std::span<const ShaderRecompiler::IR::DescriptorValue> {resources.buffers});
+		hash.AddRange(std::span<const ShaderRecompiler::IR::DescriptorValue> {resources.images});
+		hash.AddRange(std::span<const ShaderRecompiler::IR::DescriptorValue> {resources.samplers});
+		hash.AddRange(std::span<const uint32_t> {resources.flattened_srt});
+		hash.AddRange(std::span<const uint32_t> {resources.user_data});
+		state.snapshot = hash.Value();
+	}
+	{
+		RepeatHash hash;
+		for (const auto& image: prepared.images) {
+			hash.Add(image.image_id.index);
+			hash.Add(static_cast<VkImageView>(image.image_view));
+		}
+		state.images = hash.Value();
+	}
+	{
+		RepeatHash ranges;
+		for (const auto& source: prepared.buffer_sources) {
+			ranges.Add(source.address);
+			ranges.Add(source.size);
+		}
+		state.ranges = ranges.Value();
+		RepeatHash buffers;
+		for (const auto& buffer: prepared.buffers) {
+			buffers.Add(static_cast<VkBuffer>(buffer.buffer));
+			buffers.Add(buffer.offset);
+			buffers.Add(buffer.range);
+		}
+		state.buffers = buffers.Value();
+	}
+	{
+		RepeatHash hash;
+		hash.AddRange(std::span<const uint32_t> {prepared.shader_data});
+		state.data = hash.Value();
+	}
+	{
+		RepeatHash hash;
+		for (const auto sampler: prepared.samplers) {
+			hash.Add(static_cast<VkSampler>(sampler));
+		}
+		state.samplers = hash.Value();
+	}
+	return state;
+}
+
+void CountBindingRepeats(std::span<const PreparedBindings* const, 4> slots, const void* pipeline,
+                         const DrawRenderState& draw) {
+	namespace Counters = Common::DebugCounters;
+	if (!Counters::Enabled()) {
+		return;
+	}
+	auto& last      = g_draw_repeats;
+	bool  draw_same = true;
+	for (size_t slot = 0; slot < slots.size(); slot++) {
+		auto&      previous = last.stages[slot];
+		const auto current = slots[slot] != nullptr ? HashStage(*slots[slot]) : StageRepeatState {};
+		if (current.valid) {
+			Counters::Add(Counters::Counter::StageBinds);
+			const bool shader   = previous.valid && previous.module == current.module;
+			const bool snapshot = shader && previous.snapshot == current.snapshot;
+			const bool images   = shader && previous.images == current.images;
+			const bool ranges   = shader && previous.ranges == current.ranges;
+			const bool buffers  = shader && previous.buffers == current.buffers;
+			const bool data     = shader && previous.data == current.data;
+			const bool all = images && buffers && data && previous.samplers == current.samplers;
+			if (shader) Counters::Add(Counters::Counter::StageSameShader);
+			if (snapshot) Counters::Add(Counters::Counter::StageSameSnapshot);
+			if (images) Counters::Add(Counters::Counter::StageSameImages);
+			if (ranges) Counters::Add(Counters::Counter::StageSameRanges);
+			if (buffers) Counters::Add(Counters::Counter::StageSameBuffers);
+			if (data) Counters::Add(Counters::Counter::StageSameData);
+			if (all) Counters::Add(Counters::Counter::StageSameAll);
+			draw_same = draw_same && all;
+		} else {
+			draw_same = draw_same && !previous.valid;
+		}
+		previous = current;
+	}
+	RepeatHash targets;
+	for (uint32_t i = 0; i < draw.color_count; i++) {
+		targets.Add(draw.color_info[i].image_id.index);
+	}
+	targets.Add(draw.depth_info.image_id.index);
+	const bool same_pipeline = last.pipeline == pipeline;
+	const bool same_targets  = last.targets == targets.Value();
+	if (same_pipeline) Counters::Add(Counters::Counter::DrawSamePipeline);
+	if (same_targets) Counters::Add(Counters::Counter::DrawSameTargets);
+	if (same_pipeline && same_targets && draw_same) {
+		Counters::Add(Counters::Counter::DrawSameAll);
+	}
+	last.pipeline = pipeline;
+	last.targets  = targets.Value();
+}
+
+} // namespace
 
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t                     index_offset,
                                                 const ShaderVertexInputInfo& vs_input_info) {
@@ -1163,6 +1315,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 	                                            state.depth_info, feedback_aspects, stages);
 	Common::DebugCounters::SetDrawPhase("CommitDraw");
+	if (Common::DebugCounters::Enabled()) {
+		std::array<const PreparedBindings*, 4> slots {};
+		for (uint32_t i = 0; i < vertex_stages.size() && i < 3; i++) {
+			slots[i] = &bindings.vertex[i];
+		}
+		if (state.ps_active) {
+			slots[3] = &*bindings.pixel;
+		}
+		CountBindingRepeats(slots, &pipeline, state);
+	}
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest

@@ -56,7 +56,11 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	const Common::DebugCounters::ScopedTimer site_timer(
 	    Common::DebugCounters::GpuWaitCount(site), Common::DebugCounters::GpuWaitDuration(site));
 
+	const auto start  = Common::DebugCounters::t_gpu_thread
+	                        ? Common::DebugCounters::TimerStart()
+	                        : std::chrono::steady_clock::time_point {};
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	Common::DebugCounters::AddSince(Common::DebugCounters::Counter::GpuThreadGpuWaitNs, start);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }

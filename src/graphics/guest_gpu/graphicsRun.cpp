@@ -415,8 +415,10 @@ void GuestGpu::ThreadRun(void* data) {
 	if (!Common::Thread::RaiseCurrentPriority()) {
 		Log::WriteToConsoleAndLog("GPU: could not raise the GPU thread priority.\n");
 	}
-	g_gpu_thread = true;
-	g_gpu_state  = gpu;
+	g_gpu_thread           = true;
+	g_gpu_state            = gpu;
+	namespace Counters     = Common::DebugCounters;
+	Counters::t_gpu_thread = true;
 	Common::DebugCounters::SetPm4Op(Common::DebugCounters::READ_FAULT_GPU_OUTSIDE);
 
 	for (;;) {
@@ -429,7 +431,9 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				const auto start = Counters::TimerStart();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				Counters::AddSince(Counters::Counter::GpuThreadIdleNs, start);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -451,7 +455,10 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					Counters::Add(Counters::Counter::GpuThreadBlocks);
+					const auto start = Counters::TimerStart();
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					Counters::AddSince(Counters::Counter::GpuThreadBlockedNs, start);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -477,7 +484,9 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			const auto start = Counters::TimerStart();
 			command();
+			Counters::AddSince(Counters::Counter::GpuThreadCallNs, start);
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -488,7 +497,9 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
+		const auto start    = Counters::TimerStart();
 		const bool complete = gpu->Process(submission);
+		Counters::AddSince(Counters::Counter::GpuThreadPm4Ns, start);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
