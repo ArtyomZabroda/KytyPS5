@@ -242,6 +242,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	++m_region_generation;
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_gc_tick;
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -264,6 +265,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	});
 	++m_region_generation;
 	m_lru_cache.Free(image.lru_id);
+	image.lru_tick = UINT64_MAX;
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
 		EXIT("TextureCache: image accounting underflow\n");
@@ -310,7 +312,8 @@ void TextureCache::FreeImage(ImageId id, FreeReason reason) {
 }
 
 void TextureCache::TouchImage(Image& image) {
-	if (image.registered) {
+	if (image.registered && image.lru_tick != m_gc_tick) {
+		image.lru_tick = m_gc_tick;
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}
 }

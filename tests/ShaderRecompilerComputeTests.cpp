@@ -289,11 +289,13 @@ struct TextureCacheTestAccess {
       if (owner != nullptr && owner->registered) {
         owner->frame_accessed_last = 0;
         owner->lru_id = cache.m_lru_cache.Insert(id, 0);
+        owner->lru_tick = 0;
       }
     }
     for (const auto id : live) {
       if (std::ranges::find(oldest, id) == oldest.end()) {
         cache.m_slot_images[id].lru_id = cache.m_lru_cache.Insert(id, tick);
+        cache.m_slot_images[id].lru_tick = tick;
       }
     }
   }

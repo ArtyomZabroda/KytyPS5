@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -240,6 +241,15 @@ private:
 	GraphicsBindings     m_graphics_bindings;
 	PreparedBindings     m_compute_bindings;
 	std::vector<ImageId> m_bound_images;
+	// Per color slot: the registers of the last resolved render target and their decoding.
+	struct ColorTargetDecode {
+		HW::RenderTarget registers;
+		uint32_t         mask         = 0;
+		uint32_t         slice_offset = 0;
+		bool             valid        = false;
+		RenderColorInfo  info;
+	};
+	std::array<ColorTargetDecode, 8> m_color_target_decodes;
 	// Draws bind the same textures every frame; their descriptions depend on nothing else.
 	std::unordered_map<TextureShapeKey, TextureShape, TextureShapeKeyHash> m_texture_shapes;
 	std::vector<vk::DescriptorImageInfo>                                   m_descriptor_images;

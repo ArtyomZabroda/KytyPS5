@@ -170,6 +170,8 @@ public:
 	// TextureCache garbage-collector tick, one per frame, of the last access.
 	uint64_t frame_accessed_last = 0;
 	size_t   lru_id              = 0;
+	// m_gc_tick of the last LRU touch; repeated touches within one tick change nothing.
+	uint64_t lru_tick = UINT64_MAX;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 	// heap_epoch after this image's last HeapChanged.

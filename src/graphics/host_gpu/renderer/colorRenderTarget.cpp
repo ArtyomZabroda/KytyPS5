@@ -53,6 +53,18 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		mask = 0x0f;
 	}
 
+	EXIT_IF(rt_slot >= m_color_target_decodes.size());
+	auto& decode = m_color_target_decodes[rt_slot];
+	// The decoding below reads only these registers, the slot mask and the slice offset.
+	if (decode.valid && decode.mask == mask && decode.slice_offset == render_target_slice_offset &&
+	    decode.registers == rt && !graphics_debug_dump_enabled()) {
+		r          = decode.info;
+		r.image_id = m_context.GetTextureCache().FindImage(r.desc, exact_format);
+		BindRenderTarget(r.image_id);
+		return;
+	}
+	decode.valid = false;
+
 	r             = {};
 	r.target_slot = rt_slot;
 
@@ -265,8 +277,13 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
+	decode.registers           = rt;
+	decode.mask                = mask;
+	decode.slice_offset        = render_target_slice_offset;
+	decode.info                = r;
+	decode.valid               = true;
+	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	BindRenderTarget(r.image_id);
 }
 

@@ -668,14 +668,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (!cached->second.complete) {
 		cached->second = ResolveTextureShape(resource, descriptor, true);
 	}
-	auto       desc         = cached->second.desc;
-	const auto pixel_format = cached->second.pixel_format;
-	const auto view_format  = cached->second.view_format;
+	// One binding is returned on every path below, so the description is copied only once.
+	TextureBinding result {.desc = cached->second.desc};
+	auto&          desc         = result.desc;
+	const auto     pixel_format = cached->second.pixel_format;
+	const auto     view_format  = cached->second.view_format;
 
 	auto id = texture_cache.FindImage(desc, cached->second.shader_conversion);
 	if (!id) {
 		// Another extent at the address holds it; the heap retries once an image is created.
-		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};
+		result.layout = vk::ImageLayout::eGeneral;
+		return result;
 	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
@@ -694,7 +697,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
-	return {id, nullptr, std::move(desc)};
+	result.image_id = id;
+	return result;
 }
 
 static vk::Sampler NativeSampler(RenderContext&                                  context,
