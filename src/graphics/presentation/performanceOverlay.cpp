@@ -940,6 +940,13 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		Row("Queue submits",
 		    Fmt("%.0f/s  (%.0f/s early, GPU idle)", Rate(shown, Counter::QueueSubmits),
 		        Rate(shown, Counter::EarlySubmits)));
+		if (const auto busy_ns = Rate(shown, Counter::RecorderBusyNs); busy_ns > 0.0) {
+			const auto waits = Rate(shown, Counter::RecorderWaits);
+			Row("Recording thread",
+			    Fmt("busy %.0f ms/s  %.2f us/draw  waited for %.0f ms/s  (%.0f/s)", busy_ns / 1e6,
+			        busy_ns / 1e3 / std::max(Rate(shown, Counter::Draws), 1.0),
+			        Rate(shown, Counter::RecorderWaitNs) / 1e6, waits));
+		}
 		const auto faults = Rate(shown, Counter::GpuFaults);
 		Row("Write-tracking faults",
 		    Fmt("%.0f/s  (handler %.1f us avg, %.0f ms/s)", faults,

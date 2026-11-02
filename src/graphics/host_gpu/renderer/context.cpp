@@ -26,17 +26,22 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	if (m_stream != nullptr) {
+		m_stream->Drain();
+	}
 	return m_buffer;
 }
 
 CommandRecorder CommandBuffer::Recorder() const {
 	EXIT_IF(IsInvalid());
-	return CommandRecorder {m_buffer};
+	return CommandRecorder {m_buffer, m_stream};
 }
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer         = Handle();
+	// Not Handle(): a new buffer has nothing pending, and the recording thread may still be
+	// finishing the previous one.
+	auto buffer         = m_buffer;
 	m_graphics_pipeline = nullptr;
 
 	vk::CommandBufferBeginInfo begin_info {};

@@ -105,6 +105,10 @@ struct ConfigOptions {
 	bool vk_call_timing_enabled = false;
 	// Skip image barriers whose accesses the image's last barrier already covers.
 	bool image_barrier_merge_enabled = true;
+	// A second thread calls the driver for the renderer's recorded Vulkan commands.
+	bool threaded_recording_enabled = false;
+	// Pin the GPU thread and the recording thread to two different physical cores.
+	bool pin_gpu_threads_enabled = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -178,6 +182,8 @@ bool     SkipNoticeScreen();
 bool     PollBackoffEnabled();
 bool     VulkanCallTimingEnabled();
 bool     ImageBarrierMergeEnabled();
+bool     ThreadedRecordingEnabled();
+bool     PinGpuThreadsEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

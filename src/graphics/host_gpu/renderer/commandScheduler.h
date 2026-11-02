@@ -3,12 +3,14 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/renderer/commandStream.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 
 #include <queue>
@@ -20,7 +22,10 @@ namespace Libs::Graphics {
 
 class CommandScheduler {
 public:
-	CommandScheduler(RenderContext& context, GraphicContext& graphics);
+	// With threaded_recording, a CommandStream thread calls the driver for recorded commands. The
+	// stream is declared after the command pool, so its thread stops before the pool is destroyed.
+	CommandScheduler(RenderContext& context, GraphicContext& graphics,
+	                 bool threaded_recording = false);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
@@ -74,9 +79,12 @@ private:
 
 		size_t Grow();
 
-		GraphicContext&                m_graphics;
-		MasterSemaphore&               m_master;
-		vk::CommandPool                m_pool = nullptr;
+		GraphicContext&  m_graphics;
+		MasterSemaphore& m_master;
+		// One pool per buffer: with --threaded-recording, the GPU thread begins a buffer while the
+		// recording thread still records and submits another, and a pool cannot be used by two
+		// threads at once.
+		std::vector<vk::CommandPool>   m_pools;
 		std::vector<vk::CommandBuffer> m_buffers;
 		std::vector<uint64_t>          m_ticks;
 		size_t                         m_hint = 0;
@@ -89,15 +97,17 @@ private:
 		uint64_t                     tick = 0;
 	};
 
-	void BeginNext();
-	void PriorityOperationsThread(std::stop_token stop);
-	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
-	void RunOperation(Common::UniqueFunction<void>&& operation);
+	void     BeginNext();
+	uint64_t SubmitRecorded(SubmitInfo& submit);
+	void     PriorityOperationsThread(std::stop_token stop);
+	void     QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
+	void     RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore                       m_master;
 	RenderContext&                        m_context;
 	GraphicContext&                       m_graphics;
 	CommandPool                           m_command_pool;
+	std::unique_ptr<CommandStream>        m_stream;
 	CommandBuffer                         m_command;
 	DynamicState                          m_dynamic_state;
 	std::chrono::steady_clock::time_point m_command_begin;

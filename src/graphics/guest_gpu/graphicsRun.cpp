@@ -418,6 +418,7 @@ void GuestGpu::ThreadRun(void* data) {
 	if (!Common::Thread::RaiseCurrentPriority()) {
 		Log::WriteToConsoleAndLog("GPU: could not raise the GPU thread priority.\n");
 	}
+	PlaceGpuThread(false);
 	g_gpu_thread           = true;
 	g_gpu_state            = gpu;
 	namespace Counters     = Common::DebugCounters;

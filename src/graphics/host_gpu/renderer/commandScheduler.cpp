@@ -35,29 +35,35 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
     : m_graphics(graphics), m_master(master) {
 	EXIT_IF(graphics.queue_family == static_cast<uint32_t>(-1));
-	vk::CommandPoolCreateInfo create {};
-	create.queueFamilyIndex = graphics.queue_family;
-	create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
-	                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-	const auto result       = graphics.device.createCommandPool(&create, nullptr, &m_pool);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_pool == nullptr);
 }
 
 CommandScheduler::CommandPool::~CommandPool() {
-	m_graphics.device.destroyCommandPool(m_pool, nullptr);
+	for (const auto pool: m_pools) {
+		m_graphics.device.destroyCommandPool(pool, nullptr);
+	}
 }
 
 size_t CommandScheduler::CommandPool::Grow() {
 	const auto first = m_ticks.size();
 	m_ticks.resize(first + GrowStep);
+	m_pools.resize(first + GrowStep);
 	m_buffers.resize(first + GrowStep);
 
-	vk::CommandBufferAllocateInfo allocate {};
-	allocate.commandPool        = m_pool;
-	allocate.level              = vk::CommandBufferLevel::ePrimary;
-	allocate.commandBufferCount = static_cast<uint32_t>(GrowStep);
-	EXIT_IF(m_graphics.device.allocateCommandBuffers(&allocate, m_buffers.data() + first) !=
-	        vk::Result::eSuccess);
+	for (size_t index = first; index < first + GrowStep; index++) {
+		vk::CommandPoolCreateInfo create {};
+		create.queueFamilyIndex = m_graphics.queue_family;
+		create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+		                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		const auto result = m_graphics.device.createCommandPool(&create, nullptr, &m_pools[index]);
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = m_pools[index];
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		EXIT_IF(m_graphics.device.allocateCommandBuffers(&allocate, &m_buffers[index]) !=
+		        vk::Result::eSuccess);
+	}
 	return first;
 }
 
@@ -95,10 +101,14 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
-CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
+CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics,
+                                   bool threaded_recording)
     : m_master(graphics), m_context(context), m_graphics(graphics),
-      m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_command_pool(graphics, m_master),
+      m_stream(threaded_recording ? std::make_unique<CommandStream>() : nullptr), m_command(*this),
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	m_command.m_stream = m_stream.get();
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -378,8 +388,13 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
+	// Commit() reuses only buffers whose submission the GPU has finished, so the recording thread
+	// is done with the one it returns.
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	if (m_stream != nullptr) {
+		m_stream->RecordTarget(m_command.m_buffer);
+	}
 	m_dynamic_state.Invalidate();
 	m_command_begin = std::chrono::steady_clock::now();
 	return m_command;
@@ -405,6 +420,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
+	if (m_stream != nullptr) {
+		return SubmitRecorded(submit);
+	}
 
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
@@ -445,6 +463,69 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+	m_command.m_buffer = nullptr;
+	return tick;
+}
+
+// --threaded-recording: the recording thread ends and submits the buffer after replaying its
+// commands, and the GPU thread goes on at once. The tick is taken here, so CurrentTick() and the
+// ticks callers wait for mean the same as without the thread; waiting for a tick that is not
+// submitted yet is valid for a timeline semaphore. Only this stream signals the master
+// semaphore, and it submits in tick order.
+uint64_t CommandScheduler::SubmitRecorded(SubmitInfo& submit) {
+	m_command.EndRendering();
+	const auto tick = m_master.NextTick();
+	submit.AddSignal(m_master.Handle(), tick);
+
+	struct Debug {
+		uint32_t op;
+		uint64_t submit_id;
+		uint32_t arg0, arg1, arg2, arg3;
+		uint64_t arg4;
+	};
+	const Debug debug {m_command.m_debug_op,   m_command.m_debug_submit_id, m_command.m_debug_arg0,
+	                   m_command.m_debug_arg1, m_command.m_debug_arg2,      m_command.m_debug_arg3,
+	                   m_command.m_debug_arg4};
+	auto*       graphics = &m_graphics;
+	m_stream->RecordWithData(
+	    CommandStream::DataBytes<SubmitInfo>(1) + CommandStream::DataBytes<Debug>(1), [&] {
+		    const auto* info       = m_stream->Copy(&submit, 1);
+		    const auto* debug_copy = m_stream->Copy(&debug, 1);
+		    return [=](vk::CommandBuffer buffer) {
+			    auto result = buffer.end();
+			    EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+			    vk::TimelineSemaphoreSubmitInfo timeline_info {};
+			    timeline_info.waitSemaphoreValueCount   = info->num_wait_semaphores;
+			    timeline_info.pWaitSemaphoreValues      = info->wait_ticks.data();
+			    timeline_info.signalSemaphoreValueCount = info->num_signal_semaphores;
+			    timeline_info.pSignalSemaphoreValues    = info->signal_ticks.data();
+
+			    vk::SubmitInfo submit_info {};
+			    submit_info.pNext                = &timeline_info;
+			    submit_info.waitSemaphoreCount   = info->num_wait_semaphores;
+			    submit_info.pWaitSemaphores      = info->wait_semaphores.data();
+			    submit_info.pWaitDstStageMask    = info->wait_stages.data();
+			    submit_info.commandBufferCount   = 1;
+			    submit_info.pCommandBuffers      = &buffer;
+			    submit_info.signalSemaphoreCount = info->num_signal_semaphores;
+			    submit_info.pSignalSemaphores    = info->signal_semaphores.data();
+			    {
+				    Common::LockGuard lock(graphics->queue_mutex);
+				    result = graphics->queue.submit(1, &submit_info, nullptr);
+			    }
+			    if (result != vk::Result::eSuccess) {
+				    ReportVulkanFatal("vkQueueSubmit", result, tick, debug_copy->op,
+				                      debug_copy->submit_id, debug_copy->arg0, debug_copy->arg1,
+				                      debug_copy->arg2, debug_copy->arg3, debug_copy->arg4);
+			    }
+			    EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+		    };
+	    });
+	// Callers may wait for the tick right away.
+	m_stream->Publish();
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	m_command.m_buffer = nullptr;
 	return tick;

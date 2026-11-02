@@ -124,6 +124,11 @@ static void PrintUsage() {
 	::printf(
 	    "  --no-image-barrier-merge             Issue an image barrier on every access change, "
 	    "even when the last one covers it.\n");
+	::printf("  --threaded-recording                 Call the driver for recorded Vulkan commands "
+	         "on a second thread.\n");
+	::printf(
+	    "  --pin-gpu-threads                    Pin the GPU thread and the recording thread to "
+	    "two different physical cores.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -248,6 +253,8 @@ static constexpr Flag FLAGS[] = {
     {"--no-poll-backoff", &ConfigOptions::poll_backoff_enabled, false},
     {"--vk-call-timing", &ConfigOptions::vk_call_timing_enabled},
     {"--no-image-barrier-merge", &ConfigOptions::image_barrier_merge_enabled, false},
+    {"--threaded-recording", &ConfigOptions::threaded_recording_enabled},
+    {"--pin-gpu-threads", &ConfigOptions::pin_gpu_threads_enabled},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
 #endif

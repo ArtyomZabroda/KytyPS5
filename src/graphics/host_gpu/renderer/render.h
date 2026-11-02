@@ -140,7 +140,8 @@ public:
 	void InvalidateGraphicsPipeline() const noexcept { m_graphics_pipeline = nullptr; }
 
 	// Records the renderer's commands. Handle() remains for the scheduler and for code that records
-	// through other APIs (presentation, ImGui).
+	// through other APIs (presentation, ImGui). With --threaded-recording it first waits until the
+	// recording thread has replayed every command, so direct recording keeps its order.
 	[[nodiscard]] CommandRecorder   Recorder() const;
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -163,6 +164,7 @@ private:
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
 	vk::CommandBuffer   m_buffer          = nullptr;
+	CommandStream*      m_stream          = nullptr;
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
 	uint32_t            m_debug_arg0      = 0;

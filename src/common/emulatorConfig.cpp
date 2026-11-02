@@ -245,6 +245,14 @@ bool ImageBarrierMergeEnabled() {
 	return g_config->image_barrier_merge_enabled;
 }
 
+bool ThreadedRecordingEnabled() {
+	return g_config->threaded_recording_enabled;
+}
+
+bool PinGpuThreadsEnabled() {
+	return g_config->pin_gpu_threads_enabled;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;

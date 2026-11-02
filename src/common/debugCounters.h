@@ -21,6 +21,11 @@ enum class Counter {
 	EarlySubmits, // Of those, recorded work handed to an idle GPU between guest packets.
 	GpuWaits,     // CPU blocked on a GPU timeline semaphore.
 	GpuWaitNs,
+	// --threaded-recording: time the recording thread spends calling the driver, and waits for it
+	// to catch up (before a submit or direct recording).
+	RecorderBusyNs,
+	RecorderWaits,
+	RecorderWaitNs,
 	// Graphics draws and their shader stages compared with the previous draw.
 	DrawSamePipeline,  // Same host pipeline.
 	DrawSameTargets,   // Same color and depth target images.
