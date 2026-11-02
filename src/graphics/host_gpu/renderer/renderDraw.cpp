@@ -1011,22 +1011,27 @@ static bool ResolvePrimitiveRestart(const CommandBuffer&         buffer,
 	return false;
 }
 
+// Every draw times its phases; only indexed draws log them, as before.
+static void MarkDrawPhase(const DrawCallInfo& draw, const char* phase) {
+	if (draw.IsIndexed()) {
+		LogDrawPhase(draw.Name(), phase);
+	} else {
+		Common::DebugCounters::SetDrawPhase(phase);
+	}
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t         render_target_slice_offset,
                                             DrawRenderState& state) {
 	m_context.GetImageHeap().BeginDraw();
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
-	}
+	MarkDrawPhase(draw, "GetGraphicsPrograms");
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
 		return false;
 	}
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
-	}
+	MarkDrawPhase(draw, "ResolveRenderColorTarget");
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((state.mrt_mask & (1u << slot)) != 0) {
 			ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
@@ -1036,9 +1041,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			}
 		}
 	}
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
-	}
+	MarkDrawPhase(draw, "ResolveRenderDepthTarget");
 	ResolveRenderDepthTarget(buffer, state.depth_info);
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
@@ -1295,20 +1298,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
+		Common::DebugCounters::SetDrawPhase("PrepareVertexBuffers/Vertex");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
-		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		Common::DebugCounters::SetDrawPhase("PrepareVertexBuffers/Index");
+		index_binding = PrepareIndexBuffer(buffer, index_source);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
 	if (emit.indirect.address != 0) {
+		Common::DebugCounters::SetDrawPhase("IndirectArgs");
 		const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
 		                  (draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
 		                                    : sizeof(vk::DrawIndirectCommand));
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "CreatePipeline");
-	}
+	MarkDrawPhase(draw, "CreatePipeline");
 	auto&                pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
 	vk::ImageAspectFlags feedback_aspects;
 	Common::DebugCounters::SetDrawPhase("AcquireRenderTargets");
@@ -1394,7 +1398,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	buffer.BindGraphicsPipeline(pipeline.pipeline);
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
@@ -1468,7 +1472,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	if (Common::DebugCounters::g_skip_draws.load(std::memory_order_relaxed)) {
 		return true;
 	}
-	Common::DebugCounters::SetDrawPhase("DrawSetup");
+	Common::DebugCounters::SetDrawPhase("DrawSetup/Pending");
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1480,17 +1484,20 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
+	Common::DebugCounters::SetDrawPhase("DrawSetup/Lock");
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
 		return true;
 	}
 
+	Common::DebugCounters::SetDrawPhase("DrawSetup/Special");
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
 	    DepthStencilCopy(buffer) || ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return true;
 	}
 
+	Common::DebugCounters::SetDrawPhase("DrawSetup/Checks");
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		return true;
 	}
@@ -1537,6 +1544,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+	Common::DebugCounters::SetDrawPhase("DrawSetup/Restart");
 	state.primitive_restart_enable = ResolvePrimitiveRestart(buffer, index_source);
 
 	std::vector<uint16_t> expanded_indices;
@@ -1559,6 +1567,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return true;
 	}
 
+	Common::DebugCounters::SetDrawPhase("ResolveDrawEmit");
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size, args.index_addr);
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
 	                                  args.base_vertex, args.first_instance, args.indirect);
@@ -1575,7 +1584,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	if (Common::DebugCounters::g_skip_draws.load(std::memory_order_relaxed)) {
 		return true;
 	}
-	Common::DebugCounters::SetDrawPhase("DrawSetup");
+	Common::DebugCounters::SetDrawPhase("DrawSetup/Pending");
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1587,17 +1596,20 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
 	                    args.first_instance);
 
+	Common::DebugCounters::SetDrawPhase("DrawSetup/Lock");
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
 		return true;
 	}
 
+	Common::DebugCounters::SetDrawPhase("DrawSetup/Special");
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
 	    DepthStencilCopy(buffer) || ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return true;
 	}
 
+	Common::DebugCounters::SetDrawPhase("DrawSetup/Checks");
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		return true;
 	}
@@ -1647,6 +1659,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return true;
 	}
 
+	Common::DebugCounters::SetDrawPhase("ResolveDrawEmit");
 	LogDrawStateIfNeeded(buffer, draw, state, 0, nullptr);
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
 	                                  static_cast<int32_t>(args.first_vertex), args.first_instance,

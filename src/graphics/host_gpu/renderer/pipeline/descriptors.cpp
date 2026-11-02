@@ -766,21 +766,27 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		if (program.info.images[i].heap) {
-			prepared.images[i] = {};
-			continue;
+	{
+		const Common::DebugCounters::ScopedDrawSubPhase phase("PrepareBindings/Textures");
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			if (program.info.images[i].heap) {
+				prepared.images[i] = {};
+				continue;
+			}
+			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+			binding.mip_views.swap(prepared.images[i].mip_views);
+			binding.mip_views.clear();
+			prepared.images[i] = std::move(binding);
 		}
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		binding.mip_views.swap(prepared.images[i].mip_views);
-		binding.mip_views.clear();
-		prepared.images[i] = std::move(binding);
 	}
-	prepared.samplers.reserve(program.info.samplers.size());
-	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+	{
+		const Common::DebugCounters::ScopedDrawSubPhase phase("PrepareBindings/Samplers");
+		prepared.samplers.reserve(program.info.samplers.size());
+		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+			prepared.samplers.push_back(NativeSampler(
+			    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		}
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.info.user_data_registers) {

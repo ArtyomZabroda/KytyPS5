@@ -75,7 +75,7 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 	stages[1].module = m_fragment_shader;
 	stages[1].pName  = "main";
 
-	vk::PipelineVertexInputStateCreateInfo vertex_input {};
+	vk::PipelineVertexInputStateCreateInfo   vertex_input {};
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
 	input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
 	vk::PipelineViewportStateCreateInfo viewport {};
@@ -180,6 +180,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	                             &descriptor_write);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics,
 	                     GetPipeline({destination_info.samples, destination_info.pixel_format}));
+	command_buffer.InvalidateGraphicsPipeline();
 
 	const vk::Viewport viewport {0.0f,
 	                             0.0f,

@@ -26,7 +26,7 @@ public:
 
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
-	void           EndRendering();
+	void           EndRendering(std::source_location location = std::source_location::current());
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();

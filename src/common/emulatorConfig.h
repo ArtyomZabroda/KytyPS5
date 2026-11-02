@@ -101,6 +101,10 @@ struct ConfigOptions {
 	bool                   skip_notice_screen              = false;
 	// Failed zero-timeout event-flag polls back off: yield, then sleep briefly.
 	bool poll_backoff_enabled = true;
+	// Diagnostics: time Vulkan entry points called on the GPU thread (performance overlay).
+	bool vk_call_timing_enabled = false;
+	// Skip image barriers whose accesses the image's last barrier already covers.
+	bool image_barrier_merge_enabled = true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -172,6 +176,8 @@ uint32_t GetTrophyDurationSeconds();
 bool     PlayGoHackEnabled();
 bool     SkipNoticeScreen();
 bool     PollBackoffEnabled();
+bool     VulkanCallTimingEnabled();
+bool     ImageBarrierMergeEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

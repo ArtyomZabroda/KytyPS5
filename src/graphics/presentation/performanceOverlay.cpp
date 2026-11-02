@@ -17,7 +17,10 @@
 #include <cstdio>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stop_token>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -74,28 +77,37 @@ struct Snapshot {
 	Common::HostStats                   host;
 	std::optional<uint64_t>             device_memory;
 	uint64_t                            device_budget = 0;
-	std::array<GraphicContext::HeapUsage, VK_MAX_MEMORY_HEAPS>        heaps {};
-	uint32_t                                                          heap_count = 0;
-	std::array<float, FRAME_HISTORY>                                  history {};
-	size_t                                                            history_count = 0;
-	Clock::time_point                                                 sample_time {};
-	LibKernel::Memory::DebugStats                                     guest_memory;
-	std::array<double, Common::DebugCounters::READ_FAULT_SLOTS>       read_fault_rates {};
-	std::array<double, Common::DebugCounters::READ_FAULT_SLOTS>       read_fault_ns_rates {};
-	std::array<uint64_t, Common::DebugCounters::READ_FAULT_SLOTS>     read_fault_totals {};
-	std::array<uint64_t, Common::DebugCounters::READ_FAULT_SLOTS>     read_fault_ns_totals {};
-	std::array<double, Common::DebugCounters::FAULT_PHASE_SLOTS>      phase_fault_rates {};
-	std::array<double, Common::DebugCounters::FAULT_PHASE_SLOTS>      phase_fault_ns_rates {};
-	std::array<uint64_t, Common::DebugCounters::FAULT_PHASE_SLOTS>    phase_fault_totals {};
-	std::array<uint64_t, Common::DebugCounters::FAULT_PHASE_SLOTS>    phase_fault_ns_totals {};
-	std::array<const char*, Common::DebugCounters::FAULT_PHASE_SLOTS> phase_fault_names {};
-	std::array<double, Common::DebugCounters::HLE_CALL_SLOTS>         hle_call_rates {};
-	std::array<uint64_t, Common::DebugCounters::HLE_CALL_SLOTS>       hle_call_totals {};
-	std::array<uint32_t, Common::DebugCounters::HLE_CALL_SLOTS>       hle_call_threads {};
-	std::array<const char*, Common::DebugCounters::HLE_CALL_SLOTS>    hle_call_names {};
-	std::array<double, Common::DebugCounters::PHASE_TIME_SLOTS>       phase_time_rates {};
-	std::array<uint64_t, Common::DebugCounters::PHASE_TIME_SLOTS>     phase_time_totals {};
-	std::array<const char*, Common::DebugCounters::PHASE_TIME_SLOTS>  phase_time_names {};
+	std::array<GraphicContext::HeapUsage, VK_MAX_MEMORY_HEAPS>         heaps {};
+	uint32_t                                                           heap_count = 0;
+	std::array<float, FRAME_HISTORY>                                   history {};
+	size_t                                                             history_count = 0;
+	Clock::time_point                                                  sample_time {};
+	LibKernel::Memory::DebugStats                                      guest_memory;
+	std::array<double, Common::DebugCounters::READ_FAULT_SLOTS>        read_fault_rates {};
+	std::array<double, Common::DebugCounters::READ_FAULT_SLOTS>        read_fault_ns_rates {};
+	std::array<uint64_t, Common::DebugCounters::READ_FAULT_SLOTS>      read_fault_totals {};
+	std::array<uint64_t, Common::DebugCounters::READ_FAULT_SLOTS>      read_fault_ns_totals {};
+	std::array<double, Common::DebugCounters::FAULT_PHASE_SLOTS>       phase_fault_rates {};
+	std::array<double, Common::DebugCounters::FAULT_PHASE_SLOTS>       phase_fault_ns_rates {};
+	std::array<uint64_t, Common::DebugCounters::FAULT_PHASE_SLOTS>     phase_fault_totals {};
+	std::array<uint64_t, Common::DebugCounters::FAULT_PHASE_SLOTS>     phase_fault_ns_totals {};
+	std::array<const char*, Common::DebugCounters::FAULT_PHASE_SLOTS>  phase_fault_names {};
+	std::array<double, Common::DebugCounters::HLE_CALL_SLOTS>          hle_call_rates {};
+	std::array<uint64_t, Common::DebugCounters::HLE_CALL_SLOTS>        hle_call_totals {};
+	std::array<uint32_t, Common::DebugCounters::HLE_CALL_SLOTS>        hle_call_threads {};
+	std::array<const char*, Common::DebugCounters::HLE_CALL_SLOTS>     hle_call_names {};
+	std::array<double, Common::DebugCounters::PHASE_TIME_SLOTS>        phase_time_rates {};
+	std::array<uint64_t, Common::DebugCounters::PHASE_TIME_SLOTS>      phase_time_totals {};
+	std::array<const char*, Common::DebugCounters::PHASE_TIME_SLOTS>   phase_time_names {};
+	std::array<double, Common::DebugCounters::DRIVER_CALL_SLOTS>       driver_call_tick_rates {};
+	std::array<double, Common::DebugCounters::DRIVER_CALL_SLOTS>       driver_call_count_rates {};
+	std::array<uint64_t, Common::DebugCounters::DRIVER_CALL_SLOTS>     driver_call_tick_totals {};
+	std::array<uint64_t, Common::DebugCounters::DRIVER_CALL_SLOTS>     driver_call_count_totals {};
+	std::array<double, Common::DebugCounters::DRIVER_PHASE_SLOTS>      driver_phase_tick_rates {};
+	std::array<uint64_t, Common::DebugCounters::DRIVER_PHASE_SLOTS>    driver_phase_tick_totals {};
+	std::array<const char*, Common::DebugCounters::DRIVER_PHASE_SLOTS> driver_phase_names {};
+	std::array<double, Common::DebugCounters::RENDER_PASS_END_SLOTS>   pass_end_rates {};
+	std::array<uint64_t, Common::DebugCounters::RENDER_PASS_END_SLOTS> pass_end_totals {};
 };
 
 std::mutex            g_frame_mutex;
@@ -321,42 +333,188 @@ void TransferRow(const Snapshot& shown, const char* label, Counter upload, Count
 	    Throughput(Rate(shown, upload)) + " up / " + Throughput(Rate(shown, download)) + " down");
 }
 
-// GPU-thread time per draw, by draw phase, and the PM4 time outside draws.
+// GPU-thread time per draw, by draw phase, and the PM4 time outside draws. A phase named
+// "Phase/Part" is a part of Phase: Phase shows the sum, and the row below it lists the parts, with
+// "self" for the time Phase spent outside them.
 void DrawPhaseRows(const Snapshot& shown) {
-	const auto draws = Rate(shown, Counter::Draws);
-	std::array<uint32_t, Common::DebugCounters::PHASE_TIME_SLOTS> slots {};
-	uint32_t                                                      count = 0;
-	double                                                        total = 0.0;
-	for (uint32_t i = 0; i < Common::DebugCounters::PHASE_TIME_SLOTS; i++) {
-		if (shown.phase_time_names[i] != nullptr && shown.phase_time_rates[i] > 0.0) {
-			slots[count++] = i;
-			total += shown.phase_time_rates[i];
+	using Common::DebugCounters::PHASE_TIME_SLOTS;
+	struct PhaseGroup {
+		std::string_view                       name;
+		double                                 rate = 0.0;
+		std::array<uint32_t, PHASE_TIME_SLOTS> parts {};
+		uint32_t                               part_count = 0;
+		bool                                   split      = false;
+	};
+	const auto                               draws = Rate(shown, Counter::Draws);
+	std::array<PhaseGroup, PHASE_TIME_SLOTS> groups {};
+	uint32_t                                 count = 0;
+	double                                   total = 0.0;
+	for (uint32_t i = 0; i < PHASE_TIME_SLOTS; i++) {
+		if (shown.phase_time_names[i] == nullptr || shown.phase_time_rates[i] <= 0.0) {
+			continue;
 		}
+		const std::string_view name {shown.phase_time_names[i]};
+		const auto             parent = name.substr(0, name.find('/'));
+
+		const auto same  = [&](const PhaseGroup& g) { return g.name == parent; };
+		auto       group = std::find_if(groups.begin(), groups.begin() + count, same);
+		if (group == groups.begin() + count) {
+			group->name = parent;
+			count++;
+		}
+		group->rate += shown.phase_time_rates[i];
+		group->parts[group->part_count++] = i;
+		group->split |= parent.size() != name.size();
+		total += shown.phase_time_rates[i];
 	}
 	if (count == 0 || draws <= 0.0) {
 		return;
 	}
-	std::sort(slots.begin(), slots.begin() + count, [&](uint32_t a, uint32_t b) {
-		return shown.phase_time_rates[a] > shown.phase_time_rates[b];
-	});
+	std::sort(groups.begin(), groups.begin() + count,
+	          [](const PhaseGroup& a, const PhaseGroup& b) { return a.rate > b.rate; });
 	const auto pm4 = Rate(shown, Counter::GpuThreadPm4Ns);
 	Row("Draw phases", Fmt("%.2f us/draw  %.0f ms/s in draws  %.0f ms/s of PM4 outside",
 	                       total / 1e3 / draws, total / 1e6, std::max(pm4 - total, 0.0) / 1e6));
 	constexpr uint32_t SHOWN_PHASES = 10;
 	double             rest         = 0.0;
 	for (uint32_t i = 0; i < count; i++) {
-		const auto slot = slots[i];
+		auto& group = groups[i];
 		if (i >= SHOWN_PHASES) {
-			rest += shown.phase_time_rates[slot];
+			rest += group.rate;
 			continue;
 		}
-		Row(Fmt("  %.28s", shown.phase_time_names[slot]).c_str(),
-		    Fmt("%.2f us/draw  %.0f ms/s", shown.phase_time_rates[slot] / 1e3 / draws,
-		        shown.phase_time_rates[slot] / 1e6));
+		Row(Fmt("  %.*s", static_cast<int>(std::min<size_t>(group.name.size(), 28)),
+		        group.name.data())
+		        .c_str(),
+		    Fmt("%.2f us/draw  %.0f ms/s", group.rate / 1e3 / draws, group.rate / 1e6));
+		if (!group.split) {
+			continue;
+		}
+		const auto parts = std::span {group.parts.data(), group.part_count};
+		std::ranges::sort(parts, [&](uint32_t a, uint32_t b) {
+			return shown.phase_time_rates[a] > shown.phase_time_rates[b];
+		});
+		std::string line;
+		for (const auto slot: parts) {
+			const std::string_view name {shown.phase_time_names[slot]};
+			const auto             slash = name.find('/');
+			const auto part = slash == std::string_view::npos ? std::string_view {"self"}
+			                                                  : name.substr(slash + 1);
+			line += Fmt("%.*s %.2f  ", static_cast<int>(std::min<size_t>(part.size(), 16)),
+			            part.data(), shown.phase_time_rates[slot] / 1e3 / draws);
+		}
+		Row("    parts", line);
 	}
 	if (count > SHOWN_PHASES) {
 		Row(Fmt("  %u other phases", count - SHOWN_PHASES).c_str(),
 		    Fmt("%.2f us/draw  %.0f ms/s", rest / 1e3 / draws, rest / 1e6));
+	}
+}
+
+// --vk-call-timing: GPU-thread time inside Vulkan entry points, by entry point and by the draw
+// phase the call was made in. Each call also carries the cost of the two TSC reads around it.
+void DriverCallRows(const Snapshot& shown) {
+	using Common::DebugCounters::DRIVER_CALL_SLOTS;
+	using Common::DebugCounters::DRIVER_PHASE_SLOTS;
+	const auto draws     = Rate(shown, Counter::Draws);
+	const auto frequency = static_cast<double>(Common::DebugCounters::GetDriverTscFrequency());
+	if (draws <= 0.0 || frequency <= 0.0) {
+		return;
+	}
+	const auto to_ns = [&](double ticks) { return ticks * 1e9 / frequency; };
+
+	std::array<uint32_t, DRIVER_CALL_SLOTS> calls {};
+	uint32_t                                call_count  = 0;
+	double                                  total_ticks = 0.0;
+	double                                  total_calls = 0.0;
+	for (uint32_t i = 0; i < DRIVER_CALL_SLOTS; i++) {
+		if (shown.driver_call_count_rates[i] > 0.0) {
+			calls[call_count++] = i;
+			total_ticks += shown.driver_call_tick_rates[i];
+			total_calls += shown.driver_call_count_rates[i];
+		}
+	}
+	if (call_count == 0) {
+		return;
+	}
+	std::sort(calls.begin(), calls.begin() + call_count, [&](uint32_t a, uint32_t b) {
+		return shown.driver_call_tick_rates[a] > shown.driver_call_tick_rates[b];
+	});
+	const auto timer_ns = to_ns(static_cast<double>(Common::DebugCounters::GetDriverTimerTicks()));
+	Row("Vulkan calls (GPU thread)",
+	    Fmt("%.2f us/draw  %.1f calls/draw  %.0f ms/s  (timer %.0f ns/call)",
+	        to_ns(total_ticks) / 1e3 / draws, total_calls / draws, to_ns(total_ticks) / 1e6,
+	        timer_ns));
+	constexpr uint32_t SHOWN_CALLS = 8;
+	for (uint32_t i = 0; i < std::min(call_count, SHOWN_CALLS); i++) {
+		const auto slot = calls[i];
+		const auto ns   = to_ns(shown.driver_call_tick_rates[slot]);
+		Row(Fmt("  %.28s", Common::DebugCounters::GetDriverCallName(slot)).c_str(),
+		    Fmt("%.2f us/draw  %.2f calls/draw  %.0f ns/call", ns / 1e3 / draws,
+		        shown.driver_call_count_rates[slot] / draws,
+		        ns / shown.driver_call_count_rates[slot]));
+	}
+
+	std::array<uint32_t, DRIVER_PHASE_SLOTS> phases {};
+	uint32_t                                 phase_count = 0;
+	for (uint32_t i = 0; i < DRIVER_PHASE_SLOTS; i++) {
+		if (shown.driver_phase_names[i] != nullptr && shown.driver_phase_tick_rates[i] > 0.0) {
+			phases[phase_count++] = i;
+		}
+	}
+	std::sort(phases.begin(), phases.begin() + phase_count, [&](uint32_t a, uint32_t b) {
+		return shown.driver_phase_tick_rates[a] > shown.driver_phase_tick_rates[b];
+	});
+	constexpr uint32_t SHOWN_PHASES = 6;
+	for (uint32_t i = 0; i < std::min(phase_count, SHOWN_PHASES); i++) {
+		const auto slot = phases[i];
+		Row(Fmt("  in %.25s", shown.driver_phase_names[slot]).c_str(),
+		    Fmt("%.2f us/draw", to_ns(shown.driver_phase_tick_rates[slot]) / 1e3 / draws));
+	}
+}
+
+const char* FileName(const char* path) {
+	const char* name = path;
+	for (const char* c = path; *c != '\0'; c++) {
+		if (*c == '/' || *c == '\\') {
+			name = c + 1;
+		}
+	}
+	return name;
+}
+
+// Who ends the GPU thread's render passes: each end costs a vkCmdBeginRendering for the next draw.
+void RenderPassEndRows(const Snapshot& shown) {
+	using Common::DebugCounters::RENDER_PASS_END_SLOTS;
+	const auto draws = Rate(shown, Counter::Draws);
+	if (draws <= 0.0) {
+		return;
+	}
+	std::array<uint32_t, RENDER_PASS_END_SLOTS> slots {};
+	uint32_t                                    count = 0;
+	double                                      total = 0.0;
+	for (uint32_t i = 0; i < RENDER_PASS_END_SLOTS; i++) {
+		if (shown.pass_end_rates[i] > 0.0) {
+			slots[count++] = i;
+			total += shown.pass_end_rates[i];
+		}
+	}
+	Row("Skipped per draw", Fmt("pipeline binds %.2f  image barriers %.2f",
+	                            Rate(shown, Counter::GraphicsPipelineBindsSkipped) / draws,
+	                            Rate(shown, Counter::ImageBarriersMerged) / draws));
+	if (count == 0) {
+		return;
+	}
+	std::sort(slots.begin(), slots.begin() + count, [&](uint32_t a, uint32_t b) {
+		return shown.pass_end_rates[a] > shown.pass_end_rates[b];
+	});
+	Row("Render pass ends", Fmt("%.3f/draw  %.0f/s", total / draws, total));
+	constexpr uint32_t SHOWN_SITES = 4;
+	for (uint32_t i = 0; i < std::min(count, SHOWN_SITES); i++) {
+		const auto  slot = slots[i];
+		const char* file = FileName(Common::DebugCounters::GetRenderPassEndFile(slot));
+		Row(Fmt("  %.22s:%u", file, Common::DebugCounters::GetRenderPassEndLine(slot)).c_str(),
+		    Fmt("%.3f/draw", shown.pass_end_rates[slot] / draws));
 	}
 }
 
@@ -396,6 +554,8 @@ void GpuActivityRows(const Snapshot& shown) {
 	Row("  waiting on GPU", Fmt("%.0f%% of the second, inside PM4 and calls",
 	                            Rate(shown, Counter::GpuThreadGpuWaitNs) / 1e7));
 	DrawPhaseRows(shown);
+	DriverCallRows(shown);
+	RenderPassEndRows(shown);
 	if (Rate(shown, Counter::ColorMetadataReadbacks) > 0.0) {
 		Row("DCC/CMASK readbacks",
 		    Fmt("%.0f ms/s  (%.0f/s)", Rate(shown, Counter::ColorMetadataReadbackNs) / 1e6,
@@ -550,6 +710,32 @@ void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point 
 		    seconds > 0.0 ? static_cast<double>(ns - shown.phase_time_totals[i]) / seconds : 0.0;
 		shown.phase_time_totals[i] = ns;
 		shown.phase_time_names[i]  = Common::DebugCounters::GetPhaseTimeName(i);
+	}
+	for (uint32_t i = 0; i < Common::DebugCounters::DRIVER_CALL_SLOTS; i++) {
+		const auto ticks = Common::DebugCounters::GetDriverCallTicks(i);
+		const auto count = Common::DebugCounters::GetDriverCallCount(i);
+		shown.driver_call_tick_rates[i] =
+		    seconds > 0.0 ? static_cast<double>(ticks - shown.driver_call_tick_totals[i]) / seconds
+		                  : 0.0;
+		shown.driver_call_count_rates[i] =
+		    seconds > 0.0 ? static_cast<double>(count - shown.driver_call_count_totals[i]) / seconds
+		                  : 0.0;
+		shown.driver_call_tick_totals[i]  = ticks;
+		shown.driver_call_count_totals[i] = count;
+	}
+	for (uint32_t i = 0; i < Common::DebugCounters::DRIVER_PHASE_SLOTS; i++) {
+		const auto ticks = Common::DebugCounters::GetDriverPhaseTicks(i);
+		shown.driver_phase_tick_rates[i] =
+		    seconds > 0.0 ? static_cast<double>(ticks - shown.driver_phase_tick_totals[i]) / seconds
+		                  : 0.0;
+		shown.driver_phase_tick_totals[i] = ticks;
+		shown.driver_phase_names[i]       = Common::DebugCounters::GetDriverPhaseName(i);
+	}
+	for (uint32_t i = 0; i < Common::DebugCounters::RENDER_PASS_END_SLOTS; i++) {
+		const auto count = Common::DebugCounters::GetRenderPassEnds(i);
+		shown.pass_end_rates[i] =
+		    seconds > 0.0 ? static_cast<double>(count - shown.pass_end_totals[i]) / seconds : 0.0;
+		shown.pass_end_totals[i] = count;
 	}
 	for (uint32_t i = 0; i < Common::DebugCounters::HLE_CALL_SLOTS; i++) {
 		const auto count = Common::DebugCounters::GetHleCalls(i);

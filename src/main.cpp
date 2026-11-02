@@ -119,6 +119,11 @@ static void PrintUsage() {
 	         "games.\n");
 	::printf("  --no-poll-backoff                    Let failed event-flag polls spin instead of "
 	         "yielding.\n");
+	::printf("  --vk-call-timing                     Time Vulkan calls on the GPU thread for the "
+	         "performance panel.\n");
+	::printf(
+	    "  --no-image-barrier-merge             Issue an image barrier on every access change, "
+	    "even when the last one covers it.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -241,6 +246,8 @@ static constexpr Flag FLAGS[] = {
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
     {"--skip-notice-screen", &ConfigOptions::skip_notice_screen},
     {"--no-poll-backoff", &ConfigOptions::poll_backoff_enabled, false},
+    {"--vk-call-timing", &ConfigOptions::vk_call_timing_enabled},
+    {"--no-image-barrier-merge", &ConfigOptions::image_barrier_merge_enabled, false},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
 #endif

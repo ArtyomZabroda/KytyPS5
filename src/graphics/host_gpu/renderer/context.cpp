@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -30,7 +31,8 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
+	auto buffer         = Handle();
+	m_graphics_pipeline = nullptr;
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -114,13 +116,23 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	m_rendering                                           = true;
 }
 
-void CommandBuffer::EndRendering() const {
+void CommandBuffer::EndRendering(std::source_location location) const {
 	if (!m_rendering) {
 		return;
 	}
+	Common::DebugCounters::CountRenderPassEnd(location.file_name(), location.line());
 	Handle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
+}
+
+void CommandBuffer::BindGraphicsPipeline(vk::Pipeline pipeline) const {
+	if (pipeline == m_graphics_pipeline) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GraphicsPipelineBindsSkipped);
+		return;
+	}
+	Handle().bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+	m_graphics_pipeline = pipeline;
 }
 
 } // namespace Libs::Graphics

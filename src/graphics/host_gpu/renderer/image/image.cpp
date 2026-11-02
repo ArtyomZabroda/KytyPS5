@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -59,10 +61,9 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 		usage |= vk::ImageUsageFlagBits::eSampled;
 		if (graphics.supports_block_texel_view) {
 			const auto storage = usage | vk::ImageUsageFlagBits::eStorage;
-			if (graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
-			                                      vk::ImageTiling::eOptimal, storage,
-			                                      ImageCreateFlags(graphics, info, storage),
-			                                      nullptr) == vk::Result::eSuccess) {
+			if (graphics.GetImageFormatProperties(
+			        info.pixel_format, HostImageType(info.type), vk::ImageTiling::eOptimal, storage,
+			        ImageCreateFlags(graphics, info, storage), nullptr) == vk::Result::eSuccess) {
 				usage = storage;
 			} else {
 				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
@@ -82,7 +83,8 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	}
 	if (DepthAspectTransferFormat(info.pixel_format) != vk::Format::eUndefined) {
 		usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
-		if (graphics.attachment_feedback_loop_enabled && (usage & vk::ImageUsageFlagBits::eSampled)) {
+		if (graphics.attachment_feedback_loop_enabled &&
+		    (usage & vk::ImageUsageFlagBits::eSampled)) {
 			usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
 		}
 		return usage;
@@ -95,6 +97,44 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 		usage |= vk::ImageUsageFlagBits::eStorage;
 	}
 	return usage;
+}
+
+bool IsReadOnlyLayout(vk::ImageLayout layout) {
+	switch (layout) {
+		case vk::ImageLayout::eDepthStencilReadOnlyOptimal:
+		case vk::ImageLayout::eDepthReadOnlyOptimal:
+		case vk::ImageLayout::eStencilReadOnlyOptimal:
+		case vk::ImageLayout::eShaderReadOnlyOptimal:
+		case vk::ImageLayout::eReadOnlyOptimal: return true;
+		default: return false;
+	}
+}
+
+// A request needs no barrier when the layout stays, the last barrier already made the image
+// available to every requested access and stage, and nothing since could have written it. An
+// attachment store in a read-only layout writes nothing. Without this, an image that is both a
+// read-only attachment and a sampled texture alternates between the two access masks and ends the
+// render pass on every draw.
+template <typename State>
+bool CoveredByState(const State& state, vk::ImageLayout layout, vk::AccessFlags2 access,
+                    vk::PipelineStageFlags2 stage) {
+	if (!Config::ImageBarrierMergeEnabled() || state.layout != layout ||
+	    (access & ~state.access_mask) || (stage & ~state.pl_stage)) {
+		return false;
+	}
+	vk::AccessFlags2 hazards =
+	    vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
+	    vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
+	    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+	if (IsReadOnlyLayout(layout)) {
+		hazards &= ~(vk::AccessFlagBits2::eColorAttachmentWrite |
+		             vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
+	}
+	if (state.access_mask & hazards) {
+		return false;
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::ImageBarriersMerged);
+	return true;
 }
 
 void ValidateOptionalRange(GuestRange range, const char* name) {
@@ -147,6 +187,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		const uint32_t level_count = partial ? range->level_count : info.resources.levels;
 		const uint32_t base_layer  = partial ? range->base_layer : 0;
 		const uint32_t layer_count = partial ? range->layer_count : info.resources.layers;
+		bool           any_covered = false;
 		for (uint32_t level = base_level; level < base_level + level_count; level++) {
 			for (uint32_t layer = base_layer; layer < base_layer + layer_count; layer++) {
 				const auto index = level * info.resources.layers + layer;
@@ -158,8 +199,14 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				                              vk::AccessFlagBits2::eMemoryWrite;
 				const bool     repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access);
-				if (subresource_state.layout != destination_layout ||
-				    subresource_state.access_mask != destination_access || repeated_write) {
+				const bool changed = subresource_state.layout != destination_layout ||
+				                     subresource_state.access_mask != destination_access ||
+				                     repeated_write;
+				const bool covered =
+				    changed && CoveredByState(subresource_state, destination_layout,
+				                              destination_access, destination_stage);
+				any_covered = any_covered || covered;
+				if (changed && !covered) {
 					vk::ImageMemoryBarrier2 barrier {};
 					barrier.srcStageMask                    = subresource_state.pl_stage;
 					barrier.srcAccessMask                   = subresource_state.access_mask;
@@ -181,7 +228,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 			}
 		}
 
-		if (!partial) {
+		// A covered subresource keeps its wider state, so the states stay per subresource.
+		if (!partial && !any_covered) {
 			subresource_states.clear();
 		}
 	} else {
@@ -191,6 +239,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
 		    !repeated_write) {
+			return {};
+		}
+		if (CoveredByState(state, destination_layout, destination_access, destination_stage)) {
 			return {};
 		}
 
@@ -678,7 +729,8 @@ void Validate(const ImageInfo& info) {
 		case ImageMetadataKind::Dcc:
 		case ImageMetadataKind::Cmask:
 			if (!GuestRange {info.metadata.range.address,
-			                 std::max<uint64_t>(info.metadata.range.size, 1)}.Valid() ||
+			                 std::max<uint64_t>(info.metadata.range.size, 1)}
+			         .Valid() ||
 			    info.metadata.compression == VideoOutCompression::Unsupported) {
 				EXIT("invalid color metadata\n");
 			}
@@ -740,18 +792,18 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}
-	SetVulkanObjectNameF(
-	    graphics.device, backing.image,
-	    "Kyty.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} layers={} samples={}]",
-	    info.data.address, info.data.size, info.extent.width, info.extent.height, info.extent.depth,
-	    static_cast<uint32_t>(info.pixel_format), info.resources.levels, info.resources.layers,
-	    info.samples);
+	SetVulkanObjectNameF(graphics.device, backing.image,
+	                     "Kyty.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} "
+	                     "layers={} samples={}]",
+	                     info.data.address, info.data.size, info.extent.width, info.extent.height,
+	                     info.extent.depth, static_cast<uint32_t>(info.pixel_format),
+	                     info.resources.levels, info.resources.layers, info.samples);
 }
 
 uint64_t Image::HashGuestEdges() const {
 	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes {};
 	const auto                                 range = info.data;
-	const uint64_t head_end =
+	const uint64_t                             head_end =
 	    std::min(range.End(), Common::AlignUp(range.address, TRACKER_PAGE_SIZE));
 	const uint64_t tail_begin =
 	    std::max(range.address, Common::AlignDown(range.End(), TRACKER_PAGE_SIZE));

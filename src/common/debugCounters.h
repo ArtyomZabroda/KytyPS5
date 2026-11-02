@@ -183,6 +183,8 @@ enum class Counter {
 	ColorClearGuestReads,     // Metadata slices read through the guest address.
 	ColorClearGuestChecks,    // Calls that also read the backing to compare.
 	ColorClearGuestMismatch,  // Of those, slices where guest and backing bytes differed.
+	GraphicsPipelineBindsSkipped, // Draws whose pipeline was already bound in the command buffer.
+	ImageBarriersMerged, // Image barriers skipped: the last one already covered the request.
 	// Presentation.
 	FlipsRequested,
 	FlipsRejected, // Guest flip queue was full.
@@ -503,6 +505,154 @@ public:
 private:
 	const char* m_previous;
 };
+
+// A part of the current draw phase, named "Phase/Part". Outside a draw it does nothing, so code
+// that dispatches share can mark its parts without timing the dispatch as a draw.
+class ScopedDrawSubPhase final {
+public:
+	explicit ScopedDrawSubPhase(const char* phase) noexcept: m_previous(Detail::t_draw_phase) {
+		if (m_previous != nullptr) {
+			SwitchDrawPhase(phase);
+		}
+	}
+	~ScopedDrawSubPhase() {
+		if (m_previous != nullptr) {
+			SwitchDrawPhase(m_previous);
+		}
+	}
+	ScopedDrawSubPhase(const ScopedDrawSubPhase&)            = delete;
+	ScopedDrawSubPhase& operator=(const ScopedDrawSubPhase&) = delete;
+
+private:
+	const char* m_previous;
+};
+
+// Render passes the GPU thread ended, by the source location that ended them.
+constexpr uint32_t RENDER_PASS_END_SLOTS = 32;
+
+namespace Detail {
+inline std::atomic<const char*> g_pass_end_files[RENDER_PASS_END_SLOTS] {};
+inline std::atomic<uint32_t>    g_pass_end_lines[RENDER_PASS_END_SLOTS] {};
+inline std::atomic<uint64_t>    g_pass_end_counts[RENDER_PASS_END_SLOTS] {};
+} // namespace Detail
+
+inline void CountRenderPassEnd(const char* file, uint32_t line) noexcept {
+	if (!t_gpu_thread || !Enabled()) {
+		return;
+	}
+	for (uint32_t i = 0; i < RENDER_PASS_END_SLOTS; i++) {
+		const char* name = Detail::g_pass_end_files[i].load(std::memory_order_acquire);
+		if (name == nullptr) {
+			Detail::g_pass_end_lines[i].store(line, std::memory_order_relaxed);
+			Detail::g_pass_end_files[i].store(file, std::memory_order_release);
+			name = file;
+		}
+		if (name == file && Detail::g_pass_end_lines[i].load(std::memory_order_relaxed) == line) {
+			auto& count = Detail::g_pass_end_counts[i];
+			count.store(count.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+			return;
+		}
+	}
+}
+
+[[nodiscard]] inline const char* GetRenderPassEndFile(uint32_t slot) noexcept {
+	return Detail::g_pass_end_files[slot].load(std::memory_order_acquire);
+}
+
+[[nodiscard]] inline uint32_t GetRenderPassEndLine(uint32_t slot) noexcept {
+	return Detail::g_pass_end_lines[slot].load(std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline uint64_t GetRenderPassEnds(uint32_t slot) noexcept {
+	return Detail::g_pass_end_counts[slot].load(std::memory_order_relaxed);
+}
+
+// Time spent inside Vulkan entry points on the GPU thread (--vk-call-timing), in TSC ticks.
+// Every wrapped entry point owns a slot; the same time is also split by the draw phase the call
+// was made in. Only the GPU thread writes, so a plain load and store replaces a locked add.
+constexpr uint32_t DRIVER_CALL_SLOTS  = 96;
+constexpr uint32_t DRIVER_PHASE_SLOTS = 32;
+
+namespace Detail {
+inline std::atomic<const char*> g_driver_call_names[DRIVER_CALL_SLOTS] {};
+inline std::atomic<uint64_t>    g_driver_call_ticks[DRIVER_CALL_SLOTS] {};
+inline std::atomic<uint64_t>    g_driver_call_counts[DRIVER_CALL_SLOTS] {};
+inline std::atomic<const char*> g_driver_phase_names[DRIVER_PHASE_SLOTS] {};
+inline std::atomic<uint64_t>    g_driver_phase_ticks[DRIVER_PHASE_SLOTS] {};
+inline std::atomic<uint64_t>    g_driver_timer_ticks {0};
+inline std::atomic<uint64_t>    g_driver_tsc_frequency {0};
+inline thread_local const char* t_driver_phase      = nullptr;
+inline thread_local uint32_t    t_driver_phase_slot = DRIVER_PHASE_SLOTS;
+
+inline void SingleWriterAdd(std::atomic<uint64_t>& value, uint64_t delta) noexcept {
+	value.store(value.load(std::memory_order_relaxed) + delta, std::memory_order_relaxed);
+}
+
+inline uint32_t DriverPhaseSlot(const char* phase) noexcept {
+	for (uint32_t i = 0; i < DRIVER_PHASE_SLOTS; i++) {
+		const char* name = g_driver_phase_names[i].load(std::memory_order_acquire);
+		if (name == nullptr) {
+			g_driver_phase_names[i].store(phase, std::memory_order_release);
+			return i;
+		}
+		if (name == phase) {
+			return i;
+		}
+	}
+	return DRIVER_PHASE_SLOTS;
+}
+} // namespace Detail
+
+inline void RegisterDriverCall(uint32_t slot, const char* name) noexcept {
+	Detail::g_driver_call_names[slot].store(name, std::memory_order_release);
+}
+
+inline void SetDriverTiming(uint64_t tsc_frequency, uint64_t timer_ticks) noexcept {
+	Detail::g_driver_tsc_frequency.store(tsc_frequency, std::memory_order_relaxed);
+	Detail::g_driver_timer_ticks.store(timer_ticks, std::memory_order_relaxed);
+}
+
+inline void AddDriverCall(uint32_t slot, uint64_t ticks) noexcept {
+	Detail::SingleWriterAdd(Detail::g_driver_call_ticks[slot], ticks);
+	Detail::SingleWriterAdd(Detail::g_driver_call_counts[slot], 1);
+	const char* phase = Detail::t_draw_phase != nullptr ? Detail::t_draw_phase : NO_DRAW_PHASE;
+	if (phase != Detail::t_driver_phase) {
+		Detail::t_driver_phase      = phase;
+		Detail::t_driver_phase_slot = Detail::DriverPhaseSlot(phase);
+	}
+	if (Detail::t_driver_phase_slot < DRIVER_PHASE_SLOTS) {
+		Detail::SingleWriterAdd(Detail::g_driver_phase_ticks[Detail::t_driver_phase_slot], ticks);
+	}
+}
+
+[[nodiscard]] inline const char* GetDriverCallName(uint32_t slot) noexcept {
+	return Detail::g_driver_call_names[slot].load(std::memory_order_acquire);
+}
+
+[[nodiscard]] inline uint64_t GetDriverCallTicks(uint32_t slot) noexcept {
+	return Detail::g_driver_call_ticks[slot].load(std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline uint64_t GetDriverCallCount(uint32_t slot) noexcept {
+	return Detail::g_driver_call_counts[slot].load(std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline const char* GetDriverPhaseName(uint32_t slot) noexcept {
+	return Detail::g_driver_phase_names[slot].load(std::memory_order_acquire);
+}
+
+[[nodiscard]] inline uint64_t GetDriverPhaseTicks(uint32_t slot) noexcept {
+	return Detail::g_driver_phase_ticks[slot].load(std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline uint64_t GetDriverTscFrequency() noexcept {
+	return Detail::g_driver_tsc_frequency.load(std::memory_order_relaxed);
+}
+
+// Cost of the back-to-back TSC reads that bracket each call, included in every measured call.
+[[nodiscard]] inline uint64_t GetDriverTimerTicks() noexcept {
+	return Detail::g_driver_timer_ticks.load(std::memory_order_relaxed);
+}
 
 inline void AddPhaseFault(const char* phase, uint64_t ns) noexcept {
 	if (!Enabled()) {

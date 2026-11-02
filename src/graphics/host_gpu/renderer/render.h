@@ -12,6 +12,7 @@
 
 #include <array>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -129,7 +130,13 @@ public:
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
-	void EndRendering() const;
+	// The caller's location is counted for the overlay's render pass breakdown.
+	void EndRendering(std::source_location location = std::source_location::current()) const;
+	// Binding state lasts for the whole command buffer, so a draw that uses the pipeline already
+	// bound skips vkCmdBindPipeline.
+	void BindGraphicsPipeline(vk::Pipeline pipeline) const;
+	// Code that binds a graphics pipeline itself calls this, so the next draw binds again.
+	void InvalidateGraphicsPipeline() const noexcept { m_graphics_pipeline = nullptr; }
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -164,6 +171,9 @@ private:
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
+
+	// The graphics pipeline bound in this command buffer; null until a draw binds one.
+	mutable vk::Pipeline m_graphics_pipeline = nullptr;
 
 	friend class CommandScheduler;
 };

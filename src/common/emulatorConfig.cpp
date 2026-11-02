@@ -237,6 +237,14 @@ bool PollBackoffEnabled() {
 	return g_config->poll_backoff_enabled;
 }
 
+bool VulkanCallTimingEnabled() {
+	return g_config->vk_call_timing_enabled;
+}
+
+bool ImageBarrierMergeEnabled() {
+	return g_config->image_barrier_merge_enabled;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;
