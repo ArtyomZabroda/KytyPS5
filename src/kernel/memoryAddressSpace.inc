@@ -285,24 +285,26 @@ public:
 		// Draws read the same small buffers every frame, each usually inside one mapping, and
 		// a draw's buffers sit in several mappings.
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestSparseReads);
-		auto& hints = t_read_hints;
-		for (const auto& hint: hints.entries) {
-			if (hint.generation == m_generation && vaddr >= hint.vaddr &&
-			    vaddr + size <= hint.vaddr + hint.size) {
-				std::memcpy(data, m_backing_base + (hint.backing_offset + vaddr - hint.vaddr), size);
-				return true;
-			}
+		auto& hint = t_read_hints.entries[ReadHintSlot(vaddr)];
+		if (hint.generation == m_generation && vaddr >= hint.vaddr &&
+		    vaddr + size <= hint.vaddr + hint.size) {
+			std::memcpy(data, m_backing_base + (hint.backing_offset + vaddr - hint.vaddr), size);
+			return true;
 		}
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestSparseReadMisses);
+		bool hinted = false;
 		CopySparseRange(m_maps, vaddr, data, size,
 		                [&](const auto& entry, uint64_t start) {
 			                if (entry.vaddr <= vaddr && vaddr + size <= entry.vaddr + entry.size) {
-				                hints.entries[hints.next++ % hints.entries.size()] = {
-				                    m_generation, entry.vaddr, entry.size, entry.backing_offset};
+				                hint   = {m_generation, entry.vaddr, entry.size, entry.backing_offset};
+				                hinted = true;
 			                }
 			                return m_backing_base + (entry.backing_offset + start - entry.vaddr);
 		                },
 		                gap);
+		if (!hinted) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestSparseReadSplit);
+		}
 		return true;
 	}
 
@@ -695,8 +697,10 @@ private:
 	int m_fd = -1;
 #endif
 
-	// The last mappings a thread read through, valid until the maps next change. Generations
-	// are unique across stores and never 0, so a hint never outlives its store's maps.
+	// The mappings a thread last read through, valid until the maps next change. Generations
+	// are unique across stores and never 0, so a hint never outlives its store's maps. Each
+	// slot remembers the mapping of one 16 KB guest page, chosen by hashing the page, so a
+	// lookup tests one slot however many mappings a frame's reads touch.
 	struct ReadHint {
 		uint64_t generation;
 		uint64_t vaddr;
@@ -704,10 +708,16 @@ private:
 		uint64_t backing_offset;
 	};
 
+	static constexpr uint32_t READ_HINT_BITS = 10;
+
 	struct ReadHints {
-		std::array<ReadHint, 32> entries;
-		uint32_t                next;
+		std::array<ReadHint, size_t {1} << READ_HINT_BITS> entries;
 	};
+
+	static size_t ReadHintSlot(uint64_t vaddr) {
+		const auto page = vaddr >> 14u;
+		return static_cast<size_t>((page * 0x9e3779b97f4a7c15ull) >> (64u - READ_HINT_BITS));
+	}
 
 	static uint64_t NextGeneration() {
 		static std::atomic<uint64_t> next {1};

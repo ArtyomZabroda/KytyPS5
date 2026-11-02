@@ -162,6 +162,7 @@ enum class Counter {
 	TextureShapeMisses,       // Of those, T# encodings whose image description was computed anew.
 	GuestSparseReads,         // Guest memory copies through the direct-memory backing.
 	GuestSparseReadMisses,    // Of those, copies that walked the backing mappings.
+	GuestSparseReadSplit,     // Of those, copies no single mapping held, so none was hinted.
 	ImageRegionLookups,       // Texture cache searches of the image page index.
 	ImageRegionCacheHits,     // Of those, answered from a recent identical search.
 	ImageRegionPages,         // Index pages those searches visited.
@@ -429,8 +430,61 @@ inline std::atomic<uint64_t>    g_fault_phase_ns[FAULT_PHASE_SLOTS] {};
 inline thread_local const char* t_draw_phase = nullptr;
 } // namespace Detail
 
+// GPU-thread time by draw phase, measured between phase changes while counters are enabled.
+// Time outside any phase (between draws) is not counted.
+constexpr uint32_t PHASE_TIME_SLOTS = 32;
+
+namespace Detail {
+inline std::atomic<const char*> g_phase_time_names[PHASE_TIME_SLOTS] {};
+inline std::atomic<uint64_t>    g_phase_time_ns[PHASE_TIME_SLOTS] {};
+inline thread_local int64_t     t_phase_start_ns = 0;
+} // namespace Detail
+
+inline void AddPhaseTime(const char* phase, uint64_t ns) noexcept {
+	for (uint32_t i = 0; i < PHASE_TIME_SLOTS; i++) {
+		const char* name = Detail::g_phase_time_names[i].load(std::memory_order_acquire);
+		if (name == nullptr) {
+			const char* expected = nullptr;
+			if (Detail::g_phase_time_names[i].compare_exchange_strong(
+			        expected, phase, std::memory_order_acq_rel, std::memory_order_acquire)) {
+				name = phase;
+			} else {
+				name = expected;
+			}
+		}
+		if (name == phase) {
+			Detail::g_phase_time_ns[i].fetch_add(ns, std::memory_order_relaxed);
+			return;
+		}
+	}
+}
+
+inline void SwitchDrawPhase(const char* next) noexcept {
+	const char* previous = Detail::t_draw_phase;
+	Detail::t_draw_phase = next;
+	if (!t_gpu_thread || !Enabled()) {
+		Detail::t_phase_start_ns = 0;
+		return;
+	}
+	const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	if (previous != nullptr && Detail::t_phase_start_ns != 0 && now > Detail::t_phase_start_ns) {
+		AddPhaseTime(previous, static_cast<uint64_t>(now - Detail::t_phase_start_ns));
+	}
+	Detail::t_phase_start_ns = now;
+}
+
+[[nodiscard]] inline const char* GetPhaseTimeName(uint32_t slot) noexcept {
+	return Detail::g_phase_time_names[slot].load(std::memory_order_acquire);
+}
+
+[[nodiscard]] inline uint64_t GetPhaseTimeNs(uint32_t slot) noexcept {
+	return Detail::g_phase_time_ns[slot].load(std::memory_order_relaxed);
+}
+
 inline void SetDrawPhase(const char* phase) noexcept {
-	Detail::t_draw_phase = phase;
+	SwitchDrawPhase(phase);
 }
 
 [[nodiscard]] inline const char* CurrentDrawPhase() noexcept {
@@ -440,9 +494,9 @@ inline void SetDrawPhase(const char* phase) noexcept {
 class ScopedDrawPhase final {
 public:
 	explicit ScopedDrawPhase(const char* phase) noexcept: m_previous(Detail::t_draw_phase) {
-		Detail::t_draw_phase = phase;
+		SwitchDrawPhase(phase);
 	}
-	~ScopedDrawPhase() { Detail::t_draw_phase = m_previous; }
+	~ScopedDrawPhase() { SwitchDrawPhase(m_previous); }
 	ScopedDrawPhase(const ScopedDrawPhase&)            = delete;
 	ScopedDrawPhase& operator=(const ScopedDrawPhase&) = delete;
 

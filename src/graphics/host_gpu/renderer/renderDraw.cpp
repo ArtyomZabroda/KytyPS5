@@ -1314,8 +1314,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	Common::DebugCounters::SetDrawPhase("AcquireRenderTargets");
 	const auto rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 	                                            state.depth_info, feedback_aspects, stages);
-	Common::DebugCounters::SetDrawPhase("CommitDraw");
 	if (Common::DebugCounters::Enabled()) {
+		// Overlay-only statistics, kept out of the CommitDraw time.
+		Common::DebugCounters::SetDrawPhase("(overlay) CountBindingRepeats");
 		std::array<const PreparedBindings*, 4> slots {};
 		for (uint32_t i = 0; i < vertex_stages.size() && i < 3; i++) {
 			slots[i] = &bindings.vertex[i];
@@ -1325,6 +1326,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		CountBindingRepeats(slots, &pipeline, state);
 	}
+	Common::DebugCounters::SetDrawPhase("CommitDraw");
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1466,6 +1468,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	if (Common::DebugCounters::g_skip_draws.load(std::memory_order_relaxed)) {
 		return true;
 	}
+	Common::DebugCounters::SetDrawPhase("DrawSetup");
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1572,6 +1575,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	if (Common::DebugCounters::g_skip_draws.load(std::memory_order_relaxed)) {
 		return true;
 	}
+	Common::DebugCounters::SetDrawPhase("DrawSetup");
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);

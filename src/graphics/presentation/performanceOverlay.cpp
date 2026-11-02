@@ -93,6 +93,9 @@ struct Snapshot {
 	std::array<uint64_t, Common::DebugCounters::HLE_CALL_SLOTS>       hle_call_totals {};
 	std::array<uint32_t, Common::DebugCounters::HLE_CALL_SLOTS>       hle_call_threads {};
 	std::array<const char*, Common::DebugCounters::HLE_CALL_SLOTS>    hle_call_names {};
+	std::array<double, Common::DebugCounters::PHASE_TIME_SLOTS>       phase_time_rates {};
+	std::array<uint64_t, Common::DebugCounters::PHASE_TIME_SLOTS>     phase_time_totals {};
+	std::array<const char*, Common::DebugCounters::PHASE_TIME_SLOTS>  phase_time_names {};
 };
 
 std::mutex            g_frame_mutex;
@@ -318,6 +321,45 @@ void TransferRow(const Snapshot& shown, const char* label, Counter upload, Count
 	    Throughput(Rate(shown, upload)) + " up / " + Throughput(Rate(shown, download)) + " down");
 }
 
+// GPU-thread time per draw, by draw phase, and the PM4 time outside draws.
+void DrawPhaseRows(const Snapshot& shown) {
+	const auto draws = Rate(shown, Counter::Draws);
+	std::array<uint32_t, Common::DebugCounters::PHASE_TIME_SLOTS> slots {};
+	uint32_t                                                      count = 0;
+	double                                                        total = 0.0;
+	for (uint32_t i = 0; i < Common::DebugCounters::PHASE_TIME_SLOTS; i++) {
+		if (shown.phase_time_names[i] != nullptr && shown.phase_time_rates[i] > 0.0) {
+			slots[count++] = i;
+			total += shown.phase_time_rates[i];
+		}
+	}
+	if (count == 0 || draws <= 0.0) {
+		return;
+	}
+	std::sort(slots.begin(), slots.begin() + count, [&](uint32_t a, uint32_t b) {
+		return shown.phase_time_rates[a] > shown.phase_time_rates[b];
+	});
+	const auto pm4 = Rate(shown, Counter::GpuThreadPm4Ns);
+	Row("Draw phases", Fmt("%.2f us/draw  %.0f ms/s in draws  %.0f ms/s of PM4 outside",
+	                       total / 1e3 / draws, total / 1e6, std::max(pm4 - total, 0.0) / 1e6));
+	constexpr uint32_t SHOWN_PHASES = 10;
+	double             rest         = 0.0;
+	for (uint32_t i = 0; i < count; i++) {
+		const auto slot = slots[i];
+		if (i >= SHOWN_PHASES) {
+			rest += shown.phase_time_rates[slot];
+			continue;
+		}
+		Row(Fmt("  %.28s", shown.phase_time_names[slot]).c_str(),
+		    Fmt("%.2f us/draw  %.0f ms/s", shown.phase_time_rates[slot] / 1e3 / draws,
+		        shown.phase_time_rates[slot] / 1e6));
+	}
+	if (count > SHOWN_PHASES) {
+		Row(Fmt("  %u other phases", count - SHOWN_PHASES).c_str(),
+		    Fmt("%.2f us/draw  %.0f ms/s", rest / 1e3 / draws, rest / 1e6));
+	}
+}
+
 void GpuActivityRows(const Snapshot& shown) {
 	const auto draws = Rate(shown, Counter::Draws);
 	Row("Draw calls",
@@ -353,9 +395,12 @@ void GpuActivityRows(const Snapshot& shown) {
 	        Rate(shown, Counter::GpuThreadBlockedNs) / 1e7, Rate(shown, Counter::GpuThreadBlocks)));
 	Row("  waiting on GPU", Fmt("%.0f%% of the second, inside PM4 and calls",
 	                            Rate(shown, Counter::GpuThreadGpuWaitNs) / 1e7));
-	Row("DCC/CMASK readbacks",
-	    Fmt("%.0f ms/s  (%.0f/s)", Rate(shown, Counter::ColorMetadataReadbackNs) / 1e6,
-	        Rate(shown, Counter::ColorMetadataReadbacks)));
+	DrawPhaseRows(shown);
+	if (Rate(shown, Counter::ColorMetadataReadbacks) > 0.0) {
+		Row("DCC/CMASK readbacks",
+		    Fmt("%.0f ms/s  (%.0f/s)", Rate(shown, Counter::ColorMetadataReadbackNs) / 1e6,
+		        Rate(shown, Counter::ColorMetadataReadbacks)));
+	}
 	Row("DCC/CMASK GPU checks", Fmt("%.0f/s", Rate(shown, Counter::ColorMetadataChecks)));
 }
 
@@ -392,49 +437,6 @@ void GpuWaitSiteRows(const Snapshot& shown) {
 	}
 }
 
-// The PM4 packets during which the GPU thread read GPU-written memory, busiest first.
-void ReadFaultOriginRows(const Snapshot& shown) {
-	using Common::DebugCounters::READ_FAULT_SLOTS;
-	std::array<uint32_t, READ_FAULT_SLOTS> order {};
-	uint32_t                               used = 0;
-	for (uint32_t i = 0; i < READ_FAULT_SLOTS; i++) {
-		if (shown.read_fault_rates[i] > 0.0) {
-			order[used++] = i;
-		}
-	}
-	std::sort(order.begin(), order.begin() + used, [&](uint32_t a, uint32_t b) {
-		return shown.read_fault_ns_rates[a] > shown.read_fault_ns_rates[b];
-	});
-	for (uint32_t i = 0; i < std::min<uint32_t>(used, 4); i++) {
-		const auto slot  = order[i];
-		const auto label = slot == Common::DebugCounters::READ_FAULT_OTHER_THREAD
-		                       ? std::string("    other threads")
-		                   : slot == Common::DebugCounters::READ_FAULT_GPU_OUTSIDE
-		                       ? std::string("    GPU thread, no packet")
-		                       : Fmt("    PM4 op 0x%02X", slot);
-		Row(label.c_str(), Fmt("%.0f faults/s  %.0f ms/s", shown.read_fault_rates[slot],
-		                       shown.read_fault_ns_rates[slot] / 1e6));
-	}
-	// The same GPU-thread faults by draw phase.
-	using Common::DebugCounters::FAULT_PHASE_SLOTS;
-	std::array<uint32_t, FAULT_PHASE_SLOTS> phases {};
-	uint32_t                                phase_count = 0;
-	for (uint32_t i = 0; i < FAULT_PHASE_SLOTS; i++) {
-		if (shown.phase_fault_names[i] != nullptr && shown.phase_fault_rates[i] > 0.0) {
-			phases[phase_count++] = i;
-		}
-	}
-	std::sort(phases.begin(), phases.begin() + phase_count, [&](uint32_t a, uint32_t b) {
-		return shown.phase_fault_ns_rates[a] > shown.phase_fault_ns_rates[b];
-	});
-	for (uint32_t i = 0; i < std::min<uint32_t>(phase_count, 5); i++) {
-		const auto slot  = phases[i];
-		const auto label = Fmt("    phase %s", shown.phase_fault_names[slot]);
-		Row(label.c_str(), Fmt("%.0f faults/s  %.0f ms/s", shown.phase_fault_rates[slot],
-		                       shown.phase_fault_ns_rates[slot] / 1e6));
-	}
-}
-
 // Synchronous buffer readbacks by source. A call downloads only when its range holds
 // GPU-written bytes, and each download waits for all GPU work submitted before it.
 void BufferReadbackRows(const Snapshot& shown) {
@@ -463,9 +465,6 @@ void BufferReadbackRows(const Snapshot& shown) {
 		const auto ms        = rate(source, ReadbackStat::WaitNs) / 1e6;
 		Row(label, Fmt("%.0f calls/s  %.0f waited  %.0f ms/s  %s", calls, downloads, ms,
 		               Throughput(rate(source, ReadbackStat::Bytes)).c_str()));
-		if (source == ReadbackSource::ReadFault) {
-			ReadFaultOriginRows(shown);
-		}
 	}
 	const auto split = Rate(shown, Counter::ReadbackSplitWaits);
 	if (split > 0.0) {
@@ -544,6 +543,13 @@ void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point 
 		shown.phase_fault_totals[i]    = count;
 		shown.phase_fault_ns_totals[i] = ns;
 		shown.phase_fault_names[i]     = Common::DebugCounters::GetPhaseFaultName(i);
+	}
+	for (uint32_t i = 0; i < Common::DebugCounters::PHASE_TIME_SLOTS; i++) {
+		const auto ns = Common::DebugCounters::GetPhaseTimeNs(i);
+		shown.phase_time_rates[i] =
+		    seconds > 0.0 ? static_cast<double>(ns - shown.phase_time_totals[i]) / seconds : 0.0;
+		shown.phase_time_totals[i] = ns;
+		shown.phase_time_names[i]  = Common::DebugCounters::GetPhaseTimeName(i);
 	}
 	for (uint32_t i = 0; i < Common::DebugCounters::HLE_CALL_SLOTS; i++) {
 		const auto count = Common::DebugCounters::GetHleCalls(i);
@@ -723,19 +729,26 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		BufferReadbackRows(shown);
 		Row("Instances", Fmt("%.0f/frame", Rate(shown, Counter::DrawInstances) / fps));
 		Row("Indirect draws", Fmt("%.0f/s", Rate(shown, Counter::IndirectDraws)));
-		Row("  NUM_INSTANCES from memory",
-		    Fmt("%.0f/s  (%.0f GPU-written, %.0f equal 1)", Rate(shown, Counter::NumInstancesReads),
-		        Rate(shown, Counter::NumInstancesReadsGpuDirty),
-		        Rate(shown, Counter::NumInstancesReadsOne)));
-		Row("Restart index scans",
-		    Fmt("%.0f/s  (%.0f GPU-written)", Rate(shown, Counter::RestartIndexScans),
-		        Rate(shown, Counter::RestartIndexScansGpuDirty)));
+		// Rare paths: shown only while they happen.
+		if (Rate(shown, Counter::NumInstancesReads) > 0.0) {
+			Row("  NUM_INSTANCES from memory", Fmt("%.0f/s  (%.0f GPU-written, %.0f equal 1)",
+			                                       Rate(shown, Counter::NumInstancesReads),
+			                                       Rate(shown, Counter::NumInstancesReadsGpuDirty),
+			                                       Rate(shown, Counter::NumInstancesReadsOne)));
+		}
+		if (Rate(shown, Counter::RestartIndexScans) > 0.0) {
+			Row("Restart index scans",
+			    Fmt("%.0f/s  (%.0f GPU-written)", Rate(shown, Counter::RestartIndexScans),
+			        Rate(shown, Counter::RestartIndexScansGpuDirty)));
+		}
 		Row("SRT walker faults", Fmt("%.0f/s from backing  %.0f/s needed readback",
 		                             Rate(shown, Counter::SrtWalkerBackingLoads),
 		                             Rate(shown, Counter::SrtWalkerReadbacks)));
-		Row("Dispatch args read on CPU",
-		    Fmt("%.0f/s  (%.0f GPU-written)", Rate(shown, Counter::DispatchArgsReads),
-		        Rate(shown, Counter::DispatchArgsReadsGpuDirty)));
+		if (Rate(shown, Counter::DispatchArgsReads) > 0.0) {
+			Row("Dispatch args read on CPU",
+			    Fmt("%.0f/s  (%.0f GPU-written)", Rate(shown, Counter::DispatchArgsReads),
+			        Rate(shown, Counter::DispatchArgsReadsGpuDirty)));
+		}
 		Row("Dispatches", Fmt("%.0f/frame  %.0f/s", Rate(shown, Counter::Dispatches) / fps,
 		                      Rate(shown, Counter::Dispatches)));
 		Row("Queue submits",
@@ -855,9 +868,10 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 			                          Rate(shown, Counter::TrackingLockYields) / frames));
 		}
 		Row("Guest sparse reads",
-		    Fmt("%.0f/frame  (%.0f walked the mappings)",
+		    Fmt("%.0f/frame  (%.0f walked the mappings, %.0f across mappings)",
 		        Rate(shown, Counter::GuestSparseReads) / std::max(shown.fps, 1.0),
-		        Rate(shown, Counter::GuestSparseReadMisses) / std::max(shown.fps, 1.0)));
+		        Rate(shown, Counter::GuestSparseReadMisses) / std::max(shown.fps, 1.0),
+		        Rate(shown, Counter::GuestSparseReadSplit) / std::max(shown.fps, 1.0)));
 		ImGui::EndTable();
 	}
 }
