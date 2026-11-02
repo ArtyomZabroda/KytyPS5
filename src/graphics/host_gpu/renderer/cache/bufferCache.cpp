@@ -63,7 +63,7 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 		const auto destination_offset = buffer.Offset(address);
 		EXIT_IF(destination_offset > buffer.Size() || chunk > buffer.Size() - destination_offset);
 		m_scheduler.EndRendering();
-		const auto               command = m_scheduler.Current().Handle();
+		const auto               command = m_scheduler.Current().Recorder();
 		vk::BufferMemoryBarrier2 before {};
 		before.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 		before.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
@@ -200,7 +200,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
-	const auto              native = command.Handle();
+	const auto              native = command.Recorder();
 	vk::BufferMemoryBarrier before {};
 	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
@@ -507,7 +507,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		t_synchronize_uploaded = true;
 		auto& command          = m_scheduler.Current();
 		command.EndRendering();
-		const auto              native = command.Handle();
+		const auto              native = command.Recorder();
 		vk::BufferMemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
 		                       vk::AccessFlagBits::eTransferRead |

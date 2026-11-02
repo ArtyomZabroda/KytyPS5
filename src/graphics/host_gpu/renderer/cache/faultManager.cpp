@@ -113,7 +113,7 @@ void FaultManager::ProcessFaultBuffer() {
 	}
 
 	m_scheduler.EndRendering();
-	auto               command = m_scheduler.Current().Handle();
+	auto               command = m_scheduler.Current().Recorder();
 	vk::DependencyInfo dependency {};
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;

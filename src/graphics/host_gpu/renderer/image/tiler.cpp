@@ -2,6 +2,8 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "gpu_tiler_shaders/gpu_tiler_color_clear_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_demote_d16_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_depth_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_promote_d16_spv.h"
@@ -13,8 +15,6 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard4_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_3d_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_color_clear_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -105,7 +105,8 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 	    info.tiling.texel_height == 0 || info.tiled_slice_stride == 0);
 	EXIT_IF((transform == ColorTransform::SwapBgra16 && block.bytes_per_element != 8u) ||
 	        ((transform == ColorTransform::Reverse10_11_11 ||
-	          transform == ColorTransform::Rotate2_10_10_10) && block.bytes_per_element != 4u));
+	          transform == ColorTransform::Rotate2_10_10_10) &&
+	         block.bytes_per_element != 4u));
 	const auto checked_multiply = [](uint64_t left, uint64_t right, uint64_t& result) {
 		return (left == 0 || right <= UINT64_MAX / left) && (result = left * right, true);
 	};
@@ -140,7 +141,7 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 		const uint64_t slice_bytes =
 		    info.linear_slice_stride != 0 ? info.linear_slice_stride : mip.linear_size;
 		uint64_t minimum_slice = 0;
-		uint64_t linear_used = 0;
+		uint64_t linear_used   = 0;
 		uint64_t bytes         = 0;
 		uint64_t linear_span   = 0;
 		EXIT_NOT_IMPLEMENTED(!checked_multiply(pitch_bytes, height, minimum_slice) ||
@@ -252,18 +253,20 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t source_descriptor_offset = Common::AlignDown(source_offset, descriptor_alignment);
-	const uint64_t target_descriptor_offset = Common::AlignDown(target_offset, descriptor_alignment);
-	const uint64_t source_base              = source_offset - source_descriptor_offset;
-	const uint64_t target_base              = target_offset - target_descriptor_offset;
-	const uint64_t source_range             = Common::AlignUp(source_base + source_capacity, 4);
-	const uint64_t target_range             = Common::AlignUp(target_base + target_capacity, 4);
+	const uint64_t source_descriptor_offset =
+	    Common::AlignDown(source_offset, descriptor_alignment);
+	const uint64_t target_descriptor_offset =
+	    Common::AlignDown(target_offset, descriptor_alignment);
+	const uint64_t source_base  = source_offset - source_descriptor_offset;
+	const uint64_t target_base  = target_offset - target_descriptor_offset;
+	const uint64_t source_range = Common::AlignUp(source_base + source_capacity, 4);
+	const uint64_t target_range = Common::AlignUp(target_base + target_capacity, 4);
 	EXIT_NOT_IMPLEMENTED(source_range > limits.maxStorageBufferRange ||
 	                     target_range > limits.maxStorageBufferRange || target_offset % 4 != 0 ||
 	                     target_capacity % 4 != 0);
 
 	m_scheduler.EndRendering();
-	auto                    command = m_scheduler.Current().Handle();
+	auto                    command = m_scheduler.Current().Recorder();
 	vk::BufferMemoryBarrier barriers[3] {};
 	barriers[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
 	barriers[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
@@ -343,7 +346,7 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	const uint64_t source_base     = tiled_offset & (descriptor_alignment - 1);
 	const auto     linear_capacity = info.LinearSize();
 	const auto tiling  = Prepare(false, info.data.size, linear_capacity, info, 0, source_base, 0);
-	auto scratch = GetScratchBuffer(linear_capacity, tiled);
+	auto       scratch = GetScratchBuffer(linear_capacity, tiled);
 	Record(tiled, tiled_offset, info.data.size, scratch.buffer, 0, scratch.size, tiling, true);
 	return {scratch.buffer, 0, linear_capacity};
 }
@@ -381,15 +384,17 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 
 TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer input) {
 	EXIT_IF(size == 0);
-	size = Common::AlignUp(size, 4);
+	size         = Common::AlignUp(size, 4);
 	auto& buffer = m_scratch[m_scratch[0] && m_scratch[0]->Handle() == input ? 1 : 0];
 	if (!buffer || buffer->Size() < size) {
 		if (buffer) {
 			m_scheduler.DeferOperation([old = std::move(buffer)]() mutable { old.reset(); });
 		}
 		buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
-		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
-		        vk::BufferUsageFlagBits::eTransferDst, size);
+		                                  vk::BufferUsageFlagBits::eStorageBuffer |
+		                                      vk::BufferUsageFlagBits::eTransferSrc |
+		                                      vk::BufferUsageFlagBits::eTransferDst,
+		                                  size);
 	}
 	return {buffer->Handle(), 0, size};
 }
@@ -465,7 +470,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	EXIT_IF(source.size < source_barrier_size || target.size < target_barrier_size);
 
 	m_scheduler.EndRendering();
-	auto                    command = m_scheduler.Current().Handle();
+	auto                    command = m_scheduler.Current().Recorder();
 	vk::BufferMemoryBarrier barriers[2] {};
 	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -537,10 +542,10 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 			                             static_cast<uint32_t>(writes.size()), writes.data());
 			Conversion push {};
-			push.src_base    = source_binding.base;
-			push.dst_base    = target_binding.base;
-			push.width       = layout.width;
-			push.height      = rows;
+			push.src_base     = source_binding.base;
+			push.dst_base     = target_binding.base;
+			push.width        = layout.width;
+			push.height       = rows;
 			push.source_pitch = static_cast<uint32_t>(layout.source_row_stride);
 			push.target_pitch = static_cast<uint32_t>(layout.target_row_stride);
 			command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
@@ -566,8 +571,7 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 		default: EXIT("invalid color transform\n");
 	}
 	EXIT_IF(input.size == 0 || input.size % element_bytes != 0 ||
-	        input.size / element_bytes > UINT32_MAX ||
-	        output.size < input.size);
+	        input.size / element_bytes > UINT32_MAX || output.size < input.size);
 	const auto pixels = static_cast<uint32_t>(input.size / element_bytes);
 	if (m_color_transform == nullptr) {
 		m_color_transform = CreatePipeline(GPU_TILER_COLOR_TRANSFORM_SPV, nullptr);
@@ -600,7 +604,7 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eMemoryRead;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderWrite;
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Handle();
+	auto command = m_scheduler.Current().Recorder();
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
@@ -645,14 +649,14 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint64_t stride, uint32
 	EXIT_IF(slices == 0 || slices > max_slices || metadata.size % 4 != 0 || stride % 4 != 0 ||
 	        metadata.size / 4 > UINT32_MAX || stride * (slices - 1) >= metadata.size);
 	if (m_color_clear == nullptr) {
-		m_color_clear      = CreatePipeline(GPU_TILER_COLOR_CLEAR_SPV, nullptr);
-		m_clear_predicates = std::make_unique<Buffer>(
-		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
-		    vk::BufferUsageFlagBits::eStorageBuffer |
-		        vk::BufferUsageFlagBits::eConditionalRenderingEXT,
-		    uint64_t {max_slices} * ColorClearSlots * sizeof(uint32_t));
+		m_color_clear = CreatePipeline(GPU_TILER_COLOR_CLEAR_SPV, nullptr);
+		m_clear_predicates =
+		    std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		                             vk::BufferUsageFlagBits::eStorageBuffer |
+		                                 vk::BufferUsageFlagBits::eConditionalRenderingEXT,
+		                             uint64_t {max_slices} * ColorClearSlots * sizeof(uint32_t));
 	}
-	const auto source = BindStorage(metadata, metadata.size);
+	const auto                     source = BindStorage(metadata, metadata.size);
 	const vk::DescriptorBufferInfo infos[] {source.info,
 	                                        {m_clear_predicates->Handle(), 0, VK_WHOLE_SIZE}};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
@@ -663,11 +667,11 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint64_t stride, uint32
 		writes[index].pBufferInfo     = &infos[index];
 	}
 	// Orders the metadata writers and the previous check's predicate reads before this check.
-	vk::MemoryBarrier barrier {
-	    .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
-	    .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite};
+	vk::MemoryBarrier barrier {.srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+	                           .dstAccessMask = vk::AccessFlagBits::eShaderRead |
+	                                            vk::AccessFlagBits::eShaderWrite};
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Handle();
+	auto command = m_scheduler.Current().Recorder();
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &barrier, 0, nullptr,
 	                        0, nullptr);
@@ -683,8 +687,8 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint64_t stride, uint32
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-	                        vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr,
-	                        0, nullptr);
+	                        vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr, 0,
+	                        nullptr);
 	return m_clear_predicates->Handle();
 }
 

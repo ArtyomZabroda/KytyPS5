@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DYNAMICSTATE_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -63,8 +64,8 @@ struct DynamicState {
 
 	std::array<vk::Viewport, 16> viewports {};
 	std::array<vk::Rect2D, 16>   scissors {};
-	uint32_t                   num_viewports {};
-	uint32_t                   num_scissors {};
+	uint32_t                     num_viewports {};
+	uint32_t                     num_scissors {};
 
 	bool          depth_test_enabled {};
 	bool          depth_write_enabled {};
@@ -92,14 +93,14 @@ struct DynamicState {
 	vk::CullModeFlags cull_mode {};
 	vk::FrontFace     front_face {};
 
-	std::array<float, 4>                               blend_constants {};
+	std::array<float, 4>                                 blend_constants {};
 	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write_enables {};
-	uint32_t                                           num_color_write_enables {};
-	float                                              line_width {};
-	vk::ImageAspectFlags                               feedback_loop_aspects {};
+	uint32_t                                             num_color_write_enables {};
+	float                                                line_width {};
+	vk::ImageAspectFlags                                 feedback_loop_aspects {};
 
 	/// Commits the dynamic state to the provided command buffer.
-	void Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
+	void Commit(const GraphicContext& graphics, CommandRecorder cmdbuf);
 
 	/// Invalidates all dynamic state to be flushed into the next command buffer.
 	void Invalidate() { std::memset(&dirty_state, 0xFF, sizeof(dirty_state)); }

@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -138,6 +139,9 @@ public:
 	// Code that binds a graphics pipeline itself calls this, so the next draw binds again.
 	void InvalidateGraphicsPipeline() const noexcept { m_graphics_pipeline = nullptr; }
 
+	// Records the renderer's commands. Handle() remains for the scheduler and for code that records
+	// through other APIs (presentation, ImGui).
+	[[nodiscard]] CommandRecorder   Recorder() const;
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }

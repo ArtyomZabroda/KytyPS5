@@ -641,7 +641,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.Transit(layout, image.binding.attachment_access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
-		              buffer.Handle());
+		              buffer.Recorder());
 		const auto extent           = target.Extent();
 		state.width                 = std::min(state.width, extent.width);
 		state.height                = std::min(state.height, extent.height);
@@ -709,7 +709,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.Transit(layout, access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
-		              buffer.Handle());
+		              buffer.Recorder());
 		state.width               = std::min(state.width, depth.desc.info.extent.width);
 		state.height              = std::min(state.height, depth.desc.info.extent.height);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
@@ -1096,8 +1096,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	return prepared;
 }
 
-static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
-                                const PreparedVertexBuffers& prepared) {
+static void CommitVertexBuffers(CommandRecorder vk_buffer, const PreparedVertexBuffers& prepared) {
 	for (uint32_t i = 0; i < prepared.count; i++) {
 		EXIT_IF(prepared.buffers[i] == nullptr);
 	}
@@ -1108,7 +1107,7 @@ static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
 	}
 }
 
-static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
+static void CommitIndexBuffer(CommandRecorder vk_buffer, const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
 		return;
 	}
@@ -1134,7 +1133,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  draw.index_count, index_addr);
 }
 
-static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
+static void EmitDrawPrimitives(const HW::UserConfig& ucfg, CommandRecorder vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
@@ -1216,7 +1215,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 		    {static_cast<uint32_t>(rect.right - rect.left),
 		     static_cast<uint32_t>(rect.bottom - rect.top), 1}};
 		m_context.GetCommandScheduler().EndRendering();
-		const auto command = buffer.Handle();
+		const auto command = buffer.Recorder();
 		source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 		               command);
 		destination.Transit(vk::ImageLayout::eTransferDstOptimal,
@@ -1335,7 +1334,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
-	auto vk_buffer = buffer.Handle();
+	auto vk_buffer = buffer.Recorder();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);

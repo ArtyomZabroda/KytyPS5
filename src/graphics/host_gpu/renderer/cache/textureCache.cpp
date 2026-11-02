@@ -265,7 +265,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	});
 	++m_region_generation;
 	m_lru_cache.Free(image.lru_id);
-	image.lru_tick = UINT64_MAX;
+	image.lru_tick       = UINT64_MAX;
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
 		EXIT("TextureCache: image accounting underflow\n");
@@ -1338,7 +1338,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				for (uint32_t slice = 0; slice < count && expand; slice++) {
 					m_buffer_cache.MarkColorMetadataChecked(run(slice), mip.size, keys);
 				}
-				const auto    command = m_scheduler.Current().Handle();
+				const auto    command = m_scheduler.Current().Recorder();
 				const auto    area    = BeginColorRendering(image, view.format, view.base_level,
 				                                            image_first, count, nullptr, command);
 				vk::ClearRect rect {.rect = area, .layerCount = 1};
@@ -2084,33 +2084,33 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		EXIT_NOT_IMPLEMENTED(range.aspectMask != vk::ImageAspectFlagBits::eColor ||
 		                     range.levelCount != 1);
 		BeginColorRendering(image, format, range.baseMipLevel, range.baseArrayLayer,
-		                    range.layerCount, &clear, command.Handle());
-		command.Handle().endRendering();
+		                    range.layerCount, &clear, command.Recorder());
+		command.Recorder().endRendering();
 		CommitGpuWrite(image);
 		return;
 	}
 	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
-	              command.Handle());
+	              command.Recorder());
 	auto native_range = range;
 	if (image.info.IsVolume()) {
 		native_range.baseArrayLayer = 0;
 		native_range.layerCount     = 1;
 	}
 	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
-		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
-		                                 &clear.color, 1, &native_range);
+		command.Recorder().clearColorImage(image.backing.image,
+		                                   vk::ImageLayout::eTransferDstOptimal, &clear.color, 1,
+		                                   &native_range);
 	} else {
-		command.Handle().clearDepthStencilImage(image.backing.image,
-		                                        vk::ImageLayout::eTransferDstOptimal,
-		                                        &clear.depthStencil, 1, &native_range);
+		command.Recorder().clearDepthStencilImage(image.backing.image,
+		                                          vk::ImageLayout::eTransferDstOptimal,
+		                                          &clear.depthStencil, 1, &native_range);
 	}
 	CommitGpuWrite(image);
 }
 
 vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, uint32_t level,
                                              uint32_t layer, uint32_t layers,
-                                             const vk::ClearValue* clear,
-                                             vk::CommandBuffer     command) {
+                                             const vk::ClearValue* clear, CommandRecorder command) {
 	ImageViewInfo view {};
 	view.format      = format;
 	view.type        = layers == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
@@ -2312,9 +2312,9 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
-	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
-	                                               1, &barrier, 0, nullptr);
+	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
+	                                                 nullptr, 1, &barrier, 0, nullptr);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);

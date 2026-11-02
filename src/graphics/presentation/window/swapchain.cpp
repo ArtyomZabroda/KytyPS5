@@ -242,7 +242,7 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	command_buffer.EndRendering();
 	auto command = command_buffer.Handle();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
-	               command);
+	               command_buffer.Recorder());
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
 	vk::ImageCopy copy {};
 	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, source.backing.layers};

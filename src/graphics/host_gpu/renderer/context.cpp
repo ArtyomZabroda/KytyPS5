@@ -29,6 +29,11 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 	return m_buffer;
 }
 
+CommandRecorder CommandBuffer::Recorder() const {
+	EXIT_IF(IsInvalid());
+	return CommandRecorder {m_buffer};
+}
+
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
 	auto buffer         = Handle();
@@ -105,7 +110,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Handle().beginRendering(rendering);
+	Recorder().beginRendering(rendering);
 	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state = state;
 	for (auto& color: m_render_state.color_attachments) {
@@ -121,7 +126,7 @@ void CommandBuffer::EndRendering(std::source_location location) const {
 		return;
 	}
 	Common::DebugCounters::CountRenderPassEnd(location.file_name(), location.line());
-	Handle().endRendering();
+	Recorder().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
 }
@@ -131,7 +136,7 @@ void CommandBuffer::BindGraphicsPipeline(vk::Pipeline pipeline) const {
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GraphicsPipelineBindsSkipped);
 		return;
 	}
-	Handle().bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+	Recorder().bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
 	m_graphics_pipeline = pipeline;
 }
 

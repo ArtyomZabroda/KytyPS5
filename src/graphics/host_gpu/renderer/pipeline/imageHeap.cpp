@@ -640,14 +640,14 @@ void ImageHeap::Commit(CommandBuffer& buffer) {
 			image->Transit(image->ReadLayout(), vk::AccessFlagBits2::eShaderRead,
 			               ImageSubresourceRange {view_info.base_level, view_info.level_count,
 			                                      view_info.base_layer, view_info.layer_count},
-			               buffer.Handle());
+			               buffer.Recorder());
 			return true;
 		});
 	}
 	m_active.clear();
 }
 
-void ImageHeap::Bind(vk::CommandBuffer buffer, vk::PipelineBindPoint bind_point,
+void ImageHeap::Bind(CommandRecorder buffer, vk::PipelineBindPoint bind_point,
                      vk::PipelineLayout layout) const {
 	buffer.bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &m_set, 0, nullptr);
 }

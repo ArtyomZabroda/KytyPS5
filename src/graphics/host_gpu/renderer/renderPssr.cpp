@@ -39,7 +39,7 @@ RenderExecutor::~RenderExecutor() {
 void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request) {
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
-	Common::LockGuard lock(m_context.GetMutex());
+	Common::LockGuard     lock(m_context.GetMutex());
 	ShaderTextureResource input_descriptor {}, output_descriptor {};
 	std::copy_n(request.input, 8, input_descriptor.fields);
 	std::copy_n(request.output, 8, output_descriptor.fields);
@@ -56,10 +56,10 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	        output_descriptor.BaseLevel() != 0 || output_descriptor.LastLevel() != 0 ||
 	        output_descriptor.MaxMip() != 0 || output_descriptor.BaseArray5() != 0 ||
 	        output_descriptor.Depth() != 0 || request.width == 0 || request.height == 0);
-	const auto input_width = std::max(1u, (input_descriptor.Width5() + 1u) >>
-	                                         input_descriptor.BaseLevel());
-	const auto input_height = std::max(1u, (input_descriptor.Height5() + 1u) >>
-	                                          input_descriptor.BaseLevel());
+	const auto input_width =
+	    std::max(1u, (input_descriptor.Width5() + 1u) >> input_descriptor.BaseLevel());
+	const auto input_height =
+	    std::max(1u, (input_descriptor.Height5() + 1u) >> input_descriptor.BaseLevel());
 	EXIT_IF(request.width > input_width || request.height > input_height);
 	PssrParameters parameters {{request.width, request.height},
 	                           {output_descriptor.Width5() + 1u, output_descriptor.Height5() + 1u},
@@ -76,20 +76,20 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		ShaderRecompiler::IR::ImageResource resource {};
 		resource.resource_class = output ? ShaderRecompiler::IR::ImageResourceClass::Storage
 		                                 : ShaderRecompiler::IR::ImageResourceClass::Sampled;
-		resource.numeric_class = Prospero::TextureNumericClass::Float;
-		resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-		resource.read = !output;
-		resource.written = output;
+		resource.numeric_class  = Prospero::TextureNumericClass::Float;
+		resource.dimension      = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+		resource.read           = !output;
+		resource.written        = output;
 		ShaderRecompiler::IR::DescriptorValue value {};
 		std::copy_n(words, 8, value.dwords.begin());
-		value.dword_count = 8;
-		auto binding = ResolveTexture(resource, value);
+		value.dword_count                  = 8;
+		auto binding                       = ResolveTexture(resource, value);
 		binding.desc.view_info.level_count = 1;
-		binding.desc.view_info.min_lod = 0;
+		binding.desc.view_info.min_lod     = 0;
 		return binding;
 	};
 	auto& cache = m_context.GetTextureCache();
-	auto input = resolve(request.input, false);
+	auto  input = resolve(request.input, false);
 	BindImage(input.image_id, false);
 	auto output = resolve(request.output, true);
 	BindImage(output.image_id, true);
@@ -99,19 +99,19 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		auto& previous = cache.GetImage(binding.image_id);
 		if (!previous.registered || previous.binding.needs_rebind) {
 			previous.binding = {};
-			binding = resolve(words, storage);
+			binding          = resolve(words, storage);
 			BindImage(binding.image_id, storage);
 		}
 		binding.image_view = cache.FindTexture(binding.image_id, binding.desc);
 	};
 	acquire(input, request.input, false);
 	acquire(output, request.output, true);
-	auto& source = cache.GetImage(input.image_id);
-	auto& destination = cache.GetImage(output.image_id);
-	const auto& source_view = input.desc.view_info;
+	auto&       source           = cache.GetImage(input.image_id);
+	auto&       destination      = cache.GetImage(output.image_id);
+	const auto& source_view      = input.desc.view_info;
 	const auto& destination_view = output.desc.view_info;
-	EXIT_IF(source.info.IsDepth() || destination.info.IsDepth() ||
-	        source.backing.samples != 1 || destination.backing.samples != 1 ||
+	EXIT_IF(source.info.IsDepth() || destination.info.IsDepth() || source.backing.samples != 1 ||
+	        destination.backing.samples != 1 ||
 	        (input.image_id == output.image_id &&
 	         source_view.base_level == destination_view.base_level &&
 	         source_view.base_layer == destination_view.base_layer));
@@ -124,59 +124,59 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		    vk::DescriptorSetLayoutBinding {1, vk::DescriptorType::eStorageImage, 1,
 		                                    vk::ShaderStageFlagBits::eCompute}};
 		vk::DescriptorSetLayoutCreateInfo descriptor_info {};
-		descriptor_info.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		descriptor_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
 		descriptor_info.bindingCount = bindings.size();
-		descriptor_info.pBindings = bindings.data();
-		RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(
-		                         &descriptor_info, nullptr, &m_pssr_descriptor_layout),
+		descriptor_info.pBindings    = bindings.data();
+		RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(&descriptor_info, nullptr,
+		                                                               &m_pssr_descriptor_layout),
 		                     "create upscaling descriptor layout");
-		const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0,
-		                                  sizeof(PssrParameters)};
+		const vk::PushConstantRange  push {vk::ShaderStageFlagBits::eCompute, 0,
+		                                   sizeof(PssrParameters)};
 		vk::PipelineLayoutCreateInfo layout_info {};
-		layout_info.setLayoutCount = 1;
-		layout_info.pSetLayouts = &m_pssr_descriptor_layout;
+		layout_info.setLayoutCount         = 1;
+		layout_info.pSetLayouts            = &m_pssr_descriptor_layout;
 		layout_info.pushConstantRangeCount = 1;
-		layout_info.pPushConstantRanges = &push;
-		RequireVulkanSuccess(graphics.device.createPipelineLayout(
-		                         &layout_info, nullptr, &m_pssr_pipeline_layout),
-		                     "create upscaling pipeline layout");
-		const auto shader = CompileSPV(GPU_PSSR_LINEAR_SPV, graphics.device);
+		layout_info.pPushConstantRanges    = &push;
+		RequireVulkanSuccess(
+		    graphics.device.createPipelineLayout(&layout_info, nullptr, &m_pssr_pipeline_layout),
+		    "create upscaling pipeline layout");
+		const auto                    shader = CompileSPV(GPU_PSSR_LINEAR_SPV, graphics.device);
 		vk::ComputePipelineCreateInfo create {};
-		create.stage.stage = vk::ShaderStageFlagBits::eCompute;
+		create.stage.stage  = vk::ShaderStageFlagBits::eCompute;
 		create.stage.module = shader;
-		create.stage.pName = "main";
-		create.layout = m_pssr_pipeline_layout;
-		const auto result = graphics.device.createComputePipelines(
-		    nullptr, 1, &create, nullptr, &m_pssr_pipeline);
+		create.stage.pName  = "main";
+		create.layout       = m_pssr_pipeline_layout;
+		const auto result =
+		    graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &m_pssr_pipeline);
 		graphics.device.destroyShaderModule(shader, nullptr);
 		RequireVulkanSuccess(result, "create upscaling pipeline");
 	}
 	buffer.EndRendering();
-	const auto command = buffer.Handle();
+	const auto command = buffer.Recorder();
 	source.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead,
 	               ImageSubresourceRange {source_view.base_level, 1, source_view.base_layer, 1},
 	               command);
-	destination.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
-	                    ImageSubresourceRange {destination_view.base_level, 1,
-	                                           destination_view.base_layer, 1}, command);
+	destination.Transit(
+	    vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
+	    ImageSubresourceRange {destination_view.base_level, 1, destination_view.base_layer, 1},
+	    command);
 	const std::array images {
 	    vk::DescriptorImageInfo {nullptr, input.image_view, vk::ImageLayout::eGeneral},
 	    vk::DescriptorImageInfo {nullptr, output.image_view, vk::ImageLayout::eGeneral}};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
 	for (uint32_t i = 0; i < writes.size(); ++i) {
-		writes[i].dstBinding = i;
+		writes[i].dstBinding      = i;
 		writes[i].descriptorCount = 1;
-		writes[i].descriptorType = i == 0 ? vk::DescriptorType::eSampledImage
-		                                 : vk::DescriptorType::eStorageImage;
+		writes[i].descriptorType =
+		    i == 0 ? vk::DescriptorType::eSampledImage : vk::DescriptorType::eStorageImage;
 		writes[i].pImageInfo = &images[i];
 	}
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pssr_pipeline_layout,
-	                             0, writes.size(), writes.data());
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pssr_pipeline_layout, 0,
+	                             writes.size(), writes.data());
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pssr_pipeline);
-	command.pushConstants(m_pssr_pipeline_layout, vk::ShaderStageFlagBits::eCompute,
-	                      0, sizeof(parameters), &parameters);
-	command.dispatch((parameters.output_size[0] + 7) / 8,
-	                 (parameters.output_size[1] + 7) / 8, 1);
+	command.pushConstants(m_pssr_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+	                      sizeof(parameters), &parameters);
+	command.dispatch((parameters.output_size[0] + 7) / 8, (parameters.output_size[1] + 7) / 8, 1);
 	ShaderAccessBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

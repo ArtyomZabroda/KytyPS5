@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGEHEAP_H_
 
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
@@ -46,7 +47,7 @@ public:
 	// Recording: uploads slots and moves resident images to their read layout.
 	void Commit(CommandBuffer& buffer);
 	// Binds the array as set 1, after the pipeline's set 0 is bound with the same layout.
-	void Bind(vk::CommandBuffer buffer, vk::PipelineBindPoint bind_point,
+	void Bind(CommandRecorder buffer, vk::PipelineBindPoint bind_point,
 	          vk::PipelineLayout layout) const;
 	// CPU write fault, on any thread.
 	void InvalidateMemory(uint64_t address, uint64_t size);

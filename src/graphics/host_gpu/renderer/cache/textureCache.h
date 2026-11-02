@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -175,7 +176,7 @@ private:
 	// render area.
 	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level, uint32_t layer,
 	                               uint32_t layers, const vk::ClearValue* clear,
-	                               vk::CommandBuffer command);
+	                               CommandRecorder command);
 	void       PrepareImageCopy(Image& image);
 	void       RefreshCopySource(ImageId id);
 	[[nodiscard]] bool    CopyD16(Image& destination, Image& source);
@@ -243,8 +244,8 @@ private:
 	};
 	std::array<FindImageResult, 1024> m_find_image_results {};
 	uint64_t                          m_image_generation = 1;
-	[[nodiscard]] ImageId             FindImageLocked(ImageDesc& desc, bool exact_format,
-	                                                  const FindImageKey& key, FindImageResult& slot);
+	[[nodiscard]] ImageId FindImageLocked(ImageDesc& desc, bool exact_format,
+	                                      const FindImageKey& key, FindImageResult& slot);
 	// Every 16th cache hit repeats the side-effect-free part of the full lookup and compares.
 	uint32_t                  m_find_image_hits       = 0;
 	uint32_t                  m_find_image_mismatches = 0;
