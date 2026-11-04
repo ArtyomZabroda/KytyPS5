@@ -43,9 +43,13 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -96,6 +100,233 @@ struct DrawRepeatState {
 };
 
 DrawRepeatState g_draw_repeats;
+
+// --xframe-draw-stats: keys of the draws of this frame and the previous one.
+struct CrossFrameKeys {
+	std::unordered_set<uint64_t> current;
+	std::unordered_set<uint64_t> previous;
+
+	void Rotate() {
+		previous.swap(current);
+		current.clear();
+	}
+	// Whether the key was seen this frame or the previous one; records it.
+	[[nodiscard]] bool Seen(uint64_t key) {
+		const bool seen = previous.contains(key) || current.contains(key);
+		current.insert(key);
+		return seen;
+	}
+};
+
+CrossFrameKeys g_xframe_full;
+CrossFrameKeys g_xframe_structure;
+// The structure key with one more part each: UserConfig, arguments, stage registers, user SGPRs.
+std::array<CrossFrameKeys, 4> g_xframe_parts;
+// The user SGPRs (HS, GS, PS) of the last draw with each argument key.
+using CrossFrameUserData = std::array<uint32_t, 3 * HW::UserSgprInfo::SGPRS_MAX>;
+std::unordered_map<uint64_t, CrossFrameUserData> g_xframe_user_data;
+// The argument key of the draw being committed, for CountCrossFrameBindings.
+uint64_t g_xframe_draw_key   = 0;
+bool     g_xframe_draw_keyed = false;
+
+struct CrossFrameDescriptors {
+	uint64_t              textures = 0;
+	uint64_t              buffers  = 0;
+	uint64_t              no_base  = 0; // V# words without the base address.
+	uint64_t              shape    = 0; // V# words without the base address and the size.
+	std::vector<uint64_t> bases;
+};
+std::unordered_map<uint64_t, CrossFrameDescriptors> g_xframe_descriptors;
+
+// Compares the user SGPRs of a repeat with those of the last draw with its key: how many differ
+// and whether each is half of a pair that addresses mapped guest memory.
+void CountUserDataChanges(const RenderContext& context, uint64_t key,
+                          const CrossFrameUserData& current) {
+	using Common::DebugCounters::Counter;
+	constexpr uint32_t Sgprs = HW::UserSgprInfo::SGPRS_MAX;
+	const auto         found = g_xframe_user_data.find(key);
+	if (found != g_xframe_user_data.end()) {
+		const auto& previous = found->second;
+		const auto  pointer  = [&](uint32_t low) {
+			const auto value = (uint64_t {current[low + 1]} << 32u) | current[low];
+			return value != 0 && context.IsMapped(value, 1);
+		};
+		uint64_t changed  = 0;
+		uint64_t pointers = 0;
+		for (uint32_t i = 0; i < current.size(); i++) {
+			if (current[i] == previous[i]) continue;
+			changed++;
+			const auto slot = i % Sgprs;
+			if ((slot + 1 < Sgprs && pointer(i)) || (slot > 0 && pointer(i - 1))) {
+				pointers++;
+			}
+		}
+		Common::DebugCounters::Add(Counter::DrawXframeUdDraws);
+		Common::DebugCounters::Add(Counter::DrawXframeUdWords, changed);
+		Common::DebugCounters::Add(Counter::DrawXframeUdPointers, pointers);
+		if (changed == pointers) Common::DebugCounters::Add(Counter::DrawXframeUdRelocatable);
+	}
+	if (g_xframe_user_data.size() >= 1u << 20u) {
+		g_xframe_user_data.clear();
+	}
+	g_xframe_user_data[key] = current;
+}
+uint64_t g_xframe_flip = 0;
+
+// Counts whether the draw's registers repeat those of a draw of this or the previous frame.
+// Returns true when --xframe-skip-repeats drops it (an upper-bound experiment: the frame renders
+// wrong).
+bool CrossFrameRepeat(const RenderContext& context, const CommandBuffer& buffer,
+                      std::span<const uint64_t> draw_words) {
+	using Common::DebugCounters::Counter;
+	if (!Config::XframeDrawStatsEnabled()) {
+		return false;
+	}
+	Common::DebugCounters::SetDrawPhase("(xframe) Key");
+	const auto flip = Common::DebugCounters::g_flips.load(std::memory_order_relaxed);
+	if (flip != g_xframe_flip) {
+		g_xframe_flip = flip;
+		g_xframe_full.Rotate();
+		g_xframe_structure.Rotate();
+		for (auto& part: g_xframe_parts) {
+			part.Rotate();
+		}
+	}
+	const auto&                   registers = buffer.GetRegisters();
+	const auto&                   vs        = buffer.GetShaders().GetVs();
+	const auto&                   ps        = buffer.GetShaders().GetPs();
+	const std::array<uint64_t, 5> programs {vs.es_regs.data_addr, vs.ls_regs.data_addr,
+	                                        vs.hs_regs.data_addr, vs.gs_regs.data_addr,
+	                                        ps.ps_regs.data_addr};
+
+	auto structure = XXH3_64bits(&registers, sizeof(registers));
+	structure      = XXH3_64bits_withSeed(programs.data(), sizeof(programs), structure);
+	auto full = XXH3_64bits_withSeed(&buffer.GetUserConfig(), sizeof(HW::UserConfig), structure);
+	full      = XXH3_64bits_withSeed(&vs, sizeof(vs), full);
+	full      = XXH3_64bits_withSeed(&ps, sizeof(ps), full);
+	full      = XXH3_64bits_withSeed(draw_words.data(), draw_words.size_bytes(), full);
+
+	const auto with_user_config =
+	    XXH3_64bits_withSeed(&buffer.GetUserConfig(), sizeof(HW::UserConfig), structure);
+	const auto with_args =
+	    XXH3_64bits_withSeed(draw_words.data(), draw_words.size_bytes(), structure);
+	auto with_stage = XXH3_64bits_withSeed(&vs.es_regs, sizeof(vs.es_regs), structure);
+	with_stage      = XXH3_64bits_withSeed(&vs.ls_regs, sizeof(vs.ls_regs), with_stage);
+	with_stage      = XXH3_64bits_withSeed(&vs.hs_regs, sizeof(vs.hs_regs), with_stage);
+	with_stage      = XXH3_64bits_withSeed(&vs.gs_regs, sizeof(vs.gs_regs), with_stage);
+	with_stage      = XXH3_64bits_withSeed(&ps.ps_regs, sizeof(ps.ps_regs), with_stage);
+	auto with_user_data =
+	    XXH3_64bits_withSeed(&vs.hs_user_sgpr, sizeof(vs.hs_user_sgpr), structure);
+	with_user_data =
+	    XXH3_64bits_withSeed(&vs.gs_user_sgpr, sizeof(vs.gs_user_sgpr), with_user_data);
+	with_user_data =
+	    XXH3_64bits_withSeed(&ps.ps_user_sgpr, sizeof(ps.ps_user_sgpr), with_user_data);
+
+	const bool full_seen      = g_xframe_full.Seen(full);
+	const bool structure_seen = g_xframe_structure.Seen(structure);
+	const bool args_seen      = g_xframe_parts[1].Seen(with_args);
+	Common::DebugCounters::Add(Counter::DrawXframeChecks);
+	if (full_seen) Common::DebugCounters::Add(Counter::DrawXframeFull);
+	if (structure_seen) Common::DebugCounters::Add(Counter::DrawXframeStructure);
+	if (g_xframe_parts[0].Seen(with_user_config)) {
+		Common::DebugCounters::Add(Counter::DrawXframeUserConfig);
+	}
+	if (args_seen) Common::DebugCounters::Add(Counter::DrawXframeArgs);
+	g_xframe_draw_key   = with_args;
+	g_xframe_draw_keyed = true;
+	if (Common::DebugCounters::Enabled()) {
+		CrossFrameUserData user_data {};
+		constexpr auto     Sgprs = HW::UserSgprInfo::SGPRS_MAX;
+		std::copy_n(vs.hs_user_sgpr.value, Sgprs, user_data.begin());
+		std::copy_n(vs.gs_user_sgpr.value, Sgprs, user_data.begin() + Sgprs);
+		std::copy_n(ps.ps_user_sgpr.value, Sgprs, user_data.begin() + 2 * Sgprs);
+		CountUserDataChanges(context, with_args, user_data);
+	}
+	if (g_xframe_parts[2].Seen(with_stage)) Common::DebugCounters::Add(Counter::DrawXframeStage);
+	if (g_xframe_parts[3].Seen(with_user_data)) {
+		Common::DebugCounters::Add(Counter::DrawXframeUserData);
+	}
+	// The same state drawing the same mesh: user data may differ (records would relocate it).
+	const bool skip = args_seen && Config::XframeSkipRepeatsEnabled();
+	if (skip) Common::DebugCounters::Add(Counter::DrawXframeSkipped);
+	return skip;
+}
+
+// Compares the T#, S# and V# words of each stage with those of the last draw with the same
+// argument key: whether the changed user data changed which resources the draw binds.
+void CountCrossFrameBindings(std::span<const PreparedBindings* const, 4> slots) {
+	using Common::DebugCounters::Counter;
+	using ShaderRecompiler::IR::DescriptorValue;
+	if (!std::exchange(g_xframe_draw_keyed, false)) {
+		return;
+	}
+	RepeatHash            textures;
+	RepeatHash            buffers;
+	RepeatHash            no_base;
+	RepeatHash            shape;
+	std::vector<uint64_t> bases;
+	for (const auto* stage: slots) {
+		if (stage == nullptr) {
+			textures.Add(uint64_t {0});
+			buffers.Add(uint64_t {0});
+			no_base.Add(uint64_t {0});
+			shape.Add(uint64_t {0});
+			continue;
+		}
+		const auto& resources = *stage->runtime->resources;
+		textures.Add(stage->runtime->module);
+		textures.AddRange(std::span<const DescriptorValue> {resources.images});
+		textures.AddRange(std::span<const DescriptorValue> {resources.samplers});
+		buffers.AddRange(std::span<const DescriptorValue> {resources.buffers});
+		no_base.Add(resources.buffers.size());
+		shape.Add(resources.buffers.size());
+		for (auto vsharp: resources.buffers) {
+			// V#: base[31:0] in dword 0, base[47:32] in the low half of dword 1, size in dword 2.
+			bases.push_back((uint64_t {vsharp.dwords[1] & 0xFFFFu} << 32u) | vsharp.dwords[0]);
+			vsharp.dwords[0] = 0;
+			vsharp.dwords[1] &= 0xFFFF0000u;
+			no_base.Add(vsharp);
+			vsharp.dwords[2] = 0;
+			shape.Add(vsharp);
+		}
+	}
+	CrossFrameDescriptors current {textures.Value(), buffers.Value(), no_base.Value(),
+	                               shape.Value(), std::move(bases)};
+	if (g_xframe_descriptors.size() >= 1u << 20u) {
+		g_xframe_descriptors.clear();
+	}
+	const auto [found, inserted] = g_xframe_descriptors.try_emplace(g_xframe_draw_key);
+	if (inserted) {
+		found->second = std::move(current);
+		return;
+	}
+	const bool same_textures = found->second.textures == current.textures;
+	const bool same_buffers  = found->second.buffers == current.buffers;
+	Common::DebugCounters::Add(Counter::DrawXframeBindCompared);
+	if (same_textures) Common::DebugCounters::Add(Counter::DrawXframeSameTextures);
+	if (same_buffers) Common::DebugCounters::Add(Counter::DrawXframeSameBuffers);
+	if (same_textures && same_buffers) Common::DebugCounters::Add(Counter::DrawXframeSameBoth);
+	const bool same_no_base = found->second.no_base == current.no_base;
+	if (same_no_base) Common::DebugCounters::Add(Counter::DrawXframeVsharpNoBase);
+	if (found->second.shape == current.shape) {
+		Common::DebugCounters::Add(Counter::DrawXframeVsharpShape);
+	}
+	if (same_textures && same_no_base) Common::DebugCounters::Add(Counter::DrawXframeRelocatable);
+	const auto& previous = found->second.bases;
+	if (previous.size() == current.bases.size() && previous != current.bases) {
+		Common::DebugCounters::Add(Counter::DrawXframeVsharpMoved);
+		std::optional<uint64_t> shift;
+		bool                    one_shift = true;
+		for (size_t i = 0; i < previous.size() && one_shift; i++) {
+			if (previous[i] == current.bases[i]) continue;
+			const auto delta = current.bases[i] - previous[i];
+			one_shift        = !shift.has_value() || *shift == delta;
+			shift            = delta;
+		}
+		if (one_shift) Common::DebugCounters::Add(Counter::DrawXframeVsharpShift);
+	}
+	found->second = std::move(current);
+}
 
 StageRepeatState HashStage(const PreparedBindings& prepared) {
 	StageRepeatState state;
@@ -155,6 +386,7 @@ void CountBindingRepeats(std::span<const PreparedBindings* const, 4> slots, cons
 	if (!Counters::Enabled()) {
 		return;
 	}
+	CountCrossFrameBindings(slots);
 	auto& last      = g_draw_repeats;
 	bool  draw_same = true;
 	for (size_t slot = 0; slot < slots.size(); slot++) {
@@ -828,13 +1060,20 @@ struct PreparedVertexBuffers {
 	uint32_t                               count = 0;
 };
 
-static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
-                                                  const ShaderVertexInputInfo& vs_input_info) {
+// A draw's guest vertex ranges, merged and clamped without the buffer cache.
+struct VertexBufferPlan {
+	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
+	uint32_t                                                      count = 0;
+};
+
+static VertexBufferPlan DecodeVertexBuffers(const ShaderVertexInputInfo& vs_input_info) {
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
 
 	// Collect the non-empty guest vertex ranges.
-	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
+	VertexBufferPlan                                              plan;
+	auto&                                                         sizes = plan.sizes;
 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
@@ -857,8 +1096,8 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	          });
 
 	// Merge overlapping or touching ranges before acquiring host buffers.
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges {};
-	uint32_t                                                      merged_count = 0;
+	auto&     merged_ranges = plan.ranges;
+	uint32_t& merged_count  = plan.count;
 	for (uint32_t i = 0; i < range_count; i++) {
 		const auto& range = ranges[i];
 		if (merged_count != 0 &&
@@ -870,14 +1109,27 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		merged_ranges[merged_count++] = {range.base_address, range.requested_end};
 	}
 
-	auto& cache = buffer.GetContext().GetBufferCache();
 	for (uint32_t i = 0; i < merged_count; i++) {
 		auto& range = merged_ranges[i];
 		// PPSA20298
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
-		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
+	}
+	return plan;
+}
+
+static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
+                                                  const ShaderVertexInputInfo& vs_input_info,
+                                                  VertexBufferPlan&            plan) {
+	const auto& sizes         = plan.sizes;
+	auto&       merged_ranges = plan.ranges;
+	const auto  merged_count  = plan.count;
+	auto&       cache         = buffer.GetContext().GetBufferCache();
+	for (uint32_t i = 0; i < merged_count; i++) {
+		auto& range = merged_ranges[i];
+		range.binding =
+		    cache.ObtainBuffer(range.base_address, range.acquired_end - range.base_address, false);
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
@@ -1020,25 +1272,639 @@ static void MarkDrawPhase(const DrawCallInfo& draw, const char* phase) {
 	}
 }
 
+namespace {
+
+// --draw-records-verify: what a record of the previous frame's draw with the same programs and
+// arguments would prepare, checked against this draw's own preparation.
+struct DrawRecordStage {
+	const void*                                        module = nullptr;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> textures; // T# words, then S# words.
+	std::vector<ShaderRecompiler::IR::DescriptorValue> buffers;  // V# words without the base.
+	std::vector<uint32_t>                              image_ids;
+	std::vector<vk::ImageView>                         image_views;
+	std::vector<vk::Sampler>                           samplers;
+};
+
+struct DrawRecord {
+	// Context and stage registers without user SGPRs, UserConfig and the draw arguments.
+	std::vector<uint8_t>                               state;
+	std::array<DrawRecordStage, 4>                     stages;
+	uint32_t                                           stage_count = 0;
+	std::array<uint32_t, RENDER_COLOR_ATTACHMENTS_MAX> color_ids {};
+	uint32_t                                           color_count = 0;
+	uint32_t                                           depth_id    = 0;
+	const void*                                        pipeline    = nullptr;
+	std::pair<uint64_t, uint64_t>                      generations;
+	// Where the context registers, UserConfig, stage registers and arguments end in state.
+	std::array<size_t, 4> part_ends {};
+	// Every image the draw binds, with its serial: ImageId slots are reused.
+	std::vector<std::pair<uint32_t, uint64_t>> images;
+	// Left out of state: it only reaches the dynamic state that CommitDraw sets on every draw.
+	std::array<int, 4> scissor {};
+	// The color clear stamps of its DCC/CMASK images; unstamped when one had none.
+	std::vector<ColorClearStamp> color_stamps;
+	bool                         color_unstamped = false;
+};
+
+// The two latest records of a key, for draws that alternate between two states (ping-pong
+// targets).
+struct DrawRecordPair {
+	std::array<DrawRecord, 2> slots;
+	uint32_t                  newest = 0;
+	uint32_t                  filled = 0;
+};
+
+std::unordered_map<uint64_t, DrawRecordPair> g_draw_records;
+std::pair<uint64_t, uint64_t>                g_draw_record_generations;
+// Regs misses by the part and the 4-byte word that differs first in it: part << 16 | word.
+std::unordered_map<uint32_t, uint64_t> g_draw_record_reg_words;
+uint64_t                               g_draw_record_reg_misses = 0;
+
+void CountRegisterDifference(const DrawRecord& record, const DrawRecord& current) {
+	using Common::DebugCounters::Counter;
+	constexpr std::array<Counter, 4> Counters {
+	    Counter::DrawRecordRegsContext, Counter::DrawRecordRegsUcfg, Counter::DrawRecordRegsStage,
+	    Counter::DrawRecordRegsArgs};
+	constexpr std::array<const char*, 4> Names {"context", "ucfg", "stage", "args"};
+	size_t                               begin = 0;
+	for (uint32_t part = 0; part < 4; part++) {
+		const auto end    = current.part_ends[part];
+		const auto [a, b] = std::mismatch(record.state.begin() + begin, record.state.begin() + end,
+		                                  current.state.begin() + begin);
+		if (a != record.state.begin() + end) {
+			Common::DebugCounters::Add(Counters[part]);
+			const auto word = static_cast<uint32_t>((a - record.state.begin() - begin) / 4);
+			g_draw_record_reg_words[(part << 16u) | word]++;
+		}
+		begin = end;
+	}
+	if (++g_draw_record_reg_misses % 50000 != 0) {
+		return;
+	}
+	std::vector<std::pair<uint32_t, uint64_t>> words(g_draw_record_reg_words.begin(),
+	                                                 g_draw_record_reg_words.end());
+	std::ranges::sort(words, std::ranges::greater {}, &std::pair<uint32_t, uint64_t>::second);
+	std::string text = "Draw records: first differing register words of regs misses:";
+	for (size_t i = 0; i < std::min<size_t>(words.size(), 8); i++) {
+		text += fmt::format(" {} +{} x{};", Names[words[i].first >> 16u],
+		                    (words[i].first & 0xFFFFu) * 4u, words[i].second);
+	}
+	Log::WriteToConsoleAndLog(text + "\n");
+	g_draw_record_reg_words.clear();
+}
+
+// Whether every image of the record is the one it recorded and still registered.
+bool DrawRecordImagesKept(const TextureCache& textures, const DrawRecord& record) {
+	return std::ranges::all_of(record.images, [&](const auto& image) {
+		return textures.RegisteredSerial(ImageId {image.first}) == image.second;
+	});
+}
+
+template <typename T>
+void AppendBytes(std::vector<uint8_t>& out, const T& value) {
+	static_assert(std::is_trivially_copyable_v<T>);
+	const auto* bytes = reinterpret_cast<const uint8_t*>(&value);
+	out.insert(out.end(), bytes, bytes + sizeof(T));
+}
+
+DrawRecordStage RecordStage(const PreparedBindings& prepared) {
+	const auto&     resources = *prepared.runtime->resources;
+	DrawRecordStage stage;
+	stage.module   = prepared.runtime->module;
+	stage.textures = resources.images;
+	stage.textures.insert(stage.textures.end(), resources.samplers.begin(),
+	                      resources.samplers.end());
+	stage.buffers = resources.buffers;
+	for (auto& vsharp: stage.buffers) {
+		// V#: base[31:0] in dword 0, base[47:32] in the low half of dword 1.
+		vsharp.dwords[0] = 0;
+		vsharp.dwords[1] &= 0xFFFF0000u;
+	}
+	for (const auto& image: prepared.images) {
+		stage.image_ids.push_back(image.image_id.index);
+		stage.image_views.push_back(image.image_view);
+	}
+	stage.samplers = prepared.samplers;
+	return stage;
+}
+
+void VerifyDrawRecord(TextureCache& textures, const CommandBuffer& buffer,
+                      std::span<const uint64_t> args, bool excluded,
+                      std::span<PreparedBindings* const> stages,
+                      std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+                      const void* pipeline) {
+	using Common::DebugCounters::Add;
+	using Common::DebugCounters::Counter;
+	Common::DebugCounters::SetDrawPhase("(verify) DrawRecords");
+	Add(Counter::DrawRecordChecks);
+	const auto generations = textures.Generations();
+	if (generations != g_draw_record_generations) {
+		g_draw_record_generations = generations;
+		Add(Counter::DrawRecordCacheChanges);
+	}
+	if (excluded || stages.size() > 4) {
+		Add(Counter::DrawRecordExcluded);
+		return;
+	}
+	const auto&                   vs = buffer.GetShaders().GetVs();
+	const auto&                   ps = buffer.GetShaders().GetPs();
+	const std::array<uint64_t, 5> programs {vs.es_regs.data_addr, vs.ls_regs.data_addr,
+	                                        vs.hs_regs.data_addr, vs.gs_regs.data_addr,
+	                                        ps.ps_regs.data_addr};
+	const auto key = XXH3_64bits_withSeed(args.data(), args.size_bytes(),
+	                                      XXH3_64bits(programs.data(), sizeof(programs)));
+
+	DrawRecord current;
+	current.state.reserve(4096);
+	AppendBytes(current.state, buffer.GetRegisters());
+	{
+		const auto& registers = buffer.GetRegisters();
+		const auto& viewport  = registers.GetScreenViewport();
+		const auto* base      = reinterpret_cast<const uint8_t*>(&registers);
+		const auto  first = reinterpret_cast<const uint8_t*>(&viewport.screen_scissor_left) - base;
+		const auto  last =
+		    reinterpret_cast<const uint8_t*>(&viewport.screen_scissor_bottom + 1) - base;
+		std::fill(current.state.begin() + first, current.state.begin() + last, 0);
+		current.scissor = {viewport.screen_scissor_left, viewport.screen_scissor_top,
+		                   viewport.screen_scissor_right, viewport.screen_scissor_bottom};
+	}
+	current.part_ends[0] = current.state.size();
+	AppendBytes(current.state, buffer.GetUserConfig());
+	current.part_ends[1] = current.state.size();
+	AppendBytes(current.state, vs.es_regs);
+	AppendBytes(current.state, vs.ls_regs);
+	AppendBytes(current.state, vs.hs_regs);
+	AppendBytes(current.state, vs.gs_regs);
+	AppendBytes(current.state, ps.ps_regs);
+	current.part_ends[2]  = current.state.size();
+	const auto* arg_bytes = reinterpret_cast<const uint8_t*>(args.data());
+	current.state.insert(current.state.end(), arg_bytes, arg_bytes + args.size_bytes());
+	current.part_ends[3] = current.state.size();
+	for (const auto* stage: stages) {
+		current.stages[current.stage_count++] = RecordStage(*stage);
+	}
+	for (const auto& color: colors) {
+		current.color_ids[current.color_count++] = color.image_id.index;
+	}
+	current.depth_id     = depth.image_id.index;
+	current.pipeline     = pipeline;
+	current.generations  = generations;
+	const auto add_image = [&](uint32_t index) {
+		if (index != ImageId::INVALID_INDEX) {
+			current.images.emplace_back(index, textures.RegisteredSerial(ImageId {index}));
+		}
+	};
+	for (uint32_t i = 0; i < current.stage_count; i++) {
+		std::ranges::for_each(current.stages[i].image_ids, add_image);
+	}
+	std::ranges::for_each(std::span {current.color_ids}.first(current.color_count), add_image);
+	add_image(current.depth_id);
+	for (const auto& [index, serial]: current.images) {
+		if (!textures.CopyColorClearStamps(ImageId {index}, current.color_stamps)) {
+			current.color_unstamped = true;
+		}
+	}
+
+	if (g_draw_records.size() >= 1u << 16u) {
+		g_draw_records.clear();
+	}
+	auto&      pair     = g_draw_records[key];
+	const bool inserted = pair.filled == 0;
+	uint32_t   slot     = pair.newest;
+	for (const uint32_t candidate: {pair.newest, 1u - pair.newest}) {
+		if (candidate < pair.filled && pair.slots[candidate].state == current.state) {
+			slot = candidate;
+			break;
+		}
+	}
+	auto&      record  = pair.slots[slot];
+	const bool matched = !inserted && record.state == current.state;
+	const auto staged  = std::span {record.stages.data(), record.stage_count};
+	const auto now     = std::span {current.stages.data(), current.stage_count};
+	const auto same    = [&](auto field) {
+		return staged.size() == now.size() && std::ranges::equal(staged, now, {}, field, field);
+	};
+	if (inserted) {
+		Add(Counter::DrawRecordNew);
+	} else if (record.state != current.state) {
+		Add(Counter::DrawRecordRegs);
+		CountRegisterDifference(record, current);
+	} else if (!same(&DrawRecordStage::textures)) {
+		Add(Counter::DrawRecordTextures);
+	} else if (!same(&DrawRecordStage::buffers)) {
+		Add(Counter::DrawRecordBuffers);
+	} else if (record.generations != current.generations &&
+	           !DrawRecordImagesKept(textures, record)) {
+		Add(Counter::DrawRecordImages);
+	} else {
+		const bool kept = record.generations != current.generations;
+		Add(Counter::DrawRecordHits);
+		if (kept) Add(Counter::DrawRecordHitsKept);
+		if (slot != pair.newest) Add(Counter::DrawRecordHitsOlder);
+		if (record.scissor != current.scissor) Add(Counter::DrawRecordHitsScissor);
+		if (record.color_unstamped) {
+			Add(Counter::DrawRecordMetaUnstamped);
+		} else if (!textures.ColorClearStampsHold(record.color_stamps)) {
+			Add(Counter::DrawRecordMetaChanged);
+		} else {
+			Add(Counter::DrawRecordMetaStable);
+		}
+		const bool programs_ok = same(&DrawRecordStage::module);
+		const bool textures_ok = same(&DrawRecordStage::image_ids) &&
+		                         same(&DrawRecordStage::image_views) &&
+		                         same(&DrawRecordStage::samplers);
+		const bool targets_ok  = record.color_count == current.color_count &&
+		                         record.color_ids == current.color_ids &&
+		                         record.depth_id == current.depth_id;
+		const bool pipeline_ok = record.pipeline == current.pipeline;
+		if (!programs_ok) Add(Counter::DrawRecordWrongPrograms);
+		if (!textures_ok) Add(Counter::DrawRecordWrongTextures);
+		if (!targets_ok) Add(Counter::DrawRecordWrongTargets);
+		if (!pipeline_ok) Add(Counter::DrawRecordWrongPipeline);
+		if (!(programs_ok && textures_ok && targets_ok && pipeline_ok)) {
+			Add(Counter::DrawRecordWrong);
+			if (kept) Add(Counter::DrawRecordWrongKept);
+		}
+	}
+	// A matching record is renewed; otherwise the draw replaces the older record.
+	const uint32_t target = matched ? slot : (pair.filled < 2 ? pair.filled : 1u - pair.newest);
+	pair.slots[target]    = std::move(current);
+	pair.filled           = std::max(pair.filled, target + 1);
+	pair.newest           = target;
+}
+
+} // namespace
+
+namespace {
+
+// --draw-records: what the previous frame's preparation of the same draw left behind. A draw
+// repeats it when its registers, programs and T#/S# words are the same, its V# words differ at
+// most in the base address and every image of the record is still the same registered image.
+struct DrawReplayStage {
+	const void*                                        module = nullptr;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> textures; // T# words, then S# words.
+	std::vector<ShaderRecompiler::IR::DescriptorValue> buffers;  // V# words without the base.
+	std::vector<TextureBinding>                        images;
+	std::vector<vk::Sampler>                           samplers;
+};
+
+struct DrawReplay {
+	// As DrawRecord::state: the screen scissor is left out.
+	std::vector<uint8_t>                                      state;
+	std::array<DrawReplayStage, 4>                            stages;
+	uint32_t                                                  stage_count = 0;
+	std::array<RenderColorInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
+	// The base layer each color target lookup started from, for its clear materialization.
+	std::array<uint32_t, RENDER_COLOR_ATTACHMENTS_MAX> color_layers {};
+	uint32_t                                           color_count = 0;
+	std::vector<std::pair<ImageId, uint64_t>>          images;
+	// The GC tick in which its images were last touched.
+	mutable uint64_t touched_tick = 0;
+};
+
+struct DrawReplayPair {
+	std::array<DrawReplay, 2> slots;
+	uint32_t                  newest = 0;
+	uint32_t                  filled = 0;
+};
+
+// The draw being prepared.
+struct DrawReplayDraw {
+	bool              active     = false;
+	bool              capturable = false;
+	DrawReplayPair*   pair       = nullptr;
+	int32_t           matched    = -1;
+	const DrawReplay* hit        = nullptr;
+	// This draw's state and, for a store, what its preparation produced.
+	DrawReplay current;
+	// What the record's state is built from when the draw stores one.
+	const CommandBuffer*    buffer = nullptr;
+	std::array<uint64_t, 8> args {};
+	size_t                  arg_count = 0;
+};
+
+std::unordered_map<uint64_t, DrawReplayPair> g_draw_replays;
+DrawReplayDraw                               g_draw_replay;
+
+void MaskVsharps(std::vector<ShaderRecompiler::IR::DescriptorValue>& buffers) {
+	for (auto& vsharp: buffers) {
+		// V#: base[31:0] in dword 0, base[47:32] in the low half of dword 1.
+		vsharp.dwords[0] = 0;
+		vsharp.dwords[1] &= 0xFFFF0000u;
+	}
+}
+
+bool SameVsharpShapes(const std::vector<ShaderRecompiler::IR::DescriptorValue>& current,
+                      const std::vector<ShaderRecompiler::IR::DescriptorValue>& shapes) {
+	return current.size() == shapes.size() &&
+	       std::ranges::equal(current, shapes, [](auto vsharp, const auto& shape) {
+		       vsharp.dwords[0] = 0;
+		       vsharp.dwords[1] &= 0xFFFF0000u;
+		       return vsharp == shape;
+	       });
+}
+
+bool SameTextureWords(const ShaderRecompiler::IR::ResourceSnapshot&             resources,
+                      const std::vector<ShaderRecompiler::IR::DescriptorValue>& textures) {
+	const auto images = resources.images.size();
+	return textures.size() == images + resources.samplers.size() &&
+	       std::equal(resources.images.begin(), resources.images.end(), textures.begin()) &&
+	       std::equal(resources.samplers.begin(), resources.samplers.end(),
+	                  textures.begin() + static_cast<std::ptrdiff_t>(images));
+}
+
+// The draw's registers, programs and arguments as a record keeps them, without the screen
+// scissor: it only reaches the dynamic state that CommitDraw sets on every draw.
+void BuildDrawReplayState(const CommandBuffer& buffer, std::span<const uint64_t> args,
+                          std::vector<uint8_t>& state) {
+	state.clear();
+	const auto& registers = buffer.GetRegisters();
+	AppendBytes(state, registers);
+	{
+		const auto& viewport = registers.GetScreenViewport();
+		const auto* base     = reinterpret_cast<const uint8_t*>(&registers);
+		const auto  first = reinterpret_cast<const uint8_t*>(&viewport.screen_scissor_left) - base;
+		const auto  last =
+		    reinterpret_cast<const uint8_t*>(&viewport.screen_scissor_bottom + 1) - base;
+		std::fill(state.begin() + first, state.begin() + last, 0);
+	}
+	const auto& vs = buffer.GetShaders().GetVs();
+	const auto& ps = buffer.GetShaders().GetPs();
+	AppendBytes(state, buffer.GetUserConfig());
+	AppendBytes(state, vs.es_regs);
+	AppendBytes(state, vs.ls_regs);
+	AppendBytes(state, vs.hs_regs);
+	AppendBytes(state, vs.gs_regs);
+	AppendBytes(state, ps.ps_regs);
+	const auto* arg_bytes = reinterpret_cast<const uint8_t*>(args.data());
+	state.insert(state.end(), arg_bytes, arg_bytes + args.size_bytes());
+}
+
+// Whether a record's state is the draw's, compared in place instead of building it.
+bool SameDrawReplayState(const std::vector<uint8_t>& state, const CommandBuffer& buffer,
+                         std::span<const uint64_t> args) {
+	const auto& registers = buffer.GetRegisters();
+	const auto& ucfg      = buffer.GetUserConfig();
+	const auto& vs        = buffer.GetShaders().GetVs();
+	const auto& ps        = buffer.GetShaders().GetPs();
+	const auto  total = sizeof(registers) + sizeof(ucfg) + sizeof(vs.es_regs) + sizeof(vs.ls_regs) +
+	                    sizeof(vs.hs_regs) + sizeof(vs.gs_regs) + sizeof(ps.ps_regs) +
+	                    args.size_bytes();
+	if (state.size() != total) {
+		return false;
+	}
+	size_t offset = 0;
+
+	// Compares the next bytes of the state.
+	const auto same = [&](const void* data, size_t size) {
+		const bool equal = std::memcmp(state.data() + offset, data, size) == 0;
+		offset += size;
+		return equal;
+	};
+	const auto& viewport = registers.GetScreenViewport();
+	const auto* base     = reinterpret_cast<const uint8_t*>(&registers);
+	const auto  first =
+	    static_cast<size_t>(reinterpret_cast<const uint8_t*>(&viewport.screen_scissor_left) - base);
+	const auto last = static_cast<size_t>(
+	    reinterpret_cast<const uint8_t*>(&viewport.screen_scissor_bottom + 1) - base);
+	if (!same(base, first)) {
+		return false;
+	}
+	offset = last;
+	return same(base + last, sizeof(registers) - last) && same(&ucfg, sizeof(ucfg)) &&
+	       same(&vs.es_regs, sizeof(vs.es_regs)) && same(&vs.ls_regs, sizeof(vs.ls_regs)) &&
+	       same(&vs.hs_regs, sizeof(vs.hs_regs)) && same(&vs.gs_regs, sizeof(vs.gs_regs)) &&
+	       same(&ps.ps_regs, sizeof(ps.ps_regs)) && same(args.data(), args.size_bytes());
+}
+
+// Looks the draw up by programs and arguments; returns whether a record has the same registers,
+// so that their validation can be skipped.
+bool BeginDrawReplay(const CommandBuffer& buffer, std::span<const uint64_t> args) {
+	using Common::DebugCounters::Add;
+	using Common::DebugCounters::Counter;
+	auto& draw   = g_draw_replay;
+	draw.active  = false;
+	draw.hit     = nullptr;
+	draw.matched = -1;
+	if (!Config::DrawRecordsEnabled() || args.size() > draw.args.size()) {
+		return false;
+	}
+	Common::DebugCounters::SetDrawPhase("(records) Key");
+	const auto&                   vs = buffer.GetShaders().GetVs();
+	const auto&                   ps = buffer.GetShaders().GetPs();
+	const std::array<uint64_t, 5> programs {vs.es_regs.data_addr, vs.ls_regs.data_addr,
+	                                        vs.hs_regs.data_addr, vs.gs_regs.data_addr,
+	                                        ps.ps_regs.data_addr};
+
+	const auto seed = XXH3_64bits(programs.data(), sizeof(programs));
+	const auto key  = XXH3_64bits_withSeed(args.data(), args.size_bytes(), seed);
+	if (g_draw_replays.size() >= 1u << 16u) {
+		g_draw_replays.clear();
+	}
+	draw.pair = &g_draw_replays[key];
+	for (const uint32_t candidate: {draw.pair->newest, 1u - draw.pair->newest}) {
+		if (candidate < draw.pair->filled &&
+		    SameDrawReplayState(draw.pair->slots[candidate].state, buffer, args)) {
+			draw.matched = static_cast<int32_t>(candidate);
+			break;
+		}
+	}
+	draw.buffer    = &buffer;
+	draw.arg_count = args.size();
+	std::ranges::copy(args, draw.args.begin());
+	draw.active              = true;
+	draw.capturable          = true;
+	draw.current.stage_count = 0;
+	draw.current.color_count = 0;
+	Add(Counter::DrawReplayChecks);
+	if (draw.matched < 0) {
+		Add(Counter::DrawReplayMissRegs);
+	}
+	return draw.matched >= 0;
+}
+
+// The record the draw repeats, once its programs and resources are known.
+const DrawReplay* FindDrawReplay(TextureCache& textures, const DrawRenderState& state) {
+	using Common::DebugCounters::Add;
+	using Common::DebugCounters::Counter;
+	auto& draw = g_draw_replay;
+	if (!draw.active || draw.matched < 0) {
+		return nullptr;
+	}
+	Common::DebugCounters::SetDrawPhase("(records) Check");
+	const auto&                              record = draw.pair->slots[draw.matched];
+	std::array<const ShaderStageRuntime*, 4> runtimes {};
+	uint32_t                                 count = 0;
+	for (const auto& stage: state.VertexStages()) {
+		runtimes[count++] = &stage.stage;
+	}
+	if (state.ps_active) {
+		runtimes[count++] = &state.ps_input_info.stage;
+	}
+	bool same = count == record.stage_count;
+	for (uint32_t i = 0; i < count && same; i++) {
+		const auto& stage = record.stages[i];
+
+		same = runtimes[i]->module == stage.module &&
+		       SameTextureWords(*runtimes[i]->resources, stage.textures) &&
+		       SameVsharpShapes(runtimes[i]->resources->buffers, stage.buffers);
+	}
+	if (!same) {
+		Add(Counter::DrawReplayMissResources);
+		return nullptr;
+	}
+	if (!std::ranges::all_of(record.images, [&](const auto& image) {
+		    return textures.RegisteredSerial(image.first) == image.second;
+	    })) {
+		Add(Counter::DrawReplayMissImages);
+		return nullptr;
+	}
+	Add(Counter::DrawReplayHits);
+	// Touches repeat nothing within a GC tick.
+	if (record.touched_tick != textures.GcTick()) {
+		for (const auto& image: record.images) {
+			textures.RepeatTouch(image.first);
+		}
+		record.touched_tick = textures.GcTick();
+	}
+	draw.hit = &record;
+	return draw.hit;
+}
+
+// Keeps what a draw without a record found for its stage.
+void CaptureDrawReplayStage(const PreparedBindings& prepared) {
+	auto& draw = g_draw_replay;
+	if (!draw.active || draw.hit != nullptr || draw.current.stage_count >= 4) {
+		draw.capturable = false;
+		return;
+	}
+	const auto& resources = *prepared.runtime->resources;
+	auto&       stage     = draw.current.stages[draw.current.stage_count++];
+	stage.module          = prepared.runtime->module;
+	stage.textures        = resources.images;
+	stage.textures.insert(stage.textures.end(), resources.samplers.begin(),
+	                      resources.samplers.end());
+	stage.buffers = resources.buffers;
+	MaskVsharps(stage.buffers);
+	const auto& program = prepared.runtime->module->info.info;
+	for (uint32_t i = 0; i < prepared.images.size(); i++) {
+		// A lookup that found nothing can create the image: the next draw must look again.
+		if (!program.images[i].heap && !prepared.decoded_images[i].null &&
+		    !prepared.images[i].found_id) {
+			draw.capturable = false;
+		}
+	}
+	stage.images = prepared.images;
+	for (auto& image: stage.images) {
+		image.mip_views.clear();
+		image.image_view = nullptr;
+	}
+	stage.samplers = prepared.samplers;
+}
+
+// Ends the draw: a draw without a record stores what it prepared.
+void FinishDrawReplay(const TextureCache& textures, bool excluded) {
+	using Common::DebugCounters::Add;
+	using Common::DebugCounters::Counter;
+	auto& draw = g_draw_replay;
+	if (!draw.active) {
+		return;
+	}
+	draw.active = false;
+	auto& pair  = *draw.pair;
+	if (draw.hit != nullptr) {
+		pair.newest = static_cast<uint32_t>(draw.matched);
+		return;
+	}
+	if (excluded || !draw.capturable) {
+		return;
+	}
+	auto& images = draw.current.images;
+	images.clear();
+	const auto add = [&](ImageId id) {
+		if (id) {
+			images.emplace_back(id, textures.RegisteredSerial(id));
+		}
+	};
+	for (uint32_t i = 0; i < draw.current.stage_count; i++) {
+		for (const auto& image: draw.current.stages[i].images) {
+			add(image.found_id);
+			add(image.image_id);
+		}
+	}
+	for (uint32_t i = 0; i < draw.current.color_count; i++) {
+		add(draw.current.colors[i].image_id);
+	}
+	if (std::ranges::any_of(images, [](const auto& image) { return image.second == 0; })) {
+		return;
+	}
+	const uint32_t target = draw.matched >= 0 ? static_cast<uint32_t>(draw.matched)
+	                        : pair.filled < 2 ? pair.filled
+	                                          : 1u - pair.newest;
+	BuildDrawReplayState(*draw.buffer, std::span {draw.args}.first(draw.arg_count),
+	                     draw.current.state);
+	draw.current.touched_tick = textures.GcTick();
+	std::swap(pair.slots[target], draw.current);
+	pair.filled = std::max(pair.filled, target + 1);
+	pair.newest = target;
+	Add(Counter::DrawReplayStores);
+}
+
+} // namespace
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t         render_target_slice_offset,
                                             DrawRenderState& state) {
 	m_context.GetImageHeap().BeginDraw();
 	MarkDrawPhase(draw, "GetGraphicsPrograms");
-	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+	if (m_commit_job == nullptr) {
+		state.resources = &m_draw_resources;
+		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+	} else if (Config::VerifyDrawPrepEnabled()) {
+		VerifyPreparedPrograms(buffer, state);
+	} else if (!m_commit_job->heap_peeks.empty() && !AcquirePeekedHeaps(*m_commit_job)) {
+		// The GPU thread's own programs replace the worker's where they differ.
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawPrepHeapRedo);
+		VerifyPreparedPrograms(buffer, state);
+	}
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
 		return false;
 	}
-	MarkDrawPhase(draw, "ResolveRenderColorTarget");
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if ((state.mrt_mask & (1u << slot)) != 0) {
-			ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
-			                         render_target_slice_offset, slot);
-			if (state.color_info[state.color_count].image_id) {
-				state.color_count++;
+	if (const auto* replay = FindDrawReplay(m_context.GetTextureCache(), state);
+	    replay != nullptr) {
+		MarkDrawPhase(draw, "(records) Targets");
+		auto& textures = m_context.GetTextureCache();
+		for (uint32_t i = 0; i < replay->color_count; i++) {
+			auto& color = state.color_info[i];
+			color       = replay->colors[i];
+			textures.RepeatColorClear(color.image_id, color.desc, replay->color_layers[i]);
+			BindRenderTarget(color.image_id);
+		}
+		state.color_count = replay->color_count;
+	} else {
+		MarkDrawPhase(draw, "ResolveRenderColorTarget");
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if ((state.mrt_mask & (1u << slot)) != 0) {
+				ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
+				                         render_target_slice_offset, slot);
+				if (state.color_info[state.color_count].image_id) {
+					state.color_count++;
+				}
 			}
+		}
+		auto& record = g_draw_replay;
+		if (record.active) {
+			for (uint32_t i = 0; i < state.color_count; i++) {
+				const auto& color  = state.color_info[i];
+				const auto& decode = m_color_target_decodes[color.target_slot];
+				// The lookup started from the decoded description.
+				record.capturable &= decode.valid;
+				record.current.colors[i]       = color;
+				record.current.color_layers[i] = decode.info.desc.view_info.base_layer;
+			}
+			record.current.color_count = state.color_count;
 		}
 	}
 	MarkDrawPhase(draw, "ResolveRenderDepthTarget");
@@ -1279,14 +2145,35 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
+	// The worker decoded the stages of a draw it prepared.
+	const auto decoded = [&](uint32_t stage) {
+		return m_commit_job != nullptr && m_commit_job->decoded ? &m_commit_job->bindings[stage]
+		                                                        : nullptr;
+	};
+	const auto* replay = g_draw_replay.hit;
+
+	// A draw with a record takes its texture bindings and samplers from it.
+	const auto prepare = [&](const ShaderStageRuntime& runtime, PreparedBindings& prepared,
+	                         PreparedBindings* worker) {
+		if (replay != nullptr) {
+			const auto& stage        = replay->stages[stage_count];
+			prepared.replay_images   = &stage.images;
+			prepared.replay_samplers = &stage.samplers;
+		}
+		PrepareBindings(runtime, prepared, worker);
+		prepared.replay_images   = nullptr;
+		prepared.replay_samplers = nullptr;
+		if (g_draw_replay.active) {
+			CaptureDrawReplayStage(prepared);
+		}
+		descriptor_stages[stage_count++] = &prepared;
+	};
 	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
-		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
-		descriptor_stages[stage_count++] = &bindings.vertex[i];
+		prepare(state.vertex_info[i].stage, bindings.vertex[i], decoded(i));
 	}
 	if (state.ps_active) {
 		if (!bindings.pixel) bindings.pixel.emplace();
-		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
-		descriptor_stages[stage_count++] = &*bindings.pixel;
+		prepare(state.ps_input_info.stage, *bindings.pixel, decoded(3));
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	{
@@ -1298,7 +2185,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		Common::DebugCounters::SetDrawPhase("PrepareVertexBuffers/Vertex");
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
+		auto plan       = DecodeVertexBuffers(state.vertex_info[0]);
+		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0], plan);
 		Common::DebugCounters::SetDrawPhase("PrepareVertexBuffers/Index");
 		index_binding = PrepareIndexBuffer(buffer, index_source);
 	}
@@ -1328,6 +2216,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			slots[3] = &*bindings.pixel;
 		}
 		CountBindingRepeats(slots, &pipeline, state);
+	}
+	if (Config::DrawRecordsVerifyEnabled()) {
+		const std::array<uint64_t, 8> args {
+		    draw.index_count,     draw.instance_count,
+		    draw.first_instance,  static_cast<uint32_t>(emit.vertex_offset),
+		    emit.first_instance,  emit.indirect.address,
+		    index_source.address, static_cast<uint64_t>(draw.debug_op)};
+		// Indexed mesh draws register their indices with the buffer cache.
+		VerifyDrawRecord(m_context.GetTextureCache(), buffer, args, mesh_active && draw.IsIndexed(),
+		                 stages, std::span {state.color_info, state.color_count}, state.depth_info,
+		                 &pipeline);
+	}
+	if (g_draw_replay.active) {
+		Common::DebugCounters::SetDrawPhase("(records) Store");
+		// Indexed mesh draws register their indices with the buffer cache.
+		FinishDrawReplay(m_context.GetTextureCache(), mesh_active && draw.IsIndexed());
 	}
 	Common::DebugCounters::SetDrawPhase("CommitDraw");
 
@@ -1471,6 +2375,13 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	if (Common::DebugCounters::g_skip_draws.load(std::memory_order_relaxed)) {
 		return true;
 	}
+	if (const std::array<uint64_t, 8> words {
+	        args.index_count, reinterpret_cast<uint64_t>(args.index_addr), args.instance_count,
+	        args.index_type_and_size, static_cast<uint32_t>(args.base_vertex), args.first_instance,
+	        args.render_target_slice_offset, args.indirect.address};
+	    CrossFrameRepeat(m_context, buffer, words)) {
+		return true;
+	}
 	Common::DebugCounters::SetDrawPhase("DrawSetup/Pending");
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1518,12 +2429,32 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		     static_cast<uint32_t>(args.base_vertex), args.first_instance);
 	}
 
-	uc_check(ucfg);
+	const std::array<uint64_t, 8> replay_args {args.index_count,
+	                                           reinterpret_cast<uint64_t>(args.index_addr),
+	                                           args.instance_count,
+	                                           args.index_type_and_size,
+	                                           static_cast<uint32_t>(args.base_vertex),
+	                                           args.first_instance,
+	                                           args.render_target_slice_offset,
+	                                           args.indirect.address};
 
-	hw_check(buffer);
+	const bool registers_repeat = BeginDrawReplay(buffer, replay_args);
+	Common::DebugCounters::SetDrawPhase("DrawSetup/Checks");
+	// A record holds registers that passed these checks.
+	if (!registers_repeat) {
+		uc_check(ucfg);
+		hw_check(buffer);
+	}
 
-	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
-	                       .indirect_draw    = args.indirect.address != 0};
+	// A draw the worker prepared commits with the state it prepared. Only the other draws
+	// value-initialize a state of their own: it is about 17 KB.
+	std::optional<DrawRenderState> serial_state;
+	if (m_commit_job == nullptr) {
+		serial_state.emplace();
+		serial_state->indirect_offsets = args.indirect.offsets;
+		serial_state->indirect_draw    = args.indirect.address != 0;
+	}
+	DrawRenderState& state = m_commit_job != nullptr ? m_commit_job->state : *serial_state;
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		return true;
 	}
@@ -1577,10 +2508,364 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	return emit.has_value();
 }
 
+RenderExecutor::QueuedDraw& RenderExecutor::QueueDraw(uint64_t submit_id, CommandBuffer& buffer) {
+	static_assert(std::is_trivially_copyable_v<HW::Context> &&
+	              std::is_trivially_copyable_v<HW::UserConfig> &&
+	              std::is_trivially_copyable_v<HW::Shader>);
+	if (m_queue_tail - m_queue_head == MaxQueuedDraws) {
+		CommitOldestDraw(buffer);
+	}
+	auto& slot = m_queued_draws[m_queue_tail % MaxQueuedDraws];
+	if (slot == nullptr) {
+		slot = std::make_unique<QueuedDraw>();
+	}
+	auto& draw       = *slot;
+	draw.registers   = buffer.GetRegisters();
+	draw.user_config = buffer.GetUserConfig();
+	draw.shaders     = buffer.GetShaders();
+	draw.submit_id   = submit_id;
+	return draw;
+}
+
+void RenderExecutor::PublishQueuedDraw(CommandBuffer& buffer) {
+	{
+		const std::scoped_lock lock(m_prep_mutex);
+		m_queued_draws[m_queue_tail % MaxQueuedDraws]->prep = QueuedDraw::Prep::Queued;
+		m_queue_tail++;
+	}
+	if (!m_prep_worker.joinable()) {
+		m_prep_worker =
+		    std::jthread([this](const std::stop_token& stop) { RunDrawPrepWorker(stop); });
+	}
+	m_prep_work.notify_one();
+	// Draws the worker has finished commit at once, so the queue stays short.
+	while (m_queue_head != m_queue_tail && OldestDrawSettled()) {
+		CommitOldestDraw(buffer);
+	}
+}
+
+void RenderExecutor::QueueDrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+                                    const DrawIndexArgs& args) {
+	if (!Config::ParallelDrawPrepEnabled()) {
+		(void)DrawIndex(submit_id, buffer, args);
+		return;
+	}
+	auto& draw      = QueueDraw(submit_id, buffer);
+	draw.indexed    = true;
+	draw.index_args = args;
+	PublishQueuedDraw(buffer);
+}
+
+void RenderExecutor::QueueDrawAuto(uint64_t submit_id, CommandBuffer& buffer,
+                                   const DrawAutoArgs& args) {
+	if (!Config::ParallelDrawPrepEnabled()) {
+		(void)DrawAuto(submit_id, buffer, args);
+		return;
+	}
+	auto& draw     = QueueDraw(submit_id, buffer);
+	draw.indexed   = false;
+	draw.auto_args = args;
+	PublishQueuedDraw(buffer);
+}
+
+void RenderExecutor::CommitQueuedDraws(CommandBuffer& buffer) {
+	while (m_queue_head != m_queue_tail) {
+		CommitOldestDraw(buffer);
+	}
+}
+
+bool RenderExecutor::OldestDrawSettled() {
+	const std::scoped_lock lock(m_prep_mutex);
+	const auto             prep = m_queued_draws[m_queue_head % MaxQueuedDraws]->prep;
+	return prep == QueuedDraw::Prep::Ready || prep == QueuedDraw::Prep::Serial;
+}
+
+void RenderExecutor::CommitOldestDraw(CommandBuffer& buffer) {
+	using Common::DebugCounters::Counter;
+	auto& draw = *m_queued_draws[m_queue_head % MaxQueuedDraws];
+	{
+		std::unique_lock lock(m_prep_mutex);
+		if (draw.prep == QueuedDraw::Prep::Queued) {
+			// Not started: preparing it here is faster than waiting for it.
+			draw.prep = QueuedDraw::Prep::Serial;
+			Common::DebugCounters::Add(Counter::DrawPrepStolen);
+		}
+		if (draw.prep == QueuedDraw::Prep::Preparing) {
+			const auto start = Common::DebugCounters::TimerStart();
+			while (draw.prep == QueuedDraw::Prep::Preparing) {
+				// The worker can wait for a command it sent to this thread.
+				lock.unlock();
+				{
+					const Common::DebugCounters::ScopedDrawPhase phase("QueueCommit/Commands");
+					GuestGpu::RunPendingCommands();
+				}
+				lock.lock();
+				if (draw.prep == QueuedDraw::Prep::Preparing) {
+					const Common::DebugCounters::ScopedDrawPhase phase("QueueCommit/Wait");
+					m_prep_done.wait_for(lock, std::chrono::microseconds(100));
+				}
+			}
+			Common::DebugCounters::AddSince(Counter::DrawPrepWaitNs, start);
+		}
+	}
+	m_commit_job = nullptr;
+	if (draw.prep == QueuedDraw::Prep::Ready) {
+		if (draw.dirty_epoch != m_context.GetBufferCache().GpuDirtyEpoch() ||
+		    draw.program_generation != m_context.GetPipelineCache().ProgramGeneration()) {
+			Common::DebugCounters::Add(Counter::DrawPrepStale);
+		} else {
+			Common::DebugCounters::Add(Counter::DrawPrepUsed);
+			m_commit_job = &draw;
+		}
+	}
+	auto& buffers = m_context.GetBufferCache();
+	if (m_commit_job != nullptr && draw.prestream.entry != 0) {
+		buffers.UsePrestream(&draw.prestream);
+	}
+	const auto live = buffer.SwapRegisters({&draw.registers, &draw.user_config, &draw.shaders});
+	if (draw.indexed) {
+		(void)DrawIndex(draw.submit_id, buffer, draw.index_args);
+	} else {
+		(void)DrawAuto(draw.submit_id, buffer, draw.auto_args);
+	}
+	buffer.SwapRegisters(live);
+	buffers.UsePrestream(nullptr);
+	// After the draw's commands, so the space stays until the GPU has read it.
+	buffers.RetirePrestream(draw.prestream);
+	m_commit_job = nullptr;
+	const std::scoped_lock lock(m_prep_mutex);
+	m_queue_head++;
+}
+
+void RenderExecutor::RunDrawPrepWorker(const std::stop_token& stop) {
+	std::unique_lock lock(m_prep_mutex);
+	while (m_prep_work.wait(lock, stop, [&] { return m_prep_next < m_queue_tail; })) {
+		m_prep_next = std::max(m_prep_next, m_queue_head);
+		if (m_prep_next == m_queue_tail) {
+			continue;
+		}
+		auto& draw = *m_queued_draws[m_prep_next++ % MaxQueuedDraws];
+		if (draw.prep != QueuedDraw::Prep::Queued) {
+			continue;
+		}
+		draw.prep = QueuedDraw::Prep::Preparing;
+		lock.unlock();
+		const bool ready = PrepareQueuedDraw(draw);
+		lock.lock();
+		draw.prep = ready ? QueuedDraw::Prep::Ready : QueuedDraw::Prep::Serial;
+		m_prep_done.notify_all();
+	}
+}
+
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+bool RenderExecutor::PrepareQueuedDraw(QueuedDraw& draw) {
+	using Common::DebugCounters::Counter;
+	namespace IR         = ShaderRecompiler::IR;
+	const auto  start    = Common::DebugCounters::TimerStart();
+	const auto& ctx      = draw.registers;
+	const auto& ucfg     = draw.user_config;
+	const auto& indirect = draw.indexed ? draw.index_args.indirect : draw.auto_args.indirect;
+	const auto& index    = draw.index_args;
+	const auto& vertices = draw.auto_args;
+	const bool  no_index =
+	    index.index_count == 0 || (index.instance_count == 0 && indirect.address == 0);
+	const bool no_vertices =
+	    indirect.address == 0 && (vertices.vertex_count == 0 || vertices.instance_count == 0);
+	const bool empty  = draw.indexed ? no_index : no_vertices;
+	const auto copies = FindDepthStencilCopies(ctx);
+
+	vk::PrimitiveTopology topology {};
+	Common::DebugCounters::Add(Counter::DrawPrepJobs);
+	// The commit drops these draws, or turns them into other operations, before their programs.
+	if (empty) {
+		Common::DebugCounters::Add(Counter::DrawPrepSkipped);
+		Common::DebugCounters::Add(Counter::DrawPrepSkippedEmpty);
+		return false;
+	}
+	// Disable and Normal draw; the other modes are metadata and resolve operations.
+	const auto mode = ctx.GetColorControl().mode;
+	if ((mode != static_cast<uint8_t>(CbColorMode::Disable) &&
+	     mode != static_cast<uint8_t>(CbColorMode::Normal)) ||
+	    copies.depth || copies.stencil) {
+		Common::DebugCounters::Add(Counter::DrawPrepSkipped);
+		Common::DebugCounters::Add(Counter::DrawPrepSkippedSpecial);
+		return false;
+	}
+	if (!DrawHasValidVertexShader(draw.shaders)) {
+		Common::DebugCounters::Add(Counter::DrawPrepSkipped);
+		Common::DebugCounters::Add(Counter::DrawPrepSkippedShader);
+		return false;
+	}
+	if (!GetDrawTopology(ucfg, topology)) {
+		Common::DebugCounters::Add(Counter::DrawPrepSkipped);
+		Common::DebugCounters::Add(Counter::DrawPrepSkippedTopology);
+		return false;
+	}
+	if (Common::DebugCounters::g_skip_draws.load(std::memory_order_relaxed) ||
+	    graphics_debug_dump_enabled()) {
+		Common::DebugCounters::Add(Counter::DrawPrepSkipped);
+		return false;
+	}
+	auto& state = draw.state;
+	state       = DrawRenderState {.indirect_offsets = indirect.offsets,
+	                               .indirect_draw    = indirect.address != 0,
+	                               .resources        = &draw.resources};
+
+	draw.dirty_epoch        = m_context.GetBufferCache().GpuDirtyEpoch();
+	draw.program_generation = m_context.GetPipelineCache().ProgramGeneration();
+	draw.decoded            = false;
+	draw.heap_peeks.clear();
+	PipelineCache::SetHeapPeeks(&draw.heap_peeks);
+	IR::BeginSpeculation();
+	bool ready =
+	    m_context.GetPipelineCache().PrepareGraphicsPrograms(ctx, ucfg, draw.shaders, state) &&
+	    state.vertex_info[0].stage.module != nullptr;
+	if (ready) {
+		// Decoding can stop the emulator on descriptors of draws the commit drops, so only draws
+		// that reach their bindings whatever their targets are decoded here.
+		const auto& vs   = state.vertex_info[0];
+		const bool  mesh = vs.stage.module->info.stage == ShaderType::Mesh;
+		const bool  rect_skip =
+		    !draw.indexed && Prospero::IsRectList(ucfg.GetPrimType()) && vs.buffers_num == 0 &&
+		    vs.stage.module->info.param_export_mask == 0 && state.ps_input_info.input_num != 0;
+		const auto emit = draw.indexed
+		                      ? ResolveDrawEmit(ucfg, vs, index.offset_source, index.base_vertex,
+		                                        index.first_instance, indirect)
+		                      : ResolveDrawEmit(ucfg, vs, vertices.offset_source,
+		                                        static_cast<int32_t>(vertices.first_vertex),
+		                                        vertices.first_instance, indirect);
+		if (state.ps_active && !mesh && !rect_skip && emit.has_value() &&
+		    !ctx.GetRenderControl().copy_depth_to_color) {
+			const auto stages = state.VertexStages();
+			for (uint32_t i = 0; i < stages.size(); i++) {
+				DecodeBindings(state.vertex_info[i].stage, draw.bindings[i]);
+			}
+			DecodeBindings(state.ps_input_info.stage, draw.bindings[3]);
+			draw.decoded = true;
+		}
+	}
+	const auto miss = IR::EndSpeculation();
+	PipelineCache::SetHeapPeeks(nullptr);
+	switch (miss) {
+		case IR::SpeculativeMiss::None: break;
+		case IR::SpeculativeMiss::WalkerFault:
+			Common::DebugCounters::Add(Counter::DrawPrepFaults);
+			break;
+		case IR::SpeculativeMiss::Memory:
+			Common::DebugCounters::Add(Counter::DrawPrepMemory);
+			break;
+		case IR::SpeculativeMiss::ImageHeap:
+			Common::DebugCounters::Add(Counter::DrawPrepHeap);
+			break;
+		case IR::SpeculativeMiss::Program:
+			Common::DebugCounters::Add(Counter::DrawPrepMissing);
+			break;
+	}
+	ready = ready && miss == IR::SpeculativeMiss::None;
+	if (ready) {
+		Common::DebugCounters::Add(Counter::DrawPrepReady);
+		if (draw.decoded && m_context.GetBufferCache().PrestreamEnabled()) {
+			PrestreamBuffers(draw);
+		}
+	}
+	Common::DebugCounters::AddSince(Counter::DrawPrepNs, start);
+	return ready;
+}
+
+void RenderExecutor::PrestreamBuffers(QueuedDraw& draw) {
+	std::array<PreparedBindings*, 4> stages {};
+	uint32_t                         count = 0;
+	for (uint32_t i = 0; i < draw.state.VertexStages().size(); i++) {
+		stages[count++] = &draw.bindings[i];
+	}
+	if (draw.state.ps_active) {
+		stages[count++] = &draw.bindings[3];
+	}
+	const auto decoded = std::span {stages.data(), count};
+	// The same ranges the commit's FindBuffers decodes.
+	DecodeBuffers(decoded);
+	auto& cache = m_context.GetBufferCache();
+	cache.BeginPrestream(draw.prestream);
+	for (const auto* stage: decoded) {
+		for (const auto& resource: stage->runtime->module->info.info.buffers) {
+			if (resource.descriptor_index == UINT32_MAX || resource.written) continue;
+			const auto& source = stage->buffer_sources[resource.descriptor_index];
+			if (source.address != 0 && source.size != 0) {
+				cache.Prestream(draw.prestream, source.address, source.size);
+			}
+		}
+	}
+}
+
+bool RenderExecutor::AcquirePeekedHeaps(const QueuedDraw& draw) {
+	auto& heap = m_context.GetImageHeap();
+	bool  same = true;
+	// Every view is acquired, as the GPU thread's own programs would, even after a change.
+	for (const auto& peek: draw.heap_peeks) {
+		auto request = peek.request;
+		request.root = &peek.root;
+		ShaderRecompiler::IR::ImageHeapView view;
+		const bool                          acquired = heap.Acquire(request, view);
+		same = same && acquired && view.slots == peek.slots && view.slot_count == peek.slot_count &&
+		       std::ranges::equal(view.kinds, peek.kinds);
+	}
+	return same;
+}
+
+void RenderExecutor::VerifyPreparedPrograms(const CommandBuffer& buffer, DrawRenderState& state) {
+	if (m_verify_state == nullptr) {
+		m_verify_state = std::make_unique<DrawRenderState>();
+	}
+	auto& check = *m_verify_state;
+	check       = DrawRenderState {.indirect_offsets = state.indirect_offsets,
+	                               .indirect_draw    = state.indirect_draw,
+	                               .resources        = &m_draw_resources};
+	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, check);
+	const auto same_stage = [&](const ShaderStageRuntime& prepared,
+	                            const ShaderStageRuntime& serial, uint32_t stage) {
+		if (prepared.module != serial.module) return false;
+		if (serial.module == nullptr) return true;
+		const auto& x = *prepared.resources;
+		const auto& y = *serial.resources;
+		return x.buffers == y.buffers && x.images == y.images && x.samplers == y.samplers &&
+		       x.flattened_srt == y.flattened_srt && x.user_data == y.user_data &&
+		       (*state.resources)[stage].specialization == m_draw_resources[stage].specialization;
+	};
+	bool same =
+	    check.ps_active == state.ps_active && check.mrt_mask == state.mrt_mask &&
+	    (!check.ps_active || same_stage(state.ps_input_info.stage, check.ps_input_info.stage, 3));
+	for (uint32_t i = 0; i < check.vertex_info.size(); i++) {
+		same = same && same_stage(state.vertex_info[i].stage, check.vertex_info[i].stage, i);
+	}
+	if (same) {
+		return;
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawPrepMismatches);
+	static std::atomic<uint32_t> logged = 0;
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		const auto* vs = check.vertex_info[0].stage.module;
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Draw prep: worker programs differ from the GPU thread's (vs module 0x{:016x}).\n",
+		    vs != nullptr ? vs->id : 0));
+	}
+	state.vertex_info     = check.vertex_info;
+	state.ps_input_info   = check.ps_input_info;
+	state.ps_active       = check.ps_active;
+	state.mrt_mask        = check.mrt_mask;
+	state.resources       = &m_draw_resources;
+	m_commit_job->decoded = false;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	if (Common::DebugCounters::g_skip_draws.load(std::memory_order_relaxed)) {
+		return true;
+	}
+	if (const std::array<uint64_t, 6> words {
+	        args.vertex_count, args.instance_count, args.first_vertex, args.first_instance,
+	        args.render_target_slice_offset, args.indirect.address};
+	    CrossFrameRepeat(m_context, buffer, words)) {
 		return true;
 	}
 	Common::DebugCounters::SetDrawPhase("DrawSetup/Pending");
@@ -1626,15 +2911,34 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		     args.vertex_count, args.instance_count, args.first_vertex, args.first_instance);
 	}
 
-	uc_check(ucfg);
+	const std::array<uint64_t, 7> replay_args {args.vertex_count,
+	                                           args.instance_count,
+	                                           static_cast<uint32_t>(args.first_vertex),
+	                                           args.first_instance,
+	                                           args.render_target_slice_offset,
+	                                           args.indirect.address,
+	                                           uint64_t {1} << 63u};
 
-	hw_check(buffer);
+	const bool registers_repeat = BeginDrawReplay(buffer, replay_args);
+	Common::DebugCounters::SetDrawPhase("DrawSetup/Checks");
+	// A record holds registers that passed these checks.
+	if (!registers_repeat) {
+		uc_check(ucfg);
+		hw_check(buffer);
+	}
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto, args.vertex_count,
 	                         args.instance_count, args.first_instance};
 
-	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
-	                       .indirect_draw    = args.indirect.address != 0};
+	// A draw the worker prepared commits with the state it prepared. Only the other draws
+	// value-initialize a state of their own: it is about 17 KB.
+	std::optional<DrawRenderState> serial_state;
+	if (m_commit_job == nullptr) {
+		serial_state.emplace();
+		serial_state->indirect_offsets = args.indirect.offsets;
+		serial_state->indirect_draw    = args.indirect.address != 0;
+	}
+	DrawRenderState& state = m_commit_job != nullptr ? m_commit_job->state : *serial_state;
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		ResetBindings();
 		return true;

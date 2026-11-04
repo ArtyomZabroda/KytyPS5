@@ -10,11 +10,17 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <array>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <source_location>
 #include <span>
+#include <stop_token>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -40,14 +46,6 @@ struct TextureShapeKeyHash {
 	[[nodiscard]] size_t operator()(const TextureShapeKey& key) const noexcept;
 };
 
-struct TextureShape {
-	TextureCache::ImageDesc desc;
-	vk::Format              pixel_format      = vk::Format::eUndefined;
-	vk::Format              view_format       = vk::Format::eUndefined;
-	bool                    shader_conversion = false;
-	// Metadata, view and storage checks follow the heap mapping test, as they did per draw.
-	bool complete = false;
-};
 struct RenderExecutorTestAccess;
 
 enum class CommandBufferDebugOp : uint32_t {
@@ -150,6 +148,20 @@ public:
 	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
 
+	// The registers the accessors above return. A queued draw commits with its own copies.
+	struct RegisterSet {
+		HW::Context*    registers   = nullptr;
+		HW::UserConfig* user_config = nullptr;
+		HW::Shader*     shaders     = nullptr;
+	};
+	RegisterSet SwapRegisters(const RegisterSet& set) noexcept {
+		const RegisterSet previous {m_registers, m_user_config, m_shaders};
+		m_registers   = set.registers;
+		m_user_config = set.user_config;
+		m_shaders     = set.shaders;
+		return previous;
+	}
+
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
 	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
@@ -201,7 +213,20 @@ public:
 	                      uint32_t mode, bool async_compute);
 	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 
-	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	// --parallel-draw-prep: draws wait in order, each with a copy of the registers, until they
+	// commit, while a worker thread prepares them. Without the flag they are drawn at once.
+	void QueueDrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	void QueueDrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	void CommitQueuedDraws(CommandBuffer& buffer);
+	[[nodiscard]] bool HasQueuedDraws() const noexcept { return m_queue_head != m_queue_tail; }
+
+	// Decoding reads only the stage's snapshot; the other steps use the caches.
+	void DecodeBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	// With decoded, takes its decoding instead of decoding again.
+	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared,
+	                     PreparedBindings* decoded = nullptr);
+	void DecodeBuffers(std::span<PreparedBindings* const> stages);
+	void FindDecodedBuffers(std::span<PreparedBindings* const> stages);
 	void FindBuffers(std::span<PreparedBindings* const> stages);
 	void RebindBuffers(PreparedBindings& bindings);
 	void RebindImages(PreparedBindings& bindings);
@@ -210,6 +235,10 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] DecodedTexture DecodeTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                           const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] TextureBinding BindTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                         DecodedTexture&                            decoded);
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
@@ -228,6 +257,12 @@ private:
 	                              bool ignore_target_mask = false, bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
+	// The registers alone decide whether DepthStencilCopy copies.
+	struct DepthStencilCopies {
+		bool depth   = false;
+		bool stencil = false;
+	};
+	[[nodiscard]] static DepthStencilCopies FindDepthStencilCopies(const HW::Context& hw);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                    const DrawEmitInfo& emit, DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -253,6 +288,48 @@ private:
 	                                         CommandBuffer& command, uint32_t group_x,
 	                                         uint32_t group_y, uint32_t group_z, uint32_t mode);
 
+	// A queued draw with copies of its registers, and what the worker prepared for it.
+	struct QueuedDraw {
+		// Changed under m_prep_mutex. The worker owns the draw while it is Preparing.
+		enum class Prep : uint8_t { Queued, Preparing, Ready, Serial };
+		HW::Context    registers;
+		HW::UserConfig user_config;
+		HW::Shader     shaders;
+		uint64_t       submit_id = 0;
+		bool           indexed   = false;
+		DrawIndexArgs  index_args;
+		DrawAutoArgs   auto_args;
+		Prep           prep = Prep::Queued;
+		// What the preparation depends on besides the registers, checked at commit.
+		uint64_t dirty_epoch        = 0;
+		uint64_t program_generation = 0;
+		// Whether bindings hold the decoding of the stages: vertex 0-2, pixel 3.
+		bool                              decoded = false;
+		DrawRenderState                   state;
+		std::array<DrawStageResources, 4> resources;
+		std::array<PreparedBindings, 4>   bindings;
+		// --parallel-heap-prep: the image heap views the programs used, acquired again at commit.
+		std::vector<ShaderRecompiler::IR::ImageHeapPeek> heap_peeks;
+		// --parallel-buffer-prep: buffer bytes the worker copied for the commit.
+		BufferCache::PrestreamDraw prestream;
+	};
+	static constexpr size_t MaxQueuedDraws = 32;
+
+	QueuedDraw&        QueueDraw(uint64_t submit_id, CommandBuffer& buffer);
+	void               PublishQueuedDraw(CommandBuffer& buffer);
+	[[nodiscard]] bool OldestDrawSettled();
+	void               CommitOldestDraw(CommandBuffer& buffer);
+	void               RunDrawPrepWorker(const std::stop_token& stop);
+	[[nodiscard]] bool PrepareQueuedDraw(QueuedDraw& draw);
+	// --verify-draw-prep compares these with the GPU thread's own results.
+	void VerifyPreparedPrograms(const CommandBuffer& buffer, DrawRenderState& state);
+	// Acquires the views the worker used; false if any changed since.
+	[[nodiscard]] bool AcquirePeekedHeaps(const QueuedDraw& draw);
+	// Worker: copies the draw's small read-only CPU-written buffers ahead of its commit.
+	void PrestreamBuffers(QueuedDraw& draw);
+	void AdoptDecodedBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared,
+	                          PreparedBindings& decoded);
+
 	RenderContext&       m_context;
 	GraphicsBindings     m_graphics_bindings;
 	PreparedBindings     m_compute_bindings;
@@ -273,6 +350,22 @@ private:
 	vk::DescriptorSetLayout m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout      m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline            m_pssr_pipeline          = nullptr;
+	// The resources of the draw being prepared; reused, so they keep their capacity.
+	std::array<DrawStageResources, 4> m_draw_resources;
+	// The ring of queued draws: committed up to m_queue_head, published up to m_queue_tail, and
+	// taken by the worker from m_prep_next. The GPU thread moves head and tail under m_prep_mutex.
+	std::array<std::unique_ptr<QueuedDraw>, MaxQueuedDraws> m_queued_draws;
+	size_t                                                  m_queue_head = 0;
+	size_t                                                  m_queue_tail = 0;
+	size_t                                                  m_prep_next  = 0;
+	std::mutex                                              m_prep_mutex;
+	std::condition_variable_any                             m_prep_work;
+	std::condition_variable                                 m_prep_done;
+	// The draw committing with its preparation, if any.
+	QueuedDraw*                      m_commit_job = nullptr;
+	std::unique_ptr<DrawRenderState> m_verify_state;
+	// Last, so it stops before the members it uses are destroyed.
+	std::jthread m_prep_worker;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

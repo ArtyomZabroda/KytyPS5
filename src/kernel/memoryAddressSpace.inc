@@ -270,6 +270,33 @@ public:
 		return true;
 	}
 
+	// A range inside one mapping: its offset in the backing.
+	bool TranslateBacking(uint64_t vaddr, uint64_t size, uint64_t* backing_offset) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		auto&            hint = t_read_hints.entries[ReadHintSlot(vaddr)];
+		if (hint.generation == m_generation && vaddr >= hint.vaddr &&
+		    vaddr + size <= hint.vaddr + hint.size) {
+			*backing_offset = hint.backing_offset + vaddr - hint.vaddr;
+			return true;
+		}
+		auto mapping = m_maps.upper_bound(vaddr);
+		if (mapping == m_maps.begin()) {
+			return false;
+		}
+		--mapping;
+		const auto& entry = mapping->second;
+		if (vaddr < entry.vaddr || vaddr + size > entry.vaddr + entry.size ||
+		    !RangeOk(entry.backing_offset + vaddr - entry.vaddr, size)) {
+			return false;
+		}
+		hint            = {m_generation, entry.vaddr, entry.size, entry.backing_offset};
+		*backing_offset = entry.backing_offset + vaddr - entry.vaddr;
+		return true;
+	}
+
 	template <typename Gap>
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
@@ -733,6 +760,52 @@ private:
 	uint64_t                     m_generation = NextGeneration();
 };
 
+// An exclusive hold of the address-space lock, timed from acquisition to release.
+class TimedExclusiveLock final {
+public:
+	using Counter = Common::DebugCounters::Counter;
+	TimedExclusiveLock(std::shared_mutex& mutex, Counter holds, Counter ns)
+	    : m_lock(mutex), m_holds(holds), m_ns(ns),
+	      m_start(Common::DebugCounters::Enabled() ? std::chrono::steady_clock::now()
+	                                               : std::chrono::steady_clock::time_point {}) {}
+	~TimedExclusiveLock() {
+		if (m_start == std::chrono::steady_clock::time_point {}) {
+			return;
+		}
+		const auto held = std::chrono::steady_clock::now() - m_start;
+		Common::DebugCounters::Add(m_holds);
+		Common::DebugCounters::Add(
+		    m_ns, static_cast<uint64_t>(
+		              std::chrono::duration_cast<std::chrono::nanoseconds>(held).count()));
+	}
+	TimedExclusiveLock(const TimedExclusiveLock&)            = delete;
+	TimedExclusiveLock& operator=(const TimedExclusiveLock&) = delete;
+
+private:
+	std::lock_guard<std::shared_mutex>    m_lock;
+	Counter                               m_holds;
+	Counter                               m_ns;
+	std::chrono::steady_clock::time_point m_start;
+};
+
+// Takes a shared hold of the address-space lock, timing the wait when a writer holds it.
+static void LockSharedTimed(std::shared_lock<std::shared_mutex>& lock,
+                            Common::DebugCounters::Counter wait_ns) {
+	if (lock.try_lock()) {
+		return;
+	}
+	if (!Common::DebugCounters::Enabled()) {
+		lock.lock();
+		return;
+	}
+	const auto start = std::chrono::steady_clock::now();
+	lock.lock();
+	Common::DebugCounters::Add(wait_ns, static_cast<uint64_t>(
+	                                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                            std::chrono::steady_clock::now() - start)
+	                                            .count()));
+}
+
 class GuestAddressSpace {
 public:
 	explicit GuestAddressSpace(uint64_t backing_size) {
@@ -830,13 +903,32 @@ public:
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
 
+	// A range inside one backing mapping holds no private mapping.
+	bool TranslateBacking(uint64_t vaddr, uint64_t size, uint64_t* backing_offset) {
+		return m_backing->TranslateBacking(vaddr, size, backing_offset);
+	}
+
 	template <bool copy_private>
 	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
 		if (data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
+		// --fast-guest-reads: a range that backing mappings cover is owned and holds no private
+		// mapping, so it is read under the backing lock alone, without waiting for a map or unmap.
+		if (Config::FastGuestReadsEnabled() && m_backing->TryReadBacking(vaddr, data, size)) {
+			return true;
+		}
 		// One shared lock for the ownership test and the copy; draws copy many small buffers.
-		std::shared_lock lock(m_mutex);
+		std::shared_lock lock(m_mutex, std::defer_lock);
+		if (!lock.try_lock()) {
+			// Draw bindings time the wait for a writer, such as a map or an unmap.
+			std::optional<Common::DebugCounters::ScopedDrawSubPhase> phase;
+			if (std::strncmp(Common::DebugCounters::CurrentDrawPhase(), "PrepareGraphicsBindings/B",
+			                 25) == 0) {
+				phase.emplace("PrepareGraphicsBindings/BLock");
+			}
+			LockSharedTimed(lock, Common::DebugCounters::Counter::AddressLockReadWaitNs);
+		}
 		if (!std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			    return vaddr >= range.first && vaddr + size <= range.first + range.second;
 		    })) {
@@ -872,7 +964,8 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		const TimedExclusiveLock lock(m_mutex, TimedExclusiveLock::Counter::AddressLockProtects,
+		                              TimedExclusiveLock::Counter::AddressLockProtectNs);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
@@ -881,14 +974,21 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		std::shared_lock lock(m_mutex);
+		// --fast-guest-reads: a range inside backing views is protected under the backing lock
+		// alone; anything else, such as a private mapping, takes the path below.
+		if (Config::FastGuestReadsEnabled() && m_backing->ProtectViews(vaddr, size, mode)) {
+			return true;
+		}
+		std::shared_lock lock(m_mutex, std::defer_lock);
+		LockSharedTimed(lock, Common::DebugCounters::Counter::AddressLockProtectWaitNs);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
-		std::lock_guard lock(m_mutex);
+		const TimedExclusiveLock lock(m_mutex, TimedExclusiveLock::Counter::AddressLockMaps,
+		                              TimedExclusiveLock::Counter::AddressLockMapNs);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		const bool replacing = ContainsMappedUnlocked(vaddr, size, MappingType::Backing);
 #else
@@ -916,7 +1016,8 @@ public:
 	}
 
 	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
-		std::lock_guard lock(m_mutex);
+		const TimedExclusiveLock lock(m_mutex, TimedExclusiveLock::Counter::AddressLockUnmaps,
+		                              TimedExclusiveLock::Counter::AddressLockUnmapNs);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
 			return false;
 		}
@@ -976,7 +1077,8 @@ public:
 	}
 
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-		std::lock_guard lock(m_mutex);
+		const TimedExclusiveLock lock(m_mutex, TimedExclusiveLock::Counter::AddressLockCommits,
+		                              TimedExclusiveLock::Counter::AddressLockCommitNs);
 		if (!ConsumeUnlocked(vaddr, size)) {
 			return false;
 		}
@@ -1011,7 +1113,8 @@ public:
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		const TimedExclusiveLock lock(m_mutex, TimedExclusiveLock::Counter::AddressLockReleases,
+		                              TimedExclusiveLock::Counter::AddressLockReleaseNs);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Private)) {
 			return false;
 		}

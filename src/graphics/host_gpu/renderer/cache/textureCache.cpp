@@ -1241,13 +1241,212 @@ void TextureCache::ReportUploads() {
 	});
 }
 
+static ColorClearStamp::Key MakeColorClearKey(const TextureCache::ImageDesc& desc,
+                                              uint32_t                       metadata_base_layer) {
+	const auto& info     = desc.info;
+	const auto& metadata = info.metadata;
+	const auto& view     = desc.view_info;
+	return {.metadata_address    = metadata.range.address,
+	        .metadata_size       = metadata.range.size,
+	        .clear_word          = metadata.clear_word,
+	        .control             = metadata.control,
+	        .metadata_flags      = static_cast<uint32_t>(metadata.kind) |
+	                               static_cast<uint32_t>(metadata.compression) << 8u |
+	                               (metadata.stencil_compressed ? 1u << 16u : 0u) |
+	                               (metadata.clear_register_valid ? 1u << 17u : 0u) |
+	                               (metadata.dcc_alpha_msb ? 1u << 18u : 0u),
+	        .view_format         = static_cast<uint32_t>(view.format),
+	        .view_type           = static_cast<uint32_t>(view.type),
+	        .base_level          = view.base_level,
+	        .level_count         = view.level_count,
+	        .base_layer          = view.base_layer,
+	        .layer_count         = view.layer_count,
+	        .pixel_format        = static_cast<uint32_t>(info.pixel_format),
+	        .guest_format        = static_cast<uint32_t>(info.guest_format),
+	        .image_type          = static_cast<uint32_t>(info.type),
+	        .width               = info.extent.width,
+	        .height              = info.extent.height,
+	        .depth               = info.extent.depth,
+	        .levels              = info.resources.levels,
+	        .layers              = info.resources.layers,
+	        .tile_mode           = static_cast<uint32_t>(info.tile_mode),
+	        .bytes_per_block     = info.bytes_per_block,
+	        .binding             = static_cast<uint32_t>(desc.type),
+	        .metadata_base_layer = metadata_base_layer};
+}
+
+// With --fast-color-clear-checks, a full path that found nothing to do leaves a stamp in the
+// image. While its inputs and generations hold, the full path would find nothing again.
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                          uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
 	}
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::ColorClearMaterializes);
+	namespace Counters = Common::DebugCounters;
+	Counters::Add(Counters::Counter::ColorClearMaterializes);
+	// Timed as a part of the draw phase that looked the image up.
+	std::optional<Counters::ScopedDrawSubPhase> phase;
+	if (Counters::Enabled()) {
+		const std::string_view current = Counters::CurrentDrawPhase();
+		if (current.starts_with("PrepareBindings")) {
+			phase.emplace("PrepareBindings/Clear");
+		} else if (current.starts_with("ResolveRenderColorTarget")) {
+			phase.emplace("ResolveRenderColorTarget/Clear");
+		} else if (current.starts_with("PrepareGraphicsBindings")) {
+			phase.emplace("PrepareGraphicsBindings/Clear");
+		}
+	}
+	if (!Config::FastColorClearChecksEnabled() ||
+	    !m_color_clear_stamps.load(std::memory_order_relaxed)) {
+		(void)MaterializeColorClearFull(id, desc, metadata_base_layer, nullptr);
+		return;
+	}
+	// Generations are taken before the full path reads anything, so a change during it leaves
+	// the new stamp stale.
+	ColorClearStamp fresh {.key              = MakeColorClearKey(desc, metadata_base_layer),
+	                       .check_generation = m_buffer_cache.ColorCheckGeneration()};
+
+	std::array<ColorClearStamp, 2> stamps {};
+	uint64_t                       serial = 0;
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image   = m_slot_images[id];
+		image.info.metadata      = desc.info.metadata;
+		fresh.surface_generation = m_surface_meta_generation;
+		stamps                   = image.color_clear_stamps;
+		serial                   = image.serial;
+	}
+	for (const auto& stamp: stamps) {
+		if (stamp.kind == ColorClearStamp::Kind::None || stamp.key != fresh.key ||
+		    stamp.surface_generation != fresh.surface_generation) {
+			continue;
+		}
+		if (!IsColorClearStampCurrent(stamp)) {
+			Counters::Add(Counters::Counter::ColorClearStampStale);
+			break;
+		}
+		Counters::Add(Counters::Counter::ColorClearStampHits);
+		// Every 16th hit runs the full path, which must find nothing to do either.
+		if ((++m_color_clear_stamp_hits & 15u) != 0) {
+			return;
+		}
+		Counters::Add(Counters::Counter::ColorClearStampVerifies);
+		if (MaterializeColorClearFull(id, desc, metadata_base_layer, nullptr) ==
+		    ColorClearOutcome::Acted) {
+			ReportColorClearStampMismatch(stamp);
+		}
+		return;
+	}
+	Counters::Add(Counters::Counter::ColorClearStampMisses);
+	const auto outcome = MaterializeColorClearFull(id, desc, metadata_base_layer, &fresh);
+	if (!CompleteColorClearStamp(outcome, fresh)) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	if (image.serial == serial) {
+		auto& kept = image.color_clear_stamps;
+		if (kept[0].key != fresh.key) {
+			kept[1] = kept[0];
+		}
+		kept[0] = fresh;
+		Counters::Add(Counters::Counter::ColorClearStampsStored);
+	}
+}
+
+bool TextureCache::CopyColorClearStamps(ImageId id, std::vector<ColorClearStamp>& out) {
+	std::array<ColorClearStamp, 2> stamps {};
+	uint64_t                       surface_generation = 0;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto&      image = m_slot_images[id];
+		if (image.info.metadata.kind != ImageMetadataKind::Dcc &&
+		    image.info.metadata.kind != ImageMetadataKind::Cmask) {
+			return true;
+		}
+		stamps             = image.color_clear_stamps;
+		surface_generation = m_surface_meta_generation;
+	}
+	bool found = false;
+	for (const auto& stamp: stamps) {
+		if (stamp.kind != ColorClearStamp::Kind::None &&
+		    stamp.surface_generation == surface_generation && IsColorClearStampCurrent(stamp)) {
+			out.push_back(stamp);
+			found = true;
+		}
+	}
+	return found;
+}
+
+bool TextureCache::ColorClearStampsHold(std::span<const ColorClearStamp> stamps) {
+	uint64_t surface_generation = 0;
+	{
+		std::scoped_lock lock {m_lock};
+		surface_generation = m_surface_meta_generation;
+	}
+	return std::ranges::all_of(stamps, [&](const ColorClearStamp& stamp) {
+		return stamp.surface_generation == surface_generation && IsColorClearStampCurrent(stamp);
+	});
+}
+
+bool TextureCache::IsColorClearStampCurrent(const ColorClearStamp& stamp) {
+	switch (stamp.kind) {
+		case ColorClearStamp::Kind::Trivial: return true;
+		case ColorClearStamp::Kind::GpuChecked:
+			// Checks are only added until one is dropped, so the metadata stays checked.
+			return stamp.check_generation == m_buffer_cache.ColorCheckGeneration() &&
+			       m_buffer_cache.IsRegionGpuModified(stamp.viewed_address, stamp.viewed_size);
+		case ColorClearStamp::Kind::Cpu: {
+			// No CPU or GPU write and no backing write since: the same bytes, never GPU-dirty.
+			const auto [cpu, gpu] =
+			    m_buffer_cache.DirtyGenerations(stamp.viewed_address, stamp.viewed_size);
+			return cpu == stamp.cpu_generation && gpu == stamp.gpu_generation &&
+			       LibKernel::Memory::BackingWriteGeneration() == stamp.backing_generation;
+		}
+		default: return false;
+	}
+}
+
+bool TextureCache::CompleteColorClearStamp(ColorClearOutcome outcome, ColorClearStamp& stamp) {
+	namespace Counters = Common::DebugCounters;
+	switch (outcome) {
+		case ColorClearOutcome::Trivial: stamp.kind = ColorClearStamp::Kind::Trivial; return true;
+		case ColorClearOutcome::GpuChecked:
+			stamp.kind = ColorClearStamp::Kind::GpuChecked;
+			return true;
+		case ColorClearOutcome::Cpu: break;
+		default: return false;
+	}
+	// The tracker sees CPU writes only to clean, write-protected pages. Uploading the bytes
+	// just read makes them so, and keeps the generations.
+	if (m_buffer_cache.IsRegionCpuModified(stamp.viewed_address, stamp.viewed_size)) {
+		Counters::Add(Counters::Counter::ColorClearStampUploads);
+		(void)m_buffer_cache.ObtainBuffer(stamp.viewed_address, stamp.viewed_size, false);
+	}
+	if (stamp.cpu_generation == 0 || stamp.gpu_generation == 0) {
+		Counters::Add(Counters::Counter::ColorClearStampUntracked);
+		return false;
+	}
+	stamp.kind = ColorClearStamp::Kind::Cpu;
+	return IsColorClearStampCurrent(stamp);
+}
+
+void TextureCache::ReportColorClearStampMismatch(const ColorClearStamp& stamp) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::ColorClearStampMismatch);
+	m_color_clear_stamps.store(false, std::memory_order_relaxed);
+	const auto number = ++m_color_clear_stamp_mismatches;
+	if (number <= 16) {
+		LOGF_COLOR(Log::Color::BrightRed,
+		           "TextureCache: color clear stamp mismatch #%u (kind %u) at 0x%016" PRIx64
+		           ": the full path had work to do; stamps are off\n",
+		           number, static_cast<uint32_t>(stamp.kind), stamp.key.metadata_address);
+	}
+}
+
+TextureCache::ColorClearOutcome
+TextureCache::MaterializeColorClearFull(ImageId id, const ImageDesc& desc,
+                                        uint32_t metadata_base_layer, ColorClearStamp* stamp) {
 	const auto  range = desc.info.metadata.range;
 	const auto& view  = desc.view_info;
 	{
@@ -1257,7 +1456,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// Native color metadata must not retain a reused HTile clear flag.
 		m_surface_metas.erase(range.address);
 		if (range.size == 0 || view.level_count != 1) {
-			return;
+			return ColorClearOutcome::Trivial;
 		}
 	}
 	const auto layers = desc.info.TransferLayers();
@@ -1288,12 +1487,20 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		mip = mips[view.base_level];
 	}
 	if (mip.size == 0) {
-		return;
+		return ColorClearOutcome::Trivial;
 	}
 	const GuestRange viewed {range.address + slice_size * first + mip.offset,
 	                         slice_size * (count - 1) + mip.size};
 	const auto       run = [&](uint32_t slice) { return viewed.address + slice_size * slice; };
-	const bool       gpu_modified = m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size);
+	if (stamp != nullptr) {
+		// Taken before the GPU-modified query, so a GPU write after it changes the generation.
+		std::tie(stamp->cpu_generation, stamp->gpu_generation) =
+		    m_buffer_cache.DirtyGenerations(viewed.address, viewed.size);
+		stamp->backing_generation = LibKernel::Memory::BackingWriteGeneration();
+		stamp->viewed_address     = viewed.address;
+		stamp->viewed_size        = viewed.size;
+	}
+	const bool gpu_modified = m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size);
 	if (gpu_modified) {
 		std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
 		uint32_t                                                      keys = 0;
@@ -1310,7 +1517,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			checked = m_buffer_cache.IsColorMetadataChecked(run(slice), mip.size, keys);
 		}
 		if (checked) {
-			return;
+			return ColorClearOutcome::GpuChecked;
 		}
 		{
 			std::scoped_lock lock {m_lock};
@@ -1357,7 +1564,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				}
 				command.endRendering();
 				CommitGpuWrite(image);
-				return;
+				return ColorClearOutcome::Acted;
 			}
 		}
 		// Finish native metadata writes before reading backing bytes. This can submit the
@@ -1383,7 +1590,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		Counters::Add(Counters::Counter::ColorClearGuestChecks);
 	}
 	thread_local std::vector<uint8_t> color_clear_bytes;
-	auto&                             bytes = color_clear_bytes;
+	auto&                             bytes   = color_clear_bytes;
+	bool                              cleared = false;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = run(slice);
 		const auto guest   = reinterpret_cast<const uint8_t*>(address);
@@ -1427,6 +1635,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!uniform) {
 			continue;
 		}
+		cleared = true;
 		{
 			std::scoped_lock lock {m_lock};
 			const auto&      image = m_slot_images[id];
@@ -1448,6 +1657,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			LibKernel::Memory::WriteBacking(address, bytes.data(), mip.size);
 		}
 	}
+	return gpu_modified || cleared ? ColorClearOutcome::Acted : ColorClearOutcome::Cpu;
 }
 
 void TextureCache::ReportColorClearMismatch(const char* what, uint64_t address, uint32_t guest,
@@ -1935,6 +2145,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] =
 		    m_surface_metas.try_emplace(desc.info.metadata.range.address);
+		if (inserted) {
+			m_surface_meta_generation++;
+		}
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}
@@ -2315,10 +2528,12 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
 	                                                 nullptr, 1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
-		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
-	});
+	m_scheduler.DeferPriorityOperation(
+	    [&download, range, mapped, offset] {
+		    download.Invalidate(offset, range.size);
+		    LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+	    },
+	    range.address, range.size);
 	return true;
 }
 

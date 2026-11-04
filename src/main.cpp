@@ -129,6 +129,31 @@ static void PrintUsage() {
 	::printf(
 	    "  --pin-gpu-threads                    Pin the GPU thread and the recording thread to "
 	    "two different physical cores.\n");
+	::printf("  --deferred-eop-labels                Write end-of-pipe labels after the GPU "
+	         "finishes their work (experiment).\n");
+	::printf("  --zero-copy-buffers                  Serve small CPU-written buffers from imported "
+	         "guest memory (experiment).\n");
+	::printf("  --parallel-draw-prep                 Prepare queued draws on a worker thread "
+	         "(experiment).\n");
+	::printf("  --verify-draw-prep                   Check worker-prepared draws on the GPU "
+	         "thread.\n");
+	::printf("  --fast-unmap                         Wait for the GPU on unmap only when needed "
+	         "(experiment).\n");
+	::printf("  --fast-guest-reads                   Read mapped guest memory without waiting for "
+	         "maps (experiment).\n");
+	::printf("  --parallel-heap-prep                 Let --parallel-draw-prep prepare image heap "
+	         "draws (experiment).\n");
+	::printf("  --parallel-buffer-prep               Let --parallel-draw-prep copy small buffers "
+	         "ahead (experiment).\n");
+	::printf("  --xframe-draw-stats                  Count draws that repeat across frames.\n");
+	::printf("  --xframe-skip-repeats                Do not render repeated draws (wrong frames, "
+	         "measurement only).\n");
+	::printf("  --draw-records-verify                Check what records of repeated draws would "
+	         "prepare (diagnostics).\n");
+	::printf("  --draw-records                       Prepare repeated draws from records "
+	         "(experiment).\n");
+	::printf("  --fast-color-clear-checks            Skip unchanged DCC/CMASK clear checks "
+	         "(experiment).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -255,6 +280,19 @@ static constexpr Flag FLAGS[] = {
     {"--no-image-barrier-merge", &ConfigOptions::image_barrier_merge_enabled, false},
     {"--threaded-recording", &ConfigOptions::threaded_recording_enabled},
     {"--pin-gpu-threads", &ConfigOptions::pin_gpu_threads_enabled},
+    {"--deferred-eop-labels", &ConfigOptions::deferred_eop_labels_enabled},
+    {"--zero-copy-buffers", &ConfigOptions::zero_copy_buffers_enabled},
+    {"--parallel-draw-prep", &ConfigOptions::parallel_draw_prep_enabled},
+    {"--verify-draw-prep", &ConfigOptions::verify_draw_prep_enabled},
+    {"--fast-unmap", &ConfigOptions::fast_unmap_enabled},
+    {"--fast-guest-reads", &ConfigOptions::fast_guest_reads_enabled},
+    {"--parallel-heap-prep", &ConfigOptions::parallel_heap_prep_enabled},
+    {"--parallel-buffer-prep", &ConfigOptions::parallel_buffer_prep_enabled},
+    {"--xframe-draw-stats", &ConfigOptions::xframe_draw_stats_enabled},
+    {"--xframe-skip-repeats", &ConfigOptions::xframe_skip_repeats_enabled},
+    {"--draw-records-verify", &ConfigOptions::draw_records_verify_enabled},
+    {"--draw-records", &ConfigOptions::draw_records_enabled},
+    {"--fast-color-clear-checks", &ConfigOptions::fast_color_clear_checks_enabled},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
 #endif

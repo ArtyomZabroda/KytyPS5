@@ -35,6 +35,7 @@
 #include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -633,48 +634,70 @@ static TextureShape ResolveTextureShape(const ShaderRecompiler::IR::ImageResourc
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
+	auto decoded = DecodeTexture(resource, value);
+	if (decoded.null) {
+		return {.layout = vk::ImageLayout::eGeneral};
+	}
+	return BindTexture(resource, decoded);
+}
+
+DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                             const ShaderRecompiler::IR::DescriptorValue& value) {
 	using Common::DebugCounters::Counter;
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
-	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
-	const bool storage    = resource.written;
-	if (storage) {
+	DecodedTexture result {.descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value)};
+	const auto&    descriptor = result.descriptor;
+	if (resource.written) {
 		ValidateStorageImageResource(resource);
 	}
-
-	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		return {.layout = vk::ImageLayout::eGeneral};
+		return result;
 	}
 
 	constexpr size_t MaxTextureShapes = 8192;
 	const auto       key              = MakeTextureShapeKey(resource, value);
-	auto             cached           = m_texture_shapes.find(key);
+	// The --parallel-draw-prep worker keeps its own.
+	thread_local std::unordered_map<TextureShapeKey, TextureShape, TextureShapeKeyHash>
+	      worker_shapes;
+	auto& shapes = ShaderRecompiler::IR::Speculating() ? worker_shapes : m_texture_shapes;
+	auto  cached = shapes.find(key);
 	Common::DebugCounters::Add(Counter::TextureShapeLookups);
-	if (cached == m_texture_shapes.end()) {
+	if (cached == shapes.end()) {
 		Common::DebugCounters::Add(Counter::TextureShapeMisses);
-		if (m_texture_shapes.size() >= MaxTextureShapes) {
-			m_texture_shapes.clear();
+		if (shapes.size() >= MaxTextureShapes) {
+			shapes.clear();
 		}
-		cached =
-		    m_texture_shapes.emplace(key, ResolveTextureShape(resource, descriptor, false)).first;
+		cached = shapes.emplace(key, ResolveTextureShape(resource, descriptor, false)).first;
 	}
 	const auto address = descriptor.Base40();
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
 	if (resource.heap && !m_context.IsMapped(address, cached->second.desc.info.data.size)) {
-		return {.layout = vk::ImageLayout::eGeneral};
+		return result;
 	}
 	if (!cached->second.complete) {
 		cached->second = ResolveTextureShape(resource, descriptor, true);
 	}
-	// One binding is returned on every path below, so the description is copied only once.
-	TextureBinding result {.desc = cached->second.desc};
-	auto&          desc         = result.desc;
-	const auto     pixel_format = cached->second.pixel_format;
-	const auto     view_format  = cached->second.view_format;
+	result.shape = cached->second;
+	result.null  = false;
+	return result;
+}
 
-	auto id = texture_cache.FindImage(desc, cached->second.shader_conversion);
+TextureBinding RenderExecutor::BindTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                                           DecodedTexture&                            decoded) {
+	EXIT_IF(decoded.null);
+	const auto& descriptor    = decoded.descriptor;
+	const bool  storage       = resource.written;
+	auto&       texture_cache = m_context.GetTextureCache();
+	// One binding is returned on every path below, so the description is moved only once.
+	TextureBinding result {.desc = std::move(decoded.shape.desc)};
+	auto&          desc         = result.desc;
+	const auto     pixel_format = decoded.shape.pixel_format;
+	const auto     view_format  = decoded.shape.view_format;
+
+	auto id         = texture_cache.FindImage(desc, decoded.shape.shader_conversion);
+	result.found_id = id;
 	if (!id) {
 		// Another extent at the address holds it; the heap retries once an image is created.
 		result.layout = vk::ImageLayout::eGeneral;
@@ -701,19 +724,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	return result;
 }
 
-static vk::Sampler NativeSampler(RenderContext&                                  context,
-                                 const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                 uint32_t                                        index,
-                                 const ShaderRecompiler::IR::DescriptorValue&    value) {
-	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
-	const auto& sampler    = program.info.samplers[index];
+static DecodedSampler DecodeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                    uint32_t                                        index,
+                                    const ShaderRecompiler::IR::DescriptorValue&    value) {
+	const auto&    sampler = program.info.samplers[index];
+	DecodedSampler result {.descriptor     = DecodeNativeDescriptor<ShaderSamplerResource>(value),
+	                       .integer_border = sampler.integer_border};
 	if (!sampler.depth_compare) {
-		descriptor.fields[0] &= ~(0x7u << 12u);
+		result.descriptor.fields[0] &= ~(0x7u << 12u);
 	}
 	if (sampler.force_point_filtering) {
-		descriptor.SetPointFiltering();
+		result.descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
+	return result;
 }
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
@@ -752,9 +775,8 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
-void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
-                                     PreparedBindings&         prepared) {
-	KYTY_PROFILER_FUNCTION();
+void RenderExecutor::DecodeBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared) {
+	const Common::DebugCounters::ScopedDrawSubPhase phase("PrepareBindings/Decode");
 	EXIT_IF(!runtime);
 	const auto& program         = runtime.module->info;
 	const auto& snapshot        = *runtime.resources;
@@ -763,9 +785,79 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.flattened_srt      = {};
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory      = {};
-	prepared.images.resize(program.info.images.size());
-	prepared.samplers.clear();
+	prepared.decoded_images.resize(program.info.images.size());
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		// Heap images are bound through the image heap.
+		prepared.decoded_images[i] =
+		    program.info.images[i].heap ? DecodedTexture {}
+		                                : DecodeTexture(program.info.images[i], snapshot.images[i]);
+	}
+	prepared.decoded_samplers.clear();
+	prepared.decoded_samplers.reserve(program.info.samplers.size());
+	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+		prepared.decoded_samplers.push_back(
+		    DecodeSampler(program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+	}
 	prepared.shader_data.clear();
+	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
+	for (const auto reg: program.info.user_data_registers) {
+		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
+	}
+	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
+}
+
+static bool SameDecoding(const PreparedBindings& a, const PreparedBindings& b) {
+	const auto same_image = [](const DecodedTexture& x, const DecodedTexture& y) {
+		return x.null == y.null &&
+		       std::memcmp(&x.descriptor, &y.descriptor, sizeof(x.descriptor)) == 0 &&
+		       (x.null || (x.shape.pixel_format == y.shape.pixel_format &&
+		                   x.shape.view_format == y.shape.view_format &&
+		                   x.shape.desc.info.data.address == y.shape.desc.info.data.address));
+	};
+	const auto same_sampler = [](const DecodedSampler& x, const DecodedSampler& y) {
+		return x.integer_border == y.integer_border &&
+		       std::memcmp(&x.descriptor, &y.descriptor, sizeof(x.descriptor)) == 0;
+	};
+	return a.shader_data == b.shader_data &&
+	       std::ranges::equal(a.decoded_images, b.decoded_images, same_image) &&
+	       std::ranges::equal(a.decoded_samplers, b.decoded_samplers, same_sampler);
+}
+
+void RenderExecutor::AdoptDecodedBindings(const ShaderStageRuntime& runtime,
+                                          PreparedBindings& prepared, PreparedBindings& decoded) {
+	if (Config::VerifyDrawPrepEnabled()) {
+		DecodeBindings(runtime, prepared);
+		if (!SameDecoding(prepared, decoded)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawPrepMismatches);
+			static std::atomic<uint32_t> logged = 0;
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Draw prep: worker bindings differ from the GPU thread's (module 0x{:016x}).\n",
+				    runtime.module->id));
+			}
+		}
+		return;
+	}
+	prepared.runtime            = &runtime;
+	prepared.gds                = {nullptr, 0, VK_WHOLE_SIZE};
+	prepared.flattened_srt      = {};
+	prepared.shader_data_buffer = {};
+	prepared.shared_memory      = {};
+	prepared.decoded_images.swap(decoded.decoded_images);
+	prepared.decoded_samplers.swap(decoded.decoded_samplers);
+	prepared.shader_data.swap(decoded.shader_data);
+}
+
+void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared,
+                                     PreparedBindings* decoded) {
+	KYTY_PROFILER_FUNCTION();
+	if (decoded != nullptr) {
+		AdoptDecodedBindings(runtime, prepared, *decoded);
+	} else {
+		DecodeBindings(runtime, prepared);
+	}
+	const auto& program = runtime.module->info;
+	prepared.images.resize(program.info.images.size());
 	{
 		const Common::DebugCounters::ScopedDrawSubPhase phase("PrepareBindings/Textures");
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -773,7 +865,20 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				prepared.images[i] = {};
 				continue;
 			}
-			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			auto&          decoded = prepared.decoded_images[i];
+			TextureBinding binding;
+			if (prepared.replay_images != nullptr) {
+				// The lookup's own effects; the descriptor validation held for the same words.
+				binding = (*prepared.replay_images)[i];
+				if (binding.found_id) {
+					m_context.GetTextureCache().RepeatColorClear(
+					    binding.found_id, binding.desc, decoded.shape.desc.view_info.base_layer);
+				}
+			} else if (decoded.null) {
+				binding = TextureBinding {.layout = vk::ImageLayout::eGeneral};
+			} else {
+				binding = BindTexture(program.info.images[i], decoded);
+			}
 			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 			binding.mip_views.swap(prepared.images[i].mip_views);
 			binding.mip_views.clear();
@@ -782,17 +887,18 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 	{
 		const Common::DebugCounters::ScopedDrawSubPhase phase("PrepareBindings/Samplers");
-		prepared.samplers.reserve(program.info.samplers.size());
-		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-			prepared.samplers.push_back(NativeSampler(
-			    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		auto&                                           samplers = m_context.GetSamplerCache();
+		if (prepared.replay_samplers != nullptr) {
+			prepared.samplers = *prepared.replay_samplers;
+		} else {
+			prepared.samplers.clear();
+			prepared.samplers.reserve(prepared.decoded_samplers.size());
+			for (const auto& sampler: prepared.decoded_samplers) {
+				prepared.samplers.push_back(
+				    samplers.GetSampler(sampler.descriptor, sampler.integer_border));
+			}
 		}
 	}
-	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
-	for (const auto reg: program.info.user_data_registers) {
-		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
-	}
-	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
 	if (program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::Gds)] != 0) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
@@ -800,7 +906,28 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
+	DecodeBuffers(stages);
+	FindDecodedBuffers(stages);
+}
+
+void RenderExecutor::FindDecodedBuffers(std::span<PreparedBindings* const> stages) {
 	auto& cache = m_context.GetBufferCache();
+	// In the decoding order, which is the order the cache saw before.
+	for (auto* stage: stages) {
+		if (stage->buffer_sources.empty()) continue;
+		const auto& program = stage->runtime->module->info;
+		for (const auto& metadata: program.info.buffers) {
+			if (metadata.descriptor_index == UINT32_MAX) continue;
+			auto& source = stage->buffer_sources[metadata.descriptor_index];
+			// Decoding clears the sources of null and empty descriptors.
+			if (source.address != 0) {
+				source.id = cache.FindBuffer(source.address, source.size);
+			}
+		}
+	}
+}
+
+void RenderExecutor::DecodeBuffers(std::span<PreparedBindings* const> stages) {
 	for (auto* stage: stages) {
 		auto& prepared = *stage;
 		EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -857,7 +984,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			}
-			source = {address, size, cache.FindBuffer(address, size)};
+			source = {address, size, {}};
 		}
 	}
 }
@@ -944,23 +1071,33 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo>         colors) {
+	using Common::DebugCounters::ScopedDrawSubPhase;
 	bool uses_dma        = false;
 	bool uses_image_heap = false;
-	FindBuffers(stages);
+	{
+		const ScopedDrawSubPhase phase("PrepareGraphicsBindings/Find");
+		FindBuffers(stages);
+	}
 	for (auto* stage: stages) {
 		uses_dma |= stage->runtime->module->info.info.uses_dma;
 		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;
 	}
 	if (uses_dma) {
+		const ScopedDrawSubPhase phase("PrepareGraphicsBindings/Bda");
 		m_context.PrepareBda();
 	}
 	if (uses_image_heap) {
+		const ScopedDrawSubPhase phase("PrepareGraphicsBindings/Heap");
 		m_context.GetImageHeap().Rebind(*this);
 	}
-	for (auto* stage: stages) {
-		RebindImages(*stage);
+	{
+		const ScopedDrawSubPhase phase("PrepareGraphicsBindings/Images");
+		for (auto* stage: stages) {
+			RebindImages(*stage);
+		}
 	}
-	auto& cache = m_context.GetTextureCache();
+	const ScopedDrawSubPhase targets_phase("PrepareGraphicsBindings/Targets");
+	auto&                    cache = m_context.GetTextureCache();
 	for (auto& target: colors) {
 		EXIT_IF(!target.image_id);
 		auto& old_image = cache.m_slot_images[target.image_id];
@@ -974,6 +1111,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
+	const ScopedDrawSubPhase buffers_phase("PrepareGraphicsBindings/Buffers");
 	for (auto* stage: stages) {
 		RebindBuffers(*stage);
 	}

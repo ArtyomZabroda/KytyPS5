@@ -21,11 +21,103 @@ enum class Counter {
 	EarlySubmits, // Of those, recorded work handed to an idle GPU between guest packets.
 	GpuWaits,     // CPU blocked on a GPU timeline semaphore.
 	GpuWaitNs,
+	// --zero-copy-buffers: small CPU-written ranges answered from imported guest memory, and
+	// command-stream writes that waited for the GPU to finish reading their pages.
+	BufferObtainZeroCopy,
+	ZeroCopyWriteWaits,
 	// --threaded-recording: time the recording thread spends calling the driver, and waits for it
 	// to catch up (before a submit or direct recording).
 	RecorderBusyNs,
 	RecorderWaits,
 	RecorderWaitNs,
+	// --parallel-draw-prep: draws the worker thread prepares before their commit.
+	DrawPrepJobs,            // Draws it took.
+	DrawPrepReady,           // Of those, prepared completely.
+	DrawPrepSkipped,         // Of those, draws the commit drops or turns into special operations.
+	DrawPrepSkippedEmpty,    // Of those, draws without vertices or instances.
+	DrawPrepSkippedSpecial,  // Of those, metadata, resolve and depth-copy operations.
+	DrawPrepSkippedShader,   // Of those, draws without a vertex shader address.
+	DrawPrepSkippedTopology, // Of those, draws with an unsupported primitive type.
+	DrawPrepMissing,         // Of those, draws needing a compile, tessellation or GPU calls.
+	DrawPrepFaults,          // Of those, draws whose walker read GPU-tracked pages.
+	DrawPrepMemory,          // Of those, draws whose specialization read GPU memory.
+	DrawPrepHeap,            // Of those, draws using an image heap.
+	DrawPrepNs,              // Worker time.
+	DrawPrepUsed,            // Draws committed with the worker's preparation.
+	DrawPrepStale,           // Prepared draws redone after GPU writes or compiles came between.
+	DrawPrepStolen,          // Draws the GPU thread took before the worker started them.
+	DrawPrepWaitNs,          // GPU thread time waiting for the worker.
+	DrawPrepMismatches,      // --verify-draw-prep: worker results unlike the GPU thread's.
+	DrawPrepHeapRedo,        // --parallel-heap-prep: prepared draws whose heap views changed.
+	DrawPrepBufferCopies,    // --parallel-buffer-prep: buffer ranges the worker copied ahead.
+	DrawPrepBufferHits,      // Of those, ranges a commit used.
+	DrawPrepBufferFull,      // Ranges not copied because the worker's ring was full.
+	DrawXframeChecks,        // --xframe-draw-stats: draws keyed.
+	DrawXframeFull,          // Of those, keys with user data and arguments seen this or last frame.
+	DrawXframeStructure,     // Of those, the same keys without user data and arguments.
+	DrawXframeUserConfig,    // Structure keys with UserConfig seen this or last frame.
+	DrawXframeArgs,          // Structure keys with the draw arguments seen this or last frame.
+	DrawXframeStage,         // Structure keys with the stage registers seen this or last frame.
+	DrawXframeUserData,      // Structure keys with the user SGPRs seen this or last frame.
+	DrawXframeUdDraws,       // Repeats by arguments whose user SGPRs were compared.
+	DrawXframeUdWords,       // Of those, user SGPRs that differ from the earlier repeat.
+	DrawXframeUdPointers,    // Of those, words of a pair that addresses mapped guest memory.
+	DrawXframeUdRelocatable, // Compared draws whose differing words are all such pointers.
+	DrawXframeBindCompared,  // Repeats by arguments whose resource descriptors were compared.
+	DrawXframeSameTextures,  // Of those, the same T# and S# words in every stage.
+	DrawXframeSameBuffers,   // Of those, the same V# words in every stage.
+	DrawXframeSameBoth,      // Of those, both.
+	DrawXframeVsharpNoBase,  // Of those, the same V# words apart from the base address.
+	DrawXframeVsharpShape,   // Of those, the same V# words apart from the base and the size.
+	DrawXframeVsharpMoved,   // Of those, draws whose V# bases differ with the same V# count.
+	DrawXframeVsharpShift,   // Of the moved, all bases moved by one and the same delta.
+	DrawXframeRelocatable,   // Same T#/S# and the same V# apart from the base.
+	DrawXframeSkipped,       // --xframe-skip-repeats: repeated draws not rendered.
+	DrawRecordChecks,        // --draw-records-verify: draws looked up by programs and arguments.
+	DrawRecordExcluded,      // Of those, draws a record would not cover.
+	DrawRecordNew,           // Of those, no record yet.
+	DrawRecordRegs,          // Of those, a record whose registers differ.
+	DrawRecordTextures,      // Of those, the same registers but other T#/S# words.
+	DrawRecordBuffers,       // Of those, V# words that differ beyond the base address.
+	DrawRecordImages,        // Of those, all the same but the texture cache changed since.
+	DrawRecordHits,          // Of those, draws the record would have prepared.
+	DrawRecordWrong,         // Hits whose record differs from the draw's own preparation.
+	DrawRecordWrongPrograms, // Of those, other shader modules.
+	DrawRecordWrongTextures, // Of those, other images, views or samplers.
+	DrawRecordWrongTargets,  // Of those, other color or depth targets.
+	DrawRecordWrongPipeline, // Of those, another pipeline.
+	DrawRecordCacheChanges,  // Texture cache generation changes seen between draws.
+	DrawRecordRegsContext,   // Regs misses whose context registers differ.
+	DrawRecordRegsUcfg,      // Regs misses whose UserConfig differs.
+	DrawRecordRegsStage,     // Regs misses whose stage registers differ.
+	DrawRecordRegsArgs,      // Regs misses whose draw arguments differ.
+	DrawRecordHitsKept,      // Hits after a cache change, with every image still the same.
+	DrawRecordWrongKept,     // Of those, records that differ from the draw's preparation.
+	DrawRecordHitsOlder,     // Hits on the older of the two records of a key.
+	DrawRecordHitsScissor,   // Hits whose screen scissor differs from the record's.
+	DrawReplayChecks,        // --draw-records: draws looked up.
+	DrawReplayMissRegs,      // Of those, no record with the same registers.
+	DrawReplayMissResources, // Of those, other programs, T#/S# or V# words.
+	DrawReplayMissImages,    // Of those, an image of the record is gone or replaced.
+	DrawReplayHits,          // Of those, draws prepared from their record.
+	DrawReplayStores,        // Records stored.
+	DrawRecordMetaStable,    // Hits whose color clear stamps all still hold.
+	DrawRecordMetaChanged,   // Hits with a recorded color clear stamp that no longer holds.
+	DrawRecordMetaUnstamped, // Hits with a DCC/CMASK image that had no stamp when recorded.
+	// Exclusive holds of the guest address-space lock, and the time each was held.
+	AddressLockMaps,
+	AddressLockMapNs,
+	AddressLockUnmaps,
+	AddressLockUnmapNs,
+	AddressLockCommits,
+	AddressLockCommitNs,
+	AddressLockReleases,
+	AddressLockReleaseNs,
+	AddressLockProtects,
+	AddressLockProtectNs,
+	// Time spent waiting for the address-space lock: guest reads and tracker protections.
+	AddressLockReadWaitNs,
+	AddressLockProtectWaitNs,
 	// Graphics draws and their shader stages compared with the previous draw.
 	DrawSamePipeline,  // Same host pipeline.
 	DrawSameTargets,   // Same color and depth target images.
@@ -188,6 +280,14 @@ enum class Counter {
 	ColorClearGuestReads,     // Metadata slices read through the guest address.
 	ColorClearGuestChecks,    // Calls that also read the backing to compare.
 	ColorClearGuestMismatch,  // Of those, slices where guest and backing bytes differed.
+	ColorClearStampHits,      // Calls skipped because the image's stamp still held.
+	ColorClearStampVerifies,  // Of those, calls that ran the full path to compare.
+	ColorClearStampMismatch,  // Of those, calls where the full path had work to do.
+	ColorClearStampMisses,    // Calls that ran the full path with stamps on.
+	ColorClearStampStale,     // Of those, calls whose stamp for the same inputs no longer held.
+	ColorClearStampsStored,   // Stamps left by a full path that found nothing to do.
+	ColorClearStampUploads,   // CPU-dirty metadata uploaded so that CPU writes are seen.
+	ColorClearStampUntracked, // Full paths with nothing to do whose metadata spans regions.
 	GraphicsPipelineBindsSkipped, // Draws whose pipeline was already bound in the command buffer.
 	ImageBarriersMerged, // Image barriers skipped: the last one already covered the request.
 	// Presentation.
@@ -288,6 +388,9 @@ inline thread_local bool t_gpu_thread = false;
 
 // F9: graphics draws return without rendering, to measure how fast the guest runs without them.
 inline std::atomic<bool> g_skip_draws {false};
+
+// Guest flips requested, counted always: frame boundaries for --xframe-draw-stats.
+inline std::atomic<uint64_t> g_flips {0};
 
 class ScopedTimer final {
 public:
@@ -439,7 +542,7 @@ inline thread_local const char* t_draw_phase = nullptr;
 
 // GPU-thread time by draw phase, measured between phase changes while counters are enabled.
 // Time outside any phase (between draws) is not counted.
-constexpr uint32_t PHASE_TIME_SLOTS = 32;
+constexpr uint32_t PHASE_TIME_SLOTS = 64;
 
 namespace Detail {
 inline std::atomic<const char*> g_phase_time_names[PHASE_TIME_SLOTS] {};

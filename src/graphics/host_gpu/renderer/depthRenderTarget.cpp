@@ -352,21 +352,27 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	BindRenderTarget(r.image_id);
 }
 
-bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
-	const auto& hw       = buffer.GetRegisters();
+RenderExecutor::DepthStencilCopies RenderExecutor::FindDepthStencilCopies(const HW::Context& hw) {
 	const auto& z        = hw.GetDepthRenderTarget();
 	const auto& override = hw.GetDepthRenderOverride();
 	if (hw.GetColorControl().mode != 0) {
-		return false;
+		return {};
 	}
-	const bool depth_copy   = override.force_z_dirty && override.force_z_valid &&
-	                          z.z_info.format != Prospero::DepthFormat::kInvalid &&
-	                          z.z_read_base_addr != 0 && z.z_write_base_addr != 0 &&
-	                          z.z_read_base_addr != z.z_write_base_addr;
-	const bool stencil_copy = override.force_stencil_dirty && override.force_stencil_valid &&
-	                          z.stencil_info.format != Prospero::StencilFormat::kInvalid &&
-	                          z.stencil_read_base_addr != 0 && z.stencil_write_base_addr != 0 &&
-	                          z.stencil_read_base_addr != z.stencil_write_base_addr;
+	return {
+	    .depth   = override.force_z_dirty && override.force_z_valid &&
+	               z.z_info.format != Prospero::DepthFormat::kInvalid && z.z_read_base_addr != 0 &&
+	               z.z_write_base_addr != 0 && z.z_read_base_addr != z.z_write_base_addr,
+	    .stencil = override.force_stencil_dirty && override.force_stencil_valid &&
+	               z.stencil_info.format != Prospero::StencilFormat::kInvalid &&
+	               z.stencil_read_base_addr != 0 && z.stencil_write_base_addr != 0 &&
+	               z.stencil_read_base_addr != z.stencil_write_base_addr,
+	};
+}
+
+bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
+	const auto& hw                        = buffer.GetRegisters();
+	const auto& z                         = hw.GetDepthRenderTarget();
+	const auto [depth_copy, stencil_copy] = FindDepthStencilCopies(hw);
 	if (!depth_copy && !stencil_copy) {
 		return false;
 	}

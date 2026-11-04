@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/emulatorConfig.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -207,6 +208,63 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 	result               = {.slots      = selected.buffer->BufferDeviceAddress(),
 	                        .slot_count = static_cast<uint32_t>(selected.slots.size() - 1u),
 	                        .kinds      = selected.kinds};
+	if (Config::ParallelHeapPrepEnabled()) {
+		Publish({.base    = request.base,
+		         .size    = size,
+		         .step    = request.step,
+		         .first   = request.first,
+		         .limit   = limit,
+		         .profile = profile},
+		        result);
+	}
+	return true;
+}
+
+void ImageHeap::Publish(const Published& key, const IR::ImageHeapView& view) {
+	const std::scoped_lock lock {m_published_mutex};
+
+	auto entry = std::ranges::find_if(m_published, [&](const auto& candidate) {
+		return candidate.base == key.base && candidate.size == key.size &&
+		       candidate.step == key.step && candidate.first == key.first &&
+		       candidate.limit == key.limit && candidate.profile == key.profile;
+	});
+	if (entry == m_published.end()) {
+		entry = m_published.insert(m_published.end(), key);
+	} else if (entry->slots == view.slots && entry->slot_count == view.slot_count &&
+	           std::ranges::equal(entry->kinds, view.kinds)) {
+		return;
+	}
+	entry->slots      = view.slots;
+	entry->slot_count = view.slot_count;
+	entry->kinds.assign(view.kinds.begin(), view.kinds.end());
+}
+
+bool ImageHeap::Peek(const IR::ImageHeapRequest& request, IR::ImageHeapPeek& peek) {
+	const auto size = request.size & ~uint64_t {3};
+	if (request.root == nullptr || request.count == 0u || request.step == 0u ||
+	    ((request.base | request.first | request.step) & 3u) != 0u) {
+		return false;
+	}
+	const auto profile = IR::ImageHeapResource(*request.root, 0u);
+	const auto probes  = Probes(size, request.first, request.step);
+	const auto limit   = request.count < probes ? request.count : UINT64_MAX;
+
+	const std::scoped_lock lock {m_published_mutex};
+
+	const auto entry = std::ranges::find_if(m_published, [&](const auto& candidate) {
+		return candidate.base == request.base && candidate.size == size &&
+		       candidate.step == request.step && candidate.first == request.first &&
+		       candidate.limit == limit && candidate.profile == profile;
+	});
+	if (entry == m_published.end()) {
+		return false;
+	}
+	peek.request      = request;
+	peek.request.root = nullptr;
+	peek.root         = *request.root;
+	peek.slots        = entry->slots;
+	peek.slot_count   = entry->slot_count;
+	peek.kinds        = entry->kinds;
 	return true;
 }
 

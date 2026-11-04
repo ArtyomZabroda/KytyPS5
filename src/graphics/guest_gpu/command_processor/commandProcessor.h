@@ -14,6 +14,9 @@
 namespace Libs::Graphics {
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
+// --deferred-eop-labels: what packets read at a label, including deferred label writes the
+// guest cannot see yet. GPU thread only.
+uint64_t ReadPm4Label(const volatile void* address, uint32_t size);
 
 enum class Pm4ProcessResult { Complete, Blocked };
 
@@ -119,12 +122,12 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
-	void ProcessPm4(Pm4Execution& execution);
-	void SuspendPm4();
-	uint32_t            NumInstances();
-	const void*         IndexAddress(uint32_t first_index) const;
-	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
-	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
+	void              ProcessPm4(Pm4Execution& execution);
+	void              SuspendPm4();
+	uint32_t          NumInstances();
+	const void*       IndexAddress(uint32_t first_index) const;
+	CommandScheduler& GetScheduler() const { return m_renderer.GetCommandScheduler(); }
+	CommandBuffer&    CurrentBuffer() { return GetScheduler().Current(); }
 
 	RenderContext& m_renderer;
 	HW::Context    m_ctx;

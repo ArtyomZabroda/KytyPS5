@@ -675,7 +675,14 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (const auto length =
 		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address);
 		    length != 0 && access == GpuAccess::Read) {
-			namespace Emulator  = Loader::X64InstructionEmulator;
+			namespace Emulator = Loader::X64InstructionEmulator;
+			namespace IR       = Libs::Graphics::ShaderRecompiler::IR;
+			// A thread preparing draws ahead of the GPU thread must not wait for it.
+			if (IR::Speculating()) {
+				IR::NoteSpeculativeMiss(IR::SpeculativeMiss::WalkerFault);
+				Emulator::SkipLoad(info->native_context, length);
+				return true;
+			}
 			const auto address  = Emulator::ReadGpr(info->native_context, 10);
 			uint32_t   value    = 0;
 			const bool in_range = info->access_violation_vaddr >= address &&

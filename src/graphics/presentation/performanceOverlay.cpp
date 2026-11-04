@@ -234,7 +234,7 @@ void Row(const char* label, const std::string& value, std::optional<ImU32> color
 }
 
 [[gnu::format(printf, 1, 2)]] std::string Fmt(const char* format, ...) {
-	char    buffer[128];
+	char    buffer[256];
 	va_list args;
 	va_start(args, format);
 	std::vsnprintf(buffer, sizeof(buffer), format, args);
@@ -540,6 +540,81 @@ void GpuActivityRows(const Snapshot& shown) {
 		        share(Counter::StageSameImages, stages), share(Counter::StageSameRanges, stages),
 		        share(Counter::StageSameBuffers, stages), share(Counter::StageSameData, stages),
 		        share(Counter::StageSameAll, stages)));
+		if (const auto keyed = Rate(shown, Counter::DrawXframeChecks); keyed > 0.0) {
+			Row("  repeats across frames",
+			    Fmt("full %.0f%%  structure %.0f%%  +ucfg %.0f%%  +args %.0f%%  +stage %.0f%%  "
+			        "+user data %.0f%%  skipped %.0f%%",
+			        share(Counter::DrawXframeFull, keyed),
+			        share(Counter::DrawXframeStructure, keyed),
+			        share(Counter::DrawXframeUserConfig, keyed),
+			        share(Counter::DrawXframeArgs, keyed), share(Counter::DrawXframeStage, keyed),
+			        share(Counter::DrawXframeUserData, keyed),
+			        share(Counter::DrawXframeSkipped, keyed)));
+			const auto compared = Rate(shown, Counter::DrawXframeUdDraws);
+			const auto words    = Rate(shown, Counter::DrawXframeUdWords);
+			Row("  changed user data",
+			    Fmt("%.1f words/draw  pointers %.0f%%  relocatable draws %.0f%%",
+			        words / std::max(compared, 1.0),
+			        words > 0.0 ? 100.0 * Rate(shown, Counter::DrawXframeUdPointers) / words : 0.0,
+			        share(Counter::DrawXframeUdRelocatable, compared)));
+			const auto bound = Rate(shown, Counter::DrawXframeBindCompared);
+			Row("  repeat descriptors", Fmt("same T#/S# %.0f%%  same V# %.0f%%  both %.0f%%",
+			                                share(Counter::DrawXframeSameTextures, bound),
+			                                share(Counter::DrawXframeSameBuffers, bound),
+			                                share(Counter::DrawXframeSameBoth, bound)));
+			const auto moved = Rate(shown, Counter::DrawXframeVsharpMoved);
+			Row("  V# without base",
+			    Fmt("same %.0f%%  +size %.0f%%  one shift %.0f%% of moved  T#+V# %.0f%%",
+			        share(Counter::DrawXframeVsharpNoBase, bound),
+			        share(Counter::DrawXframeVsharpShape, bound),
+			        share(Counter::DrawXframeVsharpShift, moved),
+			        share(Counter::DrawXframeRelocatable, bound)));
+		}
+		if (const auto replays = Rate(shown, Counter::DrawReplayChecks); replays > 0.0) {
+			Row("Draw records",
+			    Fmt("hits %.0f%%  regs %.0f%%  resources %.0f%%  images %.0f%%  stores %.0f/s",
+			        share(Counter::DrawReplayHits, replays),
+			        share(Counter::DrawReplayMissRegs, replays),
+			        share(Counter::DrawReplayMissResources, replays),
+			        share(Counter::DrawReplayMissImages, replays),
+			        Rate(shown, Counter::DrawReplayStores)));
+		}
+		if (const auto looked = Rate(shown, Counter::DrawRecordChecks); looked > 0.0) {
+			Row("Draw records (verify)",
+			    Fmt("hits %.0f%%  new %.0f%%  regs %.0f%%  T#/S# %.0f%%  V# %.0f%%  images %.0f%%  "
+			        "excluded %.0f%%  cache changes %.0f/s",
+			        share(Counter::DrawRecordHits, looked), share(Counter::DrawRecordNew, looked),
+			        share(Counter::DrawRecordRegs, looked),
+			        share(Counter::DrawRecordTextures, looked),
+			        share(Counter::DrawRecordBuffers, looked),
+			        share(Counter::DrawRecordImages, looked),
+			        share(Counter::DrawRecordExcluded, looked),
+			        Rate(shown, Counter::DrawRecordCacheChanges)));
+			const auto regs = Rate(shown, Counter::DrawRecordRegs);
+			Row("  regs misses", Fmt("context %.0f%%  ucfg %.0f%%  stage %.0f%%  args %.0f%%",
+			                         share(Counter::DrawRecordRegsContext, regs),
+			                         share(Counter::DrawRecordRegsUcfg, regs),
+			                         share(Counter::DrawRecordRegsStage, regs),
+			                         share(Counter::DrawRecordRegsArgs, regs)));
+			Row("  hits after cache change",
+			    Fmt("%.0f%% of draws  wrong %.0f/s", share(Counter::DrawRecordHitsKept, looked),
+			        Rate(shown, Counter::DrawRecordWrongKept)));
+			Row("  hits needing", Fmt("older record %.0f%%  other scissor %.0f%% of draws",
+			                          share(Counter::DrawRecordHitsOlder, looked),
+			                          share(Counter::DrawRecordHitsScissor, looked)));
+			const auto record_hits = Rate(shown, Counter::DrawRecordHits);
+			Row("  hit metadata", Fmt("stable %.0f%%  changed %.0f%%  unstamped %.0f%% of hits",
+			                          share(Counter::DrawRecordMetaStable, record_hits),
+			                          share(Counter::DrawRecordMetaChanged, record_hits),
+			                          share(Counter::DrawRecordMetaUnstamped, record_hits)));
+			Row("  wrong records",
+			    Fmt("%.0f/s  programs %.0f  textures %.0f  targets %.0f  pipeline %.0f",
+			        Rate(shown, Counter::DrawRecordWrong),
+			        Rate(shown, Counter::DrawRecordWrongPrograms),
+			        Rate(shown, Counter::DrawRecordWrongTextures),
+			        Rate(shown, Counter::DrawRecordWrongTargets),
+			        Rate(shown, Counter::DrawRecordWrongPipeline)));
+		}
 	}
 	// Includes present pacing waits, so a high value alone is not a stall.
 	Row("CPU waiting on GPU",
@@ -947,6 +1022,52 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 			        busy_ns / 1e3 / std::max(Rate(shown, Counter::Draws), 1.0),
 			        Rate(shown, Counter::RecorderWaitNs) / 1e6, waits));
 		}
+		if (const auto jobs = Rate(shown, Counter::DrawPrepJobs); jobs > 0.0) {
+			Row("Draw prep worker",
+			    Fmt("used %.0f/%.0f skip: empty %.0f special %.0f vs %.0f topo %.0f | stolen %.0f "
+			        "stale %.0f | compile %.0f fault %.0f mem %.0f heap %.0f redo %.0f | "
+			        "diff %.0f | buf %.0f/%.0f full %.0f | %.0f/%.0f ms",
+			        Rate(shown, Counter::DrawPrepUsed), Rate(shown, Counter::Draws),
+			        Rate(shown, Counter::DrawPrepSkippedEmpty),
+			        Rate(shown, Counter::DrawPrepSkippedSpecial),
+			        Rate(shown, Counter::DrawPrepSkippedShader),
+			        Rate(shown, Counter::DrawPrepSkippedTopology),
+			        Rate(shown, Counter::DrawPrepStolen), Rate(shown, Counter::DrawPrepStale),
+			        Rate(shown, Counter::DrawPrepMissing), Rate(shown, Counter::DrawPrepFaults),
+			        Rate(shown, Counter::DrawPrepMemory), Rate(shown, Counter::DrawPrepHeap),
+			        Rate(shown, Counter::DrawPrepHeapRedo),
+			        Rate(shown, Counter::DrawPrepMismatches),
+			        Rate(shown, Counter::DrawPrepBufferHits),
+			        Rate(shown, Counter::DrawPrepBufferCopies),
+			        Rate(shown, Counter::DrawPrepBufferFull),
+			        Rate(shown, Counter::DrawPrepNs) / 1e6,
+			        Rate(shown, Counter::DrawPrepWaitNs) / 1e6),
+			    Rate(shown, Counter::DrawPrepMismatches) > 0.0 ? BAD : GOOD);
+		}
+		if (const auto holds = Rate(shown, Counter::AddressLockMaps) +
+		                       Rate(shown, Counter::AddressLockUnmaps) +
+		                       Rate(shown, Counter::AddressLockCommits) +
+		                       Rate(shown, Counter::AddressLockReleases) +
+		                       Rate(shown, Counter::AddressLockProtects);
+		    holds > 0.0) {
+			// Holds per second, average and total held time.
+			const auto hold = [&](Counter count, Counter ns) {
+				const auto n = Rate(shown, count);
+				const auto t = Rate(shown, ns);
+				return Fmt("%.0f/s %.0f us %.0f ms/s", n, n > 0.0 ? t / n / 1e3 : 0.0, t / 1e6);
+			};
+			Row("Address lock (excl.)",
+			    "map " + hold(Counter::AddressLockMaps, Counter::AddressLockMapNs) + " | unmap " +
+			        hold(Counter::AddressLockUnmaps, Counter::AddressLockUnmapNs) + " | commit " +
+			        hold(Counter::AddressLockCommits, Counter::AddressLockCommitNs) +
+			        " | release " +
+			        hold(Counter::AddressLockReleases, Counter::AddressLockReleaseNs) +
+			        " | protect " +
+			        hold(Counter::AddressLockProtects, Counter::AddressLockProtectNs) +
+			        Fmt(" | waits: read %.0f ms/s tracker %.0f ms/s",
+			            Rate(shown, Counter::AddressLockReadWaitNs) / 1e6,
+			            Rate(shown, Counter::AddressLockProtectWaitNs) / 1e6));
+		}
 		const auto faults = Rate(shown, Counter::GpuFaults);
 		Row("Write-tracking faults",
 		    Fmt("%.0f/s  (handler %.1f us avg, %.0f ms/s)", faults,
@@ -1031,6 +1152,17 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 			        per_frame(Counter::ColorClearGuestReads),
 			        per_frame(Counter::ColorClearGuestChecks),
 			        per_frame(Counter::ColorClearGuestMismatch)));
+			Row("    clear stamps", Fmt("%.0f hits  %.0f misses  %.0f stale  %.0f stored /frame",
+			                            per_frame(Counter::ColorClearStampHits),
+			                            per_frame(Counter::ColorClearStampMisses),
+			                            per_frame(Counter::ColorClearStampStale),
+			                            per_frame(Counter::ColorClearStampsStored)));
+			Row("    stamp checks",
+			    Fmt("%.0f verified  %.0f mismatches  %.0f uploads  %.0f untracked /frame",
+			        per_frame(Counter::ColorClearStampVerifies),
+			        per_frame(Counter::ColorClearStampMismatch),
+			        per_frame(Counter::ColorClearStampUploads),
+			        per_frame(Counter::ColorClearStampUntracked)));
 		}
 		Row("Texture evictions", Fmt("%.0f/s", Rate(shown, Counter::TextureEvictions)));
 		TransferRow(shown, "Buffer transfers", Counter::BufferUploadBytes,
@@ -1044,11 +1176,14 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 			                          Rate(shown, Counter::BufferObtainUploads) / frames,
 			                          Rate(shown, Counter::BufferObtainWritten) / frames));
 			Row("  streamed",
-			    Fmt("%.0f KB/frame copied  %.0f reused  %.0f verified  %.0f mismatches /frame",
+			    Fmt("%.0f KB/frame copied  %.0f reused  %.0f verified  %.0f mismatches  %.0f "
+			        "zero-copy  %.0f write waits /frame",
 			        Rate(shown, Counter::BufferStreamBytes) / frames / 1024.0,
 			        Rate(shown, Counter::BufferStreamReuses) / frames,
 			        Rate(shown, Counter::BufferStreamReuseChecks) / frames,
-			        Rate(shown, Counter::BufferStreamReuseMisses) / frames));
+			        Rate(shown, Counter::BufferStreamReuseMisses) / frames,
+			        Rate(shown, Counter::BufferObtainZeroCopy) / frames,
+			        Rate(shown, Counter::ZeroCopyWriteWaits) / frames));
 			Row("  clean reads", Fmt("%.0f/frame  (%.0f repeated in one command buffer)",
 			                         Rate(shown, Counter::BufferObtainCleanReads) / frames,
 			                         Rate(shown, Counter::BufferObtainCleanRepeats) / frames));

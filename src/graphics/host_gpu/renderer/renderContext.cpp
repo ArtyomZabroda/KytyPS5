@@ -136,9 +136,15 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	const auto unmap = [this, vaddr, size] {
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() && (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		                                     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		                                     m_command_scheduler.HasPendingPriorityOperations())) {
+		// --fast-unmap: the GPU reads host copies and the caches free them after the GPU, so only
+		// GPU-written bytes, which are downloaded first, and callbacks that write the range wait.
+		const bool wait = Config::FastUnmapEnabled() && !Config::ZeroCopyBuffersEnabled()
+		                      ? m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
+		                            m_command_scheduler.PriorityOperationsTouch(vaddr, size)
+		                      : m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		                            m_texture_cache.IsRegionRegistered(vaddr, size) ||
+		                            m_command_scheduler.HasPendingPriorityOperations();
+		if (m_command_scheduler.Active() && wait) {
 			const auto                                     tick = m_command_scheduler.CurrentTick();
 			const Common::DebugCounters::ScopedGpuWaitSite wait_site(
 			    Common::DebugCounters::GpuWaitSite::Unmap);

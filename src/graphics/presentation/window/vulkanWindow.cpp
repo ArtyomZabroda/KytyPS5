@@ -1148,6 +1148,10 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(
 			    VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
+		if (Config::ZeroCopyBuffersEnabled() &&
+		    HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	}
 

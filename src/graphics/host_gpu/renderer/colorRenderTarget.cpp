@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -41,14 +42,13 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
-                                              uint32_t         render_target_slice_offset,
-                                              uint32_t rt_slot, bool ignore_target_mask,
-                                              bool exact_format) {
+                                              uint32_t render_target_slice_offset, uint32_t rt_slot,
+                                              bool ignore_target_mask, bool exact_format) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw = buffer.GetRegisters();
 
-	const auto& rt      = hw.GetRenderTarget(rt_slot);
-	auto        mask    = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
+	const auto& rt   = hw.GetRenderTarget(rt_slot);
+	auto        mask = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
 		mask = 0x0f;
 	}
@@ -58,11 +58,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	// The decoding below reads only these registers, the slot mask and the slice offset.
 	if (decode.valid && decode.mask == mask && decode.slice_offset == render_target_slice_offset &&
 	    decode.registers == rt && !graphics_debug_dump_enabled()) {
-		r          = decode.info;
-		r.image_id = m_context.GetTextureCache().FindImage(r.desc, exact_format);
+		r = decode.info;
+		{
+			const Common::DebugCounters::ScopedDrawSubPhase phase("ResolveRenderColorTarget/Find");
+			r.image_id = m_context.GetTextureCache().FindImage(r.desc, exact_format);
+		}
+		const Common::DebugCounters::ScopedDrawSubPhase phase("ResolveRenderColorTarget/Bind");
 		BindRenderTarget(r.image_id);
 		return;
 	}
+	const Common::DebugCounters::ScopedDrawSubPhase decode_phase("ResolveRenderColorTarget/Decode");
 	decode.valid = false;
 
 	r             = {};
@@ -126,12 +131,12 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const uint32_t depth = volume ? rt.attrib3.depth + 1u : 1u;
 	// For volumes, CB_COLOR_VIEW bounds exported slices; ATTRIB3 defines storage depth.
 	// The host attachment contains only the selected slices that exist in this mip.
-	const uint32_t last_layer = volume
-	                                ? std::min(rt.view.last_array_slice_index,
-	                                           std::max(depth >> rt.view.current_mip_level, 1u) - 1u)
-	                                : rt.view.last_array_slice_index;
-	const auto view = ResolveTargetViewInfo(
-	    rt.view.base_array_slice_index, last_layer, render_target_slice_offset);
+	const uint32_t last_layer =
+	    volume ? std::min(rt.view.last_array_slice_index,
+	                      std::max(depth >> rt.view.current_mip_level, 1u) - 1u)
+	           : rt.view.last_array_slice_index;
+	const auto view = ResolveTargetViewInfo(rt.view.base_array_slice_index, last_layer,
+	                                        render_target_slice_offset);
 	switch (view.type) {
 		case TargetViewType::Image2D:
 		case TargetViewType::Image2DArray: break;
@@ -159,13 +164,13 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	// The normal copy operation is a regular color write, not an attachment clear.
 	// Nonlinear clear values are still stored as normalized components.
 	// Metadata clears are materialized during image discovery; render-pass loads preserve contents.
-	uint32_t   width  = 0;
-	uint32_t       height       = 0;
-	bool       tile   = false;
-	const bool     standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
-	const bool     standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
-	const bool     depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
-	const bool     texture_tile = standard4 || standard64 || depth_tile;
+	uint32_t   width        = 0;
+	uint32_t   height       = 0;
+	bool       tile         = false;
+	const bool standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
+	const bool standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
+	const bool depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
+	const bool texture_tile = standard4 || standard64 || depth_tile;
 
 	switch (rt.attrib3.tile_mode) {
 		case Prospero::TileMode::kLinear:
@@ -220,13 +225,13 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		     " layer=%u/%u\n",
 		     rt.attrib3.dimension, rt.attrib3.depth, view.base_layer, view.image_layers);
 	}
-	auto& desc = r.desc;
-	desc.type              = TextureCache::BindingType::RenderTarget;
+	auto& desc                = r.desc;
+	desc.type                 = TextureCache::BindingType::RenderTarget;
 	desc.info.data            = {rt.base.addr, 0};
-	desc.info.pixel_format = target_format.format;
-	desc.info.guest_format = target_format.guest_format;
-	desc.info.type         = image_type;
-	desc.info.extent       = {width, height, depth};
+	desc.info.pixel_format    = target_format.format;
+	desc.info.guest_format    = target_format.guest_format;
+	desc.info.type            = image_type;
+	desc.info.extent          = {width, height, depth};
 	desc.info.resources       = {levels, volume ? 1u : view.image_layers};
 	desc.info.bytes_per_block = bytes_per_element;
 	desc.info.samples         = samples;
@@ -239,13 +244,12 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	if (!desc.info.data.Valid()) {
 		EXIT("render-target backing range is invalid\n");
 	}
-	const bool has_dcc        = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
-	const bool has_cmask      = !rt.info.dcc_compression_enable && rt.info.cmask_fast_clear_enable &&
-	                            rt.cmask.addr != 0 &&
-	                            !rt.attrib3.write_vrs_rate_hint_to_cmask;
+	const bool has_dcc   = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
+	const bool has_cmask = !rt.info.dcc_compression_enable && rt.info.cmask_fast_clear_enable &&
+	                       rt.cmask.addr != 0 && !rt.attrib3.write_vrs_rate_hint_to_cmask;
 	if (has_dcc || has_cmask) {
 		TileSizeAlign metadata_size {};
-		const auto layers = volume ? depth : view.image_layers;
+		const auto    layers = volume ? depth : view.image_layers;
 		if (has_dcc) {
 			(void)TileGetDccSize(width, height, layers, bytes_per_element, levels,
 			                     rt.attrib3.tile_mode, metadata_size, rt.attrib.num_fragments);
@@ -254,7 +258,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			(void)TileGetCmaskSize(width, height, layers, levels, metadata_size);
 		}
 		// DCC owns the clear when both planes are enabled.
-		desc.info.metadata.kind = has_dcc ? ImageMetadataKind::Dcc : ImageMetadataKind::Cmask;
+		desc.info.metadata.kind  = has_dcc ? ImageMetadataKind::Dcc : ImageMetadataKind::Cmask;
 		desc.info.metadata.range = {has_dcc ? rt.dcc_addr.addr : rt.cmask.addr, metadata_size.size};
 		desc.info.metadata.clear_word =
 		    rt.clear_word0.word0 | (uint64_t {rt.clear_word1.word1} << 32u);
@@ -283,7 +287,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	decode.slice_offset        = render_target_slice_offset;
 	decode.info                = r;
 	decode.valid               = true;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
+	const Common::DebugCounters::ScopedDrawSubPhase find_phase("ResolveRenderColorTarget/NewFind");
+	r.image_id = texture_cache.FindImage(r.desc, exact_format);
 	BindRenderTarget(r.image_id);
 }
 

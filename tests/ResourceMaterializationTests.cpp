@@ -1441,7 +1441,7 @@ void TestShaderCacheRecords() {
   selectors.descriptor_sources.emplace_back();
   const auto plan = Extract(selectors);
   Check(plan.selector_groups == std::vector<uint32_t>{0u, 1u, 0u, UINT32_MAX} &&
-            plan.selector_keys.size() == 2u,
+            plan.selector_key_groups == 2u,
         "loaded plan lost its selector key groups");
 
   const std::array values{Value(), Value(ScalarReg(3)), Value(VectorReg(5)), Value(true),

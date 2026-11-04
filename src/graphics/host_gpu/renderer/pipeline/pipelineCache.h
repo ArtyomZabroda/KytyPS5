@@ -14,6 +14,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -23,6 +24,7 @@
 
 #include <queue>
 
+#include <shared_mutex>
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -35,6 +37,12 @@ struct GraphicContext;
 struct ShaderParams;
 class CommandBuffer;
 
+namespace HW {
+class Context;
+class UserConfig;
+class Shader;
+} // namespace HW
+
 namespace ShaderRecompiler {
 struct CompileOptions;
 struct ShaderSource;
@@ -43,6 +51,7 @@ struct TranslateResult;
 
 namespace ShaderRecompiler::IR {
 class ImageHeapSource;
+struct ImageHeapPeek;
 } // namespace ShaderRecompiler::IR
 
 namespace ShaderRecompiler::Spirv {
@@ -127,6 +136,12 @@ struct ShaderModule {
 	std::vector<RectListParameter> rect_parameters;
 };
 
+// One stage's materialized resources. A draw keeps its own, apart from the program cache.
+struct DrawStageResources {
+	ShaderRecompiler::IR::ResourceSnapshot       snapshot;
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+};
+
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
 struct DrawRenderState {
 	RenderDepthInfo depth_info;
@@ -142,6 +157,9 @@ struct DrawRenderState {
 	// Input: the user-data slots a GPU-read indirect draw patches.
 	ShaderIndirectOffsets indirect_offsets;
 	bool                  indirect_draw = false;
+	// Input: resources of the vertex stages (0-2) and the pixel stage (3), which the stages
+	// point to; without it the stages use those of their programs.
+	std::array<DrawStageResources, 4>* resources = nullptr;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
@@ -197,6 +215,17 @@ public:
 	// Null skips the dispatch.
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
+	// --parallel-draw-prep worker: GetGraphicsPrograms from copies of the registers, using only
+	// programs compiled before. False, with the miss noted, when the GPU thread must prepare it.
+	bool PrepareGraphicsPrograms(const HW::Context& context, const HW::UserConfig& user_config,
+	                             const HW::Shader& shaders, DrawRenderState& state);
+	// --parallel-heap-prep: where this thread's preparation records the image heap views it used.
+	// Null stops it from using any.
+	static void SetHeapPeeks(std::vector<ShaderRecompiler::IR::ImageHeapPeek>* peeks);
+	// Changes whenever a compile may move the modules that prepared draws point to.
+	[[nodiscard]] uint64_t ProgramGeneration() const noexcept {
+		return m_program_generation.load(std::memory_order_acquire);
+	}
 
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
@@ -214,9 +243,17 @@ private:
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
+		// Materializes into resources and specialization, which need not be this program's.
 		template <bool HasCalls>
-		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                         uint32_t                                push_data_cursor);
+		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime&       runtime,
+		                         uint32_t                                      push_data_cursor,
+		                         ShaderRecompiler::IR::ResourceSnapshot&       resources,
+		                         ShaderRecompiler::IR::ResourceSpecialization& specialization);
+		// The module compiled for a materialized specialization, if any.
+		template <bool HasCalls>
+		ShaderModule*
+		MatchModule(uint32_t                                            push_data_cursor,
+		            const ShaderRecompiler::IR::ResourceSpecialization& specialization);
 	};
 
 	struct ProgramKey {
@@ -242,9 +279,12 @@ private:
 	GraphicContext&                                         m_graphics;
 	ShaderRecompiler::IR::ImageHeapSource*                  m_image_heap;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
+	// With --parallel-draw-prep the worker reads programs under a shared lock while the GPU
+	// thread changes them under an exclusive one.
+	std::shared_mutex     m_program_mutex;
+	std::atomic<uint64_t> m_program_generation {0};
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
-	ProgramKey                                                                        m_lookup_key;
 	vk::PipelineCache                     m_driver_cache = nullptr;
 	std::filesystem::path                 m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
@@ -257,13 +297,22 @@ private:
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
-	                               uint32_t& push_data_cursor);
-	ShaderModule&       CompileModule(Program& program, const ProgramKey& key,
-	                                  ShaderRecompiler::CompileOptions  options,
-	                                  ShaderRecompiler::TranslateResult translated,
-	                                  uint32_t                          push_data_cursor);
-	void                InitializeDriverCache();
-	void                CheckpointDriverCache();
+	                               uint32_t& push_data_cursor, DrawStageResources* resources);
+	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
+	                            ShaderRecompiler::CompileOptions  options,
+	                            ShaderRecompiler::TranslateResult translated,
+	                            uint32_t                          push_data_cursor,
+	                            const ShaderRecompiler::IR::ResourceSpecialization& specialization);
+	void          InitializeDriverCache();
+	void          CheckpointDriverCache();
+	// Without compiling or changing the cache; null, with the miss noted, if not found.
+	template <typename InputInfo>
+	const ShaderModule* FindCachedProgram(const ShaderParams& params, InputInfo& input_info,
+	                                      uint32_t&           push_data_cursor,
+	                                      DrawStageResources& resources);
+	bool CollectGraphicsPrograms(const HW::Context& context, const HW::UserConfig& user_config,
+	                             const HW::Shader& shaders, DrawRenderState& state,
+	                             bool speculative);
 
 	// pipelineSerialization.cpp
 	void WarmUp(const std::filesystem::path& path);

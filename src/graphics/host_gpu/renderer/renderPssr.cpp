@@ -30,6 +30,9 @@ bool IsInputFormat(Prospero::BufferFormat format) {
 } // namespace
 
 RenderExecutor::~RenderExecutor() {
+	// The draw preparation worker uses the renderer's caches.
+	m_prep_worker = std::jthread {};
+
 	const auto device = m_context.GetGraphics().device;
 	device.destroyPipeline(m_pssr_pipeline, nullptr);
 	device.destroyPipelineLayout(m_pssr_pipeline_layout, nullptr);

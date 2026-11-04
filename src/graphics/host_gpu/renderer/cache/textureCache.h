@@ -19,6 +19,7 @@
 #include <chrono>
 #include <map>
 #include <optional>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -44,6 +45,22 @@ void               Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 class TextureCache {
 public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
+
+	// Change when images are registered, unregistered or associated anew.
+	[[nodiscard]] std::pair<uint64_t, uint64_t> Generations() const {
+		return {m_region_generation, m_image_generation};
+	}
+	// --draw-records-verify: appends the image's color clear stamps that hold now. False when the
+	// image has DCC/CMASK metadata but no such stamp.
+	[[nodiscard]] bool CopyColorClearStamps(ImageId id, std::vector<ColorClearStamp>& out);
+	// Whether every stamp still holds, so MaterializeColorClear would find nothing to do.
+	[[nodiscard]] bool ColorClearStampsHold(std::span<const ColorClearStamp> stamps);
+	// The serial of a registered image, or 0 for a free slot or an unregistered image.
+	[[nodiscard]] uint64_t RegisteredSerial(ImageId id) const {
+		return m_slot_images.is_allocated(id) && m_slot_images[id].registered
+		           ? m_slot_images[id].serial
+		           : 0;
+	}
 
 	struct ImageDesc {
 		ImageInfo     info;
@@ -72,6 +89,19 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// What FindImage does besides the lookup, for a draw record that repeats one: the LRU touch,
+	// which changes nothing again within a GC tick, and the color clear materialization.
+	[[nodiscard]] uint64_t GcTick() const { return m_gc_tick; }
+
+	void RepeatTouch(ImageId id) {
+		std::scoped_lock lock {m_lock};
+		auto&            image    = m_slot_images[id];
+		image.frame_accessed_last = m_gc_tick;
+		TouchImage(image);
+	}
+	void RepeatColorClear(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer) {
+		MaterializeColorClear(id, desc, metadata_base_layer);
+	}
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -161,7 +191,17 @@ private:
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
 	void MaterializeColorClear(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer);
-	void InitializeImage(ImageId id);
+	// What the full MaterializeColorClear path did. Only Acted changes more than the image's
+	// metadata and the surface metadata entry it drops.
+	enum class ColorClearOutcome : uint8_t { Trivial, GpuChecked, Cpu, Acted };
+	[[nodiscard]] ColorClearOutcome MaterializeColorClearFull(ImageId id, const ImageDesc& desc,
+	                                                          uint32_t         metadata_base_layer,
+	                                                          ColorClearStamp* stamp);
+	[[nodiscard]] bool              IsColorClearStampCurrent(const ColorClearStamp& stamp);
+	[[nodiscard]] bool CompleteColorClearStamp(ColorClearOutcome outcome, ColorClearStamp& stamp);
+	void               ReportColorClearStampMismatch(const ColorClearStamp& stamp);
+
+	void               InitializeImage(ImageId id);
 	[[nodiscard]] bool CanDownload(const Image& image) const;
 	void               UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void               DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
@@ -258,6 +298,12 @@ private:
 	std::atomic<uint32_t> m_color_clear_mismatches {0};
 	void ReportColorClearMismatch(const char* what, uint64_t address, uint32_t guest,
 	                              uint32_t backing);
+	// --fast-color-clear-checks: stamps stay on until a checked skip disagrees.
+	std::atomic<bool> m_color_clear_stamps {true};
+	uint32_t          m_color_clear_stamp_hits       = 0;
+	uint32_t          m_color_clear_stamp_mismatches = 0;
+	// Advances when a surface metadata entry is added; MaterializeColorClear drops them.
+	uint64_t                                          m_surface_meta_generation = 1;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

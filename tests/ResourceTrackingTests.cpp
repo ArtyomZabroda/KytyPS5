@@ -3456,7 +3456,7 @@ void TestIndexedMaterialImageKeys() {
   };
   auto program = make_program();
   auto plan = ExtractResourcePlan(program);
-  Check(plan.info.images.size() == 3u && plan.selector_keys.size() == 2u,
+  Check(plan.info.images.size() == 3u && plan.selector_key_groups == 2u,
         "indexed material fields did not share their query/gather selector domain");
   for (const auto &image : plan.info.images) {
     const auto &source = *plan.descriptor_sources[image.source].indirect_descriptor;

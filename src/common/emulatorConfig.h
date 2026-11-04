@@ -109,6 +109,39 @@ struct ConfigOptions {
 	bool threaded_recording_enabled = false;
 	// Pin the GPU thread and the recording thread to two different physical cores.
 	bool pin_gpu_threads_enabled = false;
+	// Experiment: write end-of-pipe labels only after the GPU finishes the work before them.
+	bool deferred_eop_labels_enabled = false;
+	// Experiment: serve small CPU-written buffer ranges from imported guest memory instead of
+	// copies. Implies deferred end-of-pipe labels.
+	bool zero_copy_buffers_enabled = false;
+	// Experiment: draws wait in order with copies of their registers and commit before any other
+	// packet, so their preparation can move off the GPU thread.
+	bool parallel_draw_prep_enabled = false;
+	// With --parallel-draw-prep: the GPU thread prepares worker-prepared draws again and logs
+	// differences.
+	bool verify_draw_prep_enabled = false;
+	// Experiment: an unmap waits for the GPU only when GPU-written bytes or queued guest-memory
+	// completions overlap the range.
+	bool fast_unmap_enabled = false;
+	// Experiment: guest reads inside backing mappings skip the address-space lock, so they do not
+	// wait for a map or an unmap.
+	bool fast_guest_reads_enabled = false;
+	// Experiment: the draw prep worker also prepares draws using an image heap, from the views the
+	// GPU thread last acquired; the commit checks them.
+	bool parallel_heap_prep_enabled = false;
+	// Experiment: the draw prep worker copies small CPU-written buffers ahead into its own ring.
+	bool parallel_buffer_prep_enabled = false;
+	// Diagnostics: share of draws whose registers repeat across frames.
+	bool xframe_draw_stats_enabled = false;
+	// Upper-bound experiment: repeated draws are not rendered (the frame is wrong).
+	bool xframe_skip_repeats_enabled = false;
+	// Diagnostics: checks what records of the previous frame's draws would prepare.
+	bool draw_records_verify_enabled = false;
+	// Experiment: repeated draws take their targets and texture bindings from a record.
+	bool draw_records_enabled = false;
+	// Experiment: MaterializeColorClear skips an image whose inputs and metadata did not change
+	// since it last found nothing to do; every 16th skip is checked.
+	bool fast_color_clear_checks_enabled = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -184,6 +217,19 @@ bool     VulkanCallTimingEnabled();
 bool     ImageBarrierMergeEnabled();
 bool     ThreadedRecordingEnabled();
 bool     PinGpuThreadsEnabled();
+bool     DeferredEopLabelsEnabled();
+bool     ZeroCopyBuffersEnabled();
+bool     ParallelDrawPrepEnabled();
+bool     VerifyDrawPrepEnabled();
+bool     FastUnmapEnabled();
+bool     FastGuestReadsEnabled();
+bool     ParallelHeapPrepEnabled();
+bool     ParallelBufferPrepEnabled();
+bool     XframeDrawStatsEnabled();
+bool     XframeSkipRepeatsEnabled();
+bool     DrawRecordsVerifyEnabled();
+bool     DrawRecordsEnabled();
+bool     FastColorClearChecksEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

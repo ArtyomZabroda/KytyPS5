@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -25,13 +26,28 @@ struct ImageHeapRequest {
 struct ImageHeapView {
 	uint64_t                         slots      = 0; // Device address of one slot per heap dword.
 	uint32_t                         slot_count = 0; // Keys past it select a trailing null slot.
-	std::span<const DescriptorValue> kinds; // One representative descriptor per kind.
+	std::span<const DescriptorValue> kinds;          // One representative descriptor per kind.
+};
+
+// A resident view as a thread preparing draws ahead saw it. The draw's commit acquires the
+// request again and redoes the draw's programs if the view changed. The request's root points
+// to root once the commit sets it.
+struct ImageHeapPeek {
+	ImageHeapRequest             request;
+	ImageResource                root;
+	uint64_t                     slots      = 0;
+	uint32_t                     slot_count = 0;
+	std::vector<DescriptorValue> kinds;
 };
 
 class ImageHeapSource {
 public:
 	// False when the host does not keep the table resident.
 	virtual bool Acquire(const ImageHeapRequest& request, ImageHeapView& view) = 0;
+	// Any thread: the view the last Acquire of the same request returned, without changing it.
+	virtual bool Peek(const ImageHeapRequest& /*request*/, ImageHeapPeek& /*peek*/) {
+		return false;
+	}
 
 protected:
 	~ImageHeapSource() = default;
@@ -49,8 +65,8 @@ struct SrtRuntime {
 
 class SrtReadCapture {
 public:
-	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
-	    m_source(source), m_ranges(ranges) {}
+	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges)
+	    : m_source(source), m_ranges(ranges) {}
 	SrtRuntime ObservedRuntime();
 
 private:
@@ -61,6 +77,15 @@ private:
 };
 
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
+
+// The calling thread's evaluation scratch. A walk leaves its results here until the thread's next
+// walk, so a plan's results are read on the thread that walked it, before any other walk.
+struct WalkScratch {
+	std::vector<uint64_t>                   srt;
+	std::vector<uint32_t>                   material_keys;
+	std::vector<ResourcePlan::SelectorKeys> selector_keys;
+};
+WalkScratch& ThreadWalkScratch();
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
@@ -83,11 +108,21 @@ bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 
+// Draw preparation ahead of the GPU thread. Between Begin and End, walker loads that fault on
+// this thread read zero instead of waiting for the GPU thread, and the first miss is kept.
+enum class SpeculativeMiss : uint8_t { None, WalkerFault, Memory, ImageHeap, Program };
+void                          BeginSpeculation() noexcept;
+[[nodiscard]] SpeculativeMiss EndSpeculation() noexcept;
+[[nodiscard]] bool            Speculating() noexcept;
+[[nodiscard]] SpeculativeMiss CurrentSpeculativeMiss() noexcept;
+// Does nothing outside speculation.
+void NoteSpeculativeMiss(SpeculativeMiss miss) noexcept;
+
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.
 template <size_t Size>
-std::optional<std::array<uint64_t, Size>> AffineIndex(
-    Value value, const auto& resolve, const auto& leaf, uint32_t depth = 0) {
+std::optional<std::array<uint64_t, Size>> AffineIndex(Value value, const auto& resolve,
+                                                      const auto& leaf, uint32_t depth = 0) {
 	value = resolve(value);
 	if (depth > 32u || value.GetType() != Type::U32) return {};
 	std::array<uint64_t, Size> result {};
@@ -103,13 +138,14 @@ std::optional<std::array<uint64_t, Size>> AffineIndex(
 	if (inst == nullptr) return {};
 	const auto op = inst->GetOpcode();
 	if (op != ValueOpcode::IAdd32 && op != ValueOpcode::IMul32 &&
-	    op != ValueOpcode::ShiftLeftLogical32) return {};
-	auto left = AffineIndex<Size>(inst->Arg(0), resolve, leaf, depth + 1u);
+	    op != ValueOpcode::ShiftLeftLogical32)
+		return {};
+	auto left  = AffineIndex<Size>(inst->Arg(0), resolve, leaf, depth + 1u);
 	auto right = AffineIndex<Size>(inst->Arg(1), resolve, leaf, depth + 1u);
 	if (!left || !right) return {};
 	const auto constant = [](const auto& coefficients) {
 		return std::ranges::all_of(std::span(coefficients).subspan(1u),
-		                          [](uint64_t coefficient) { return coefficient == 0u; });
+		                           [](uint64_t coefficient) { return coefficient == 0u; });
 	};
 	if (op == ValueOpcode::IMul32 && !constant(*right)) std::swap(left, right);
 	if (op != ValueOpcode::IAdd32 && !constant(*right)) return {};
@@ -118,8 +154,8 @@ std::optional<std::array<uint64_t, Size>> AffineIndex(
 		(*right)[0] = uint64_t {1} << (*right)[0];
 	}
 	for (size_t index = 0; index < Size; ++index) {
-		(*left)[index] = op == ValueOpcode::IAdd32
-		    ? (*left)[index] + (*right)[index] : (*left)[index] * (*right)[0];
+		(*left)[index] = op == ValueOpcode::IAdd32 ? (*left)[index] + (*right)[index]
+		                                           : (*left)[index] * (*right)[0];
 		if ((*left)[index] > UINT32_MAX) return {};
 	}
 	return left;

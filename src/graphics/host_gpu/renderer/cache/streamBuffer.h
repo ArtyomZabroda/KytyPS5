@@ -39,6 +39,9 @@ class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	// Wraps a buffer whose handle and memory the caller owns and destroys.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, vk::Buffer external,
+	       uint64_t size);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -48,7 +51,7 @@ public:
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
-	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
+	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept;
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
@@ -82,16 +85,16 @@ private:
 	                                              vk::AccessFlags source,
 	                                              vk::AccessFlags destination) const;
 
-	GraphicContext*               m_graphics    = nullptr;
-	CommandScheduler*             m_scheduler   = nullptr;
-	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
-	uint64_t                      m_cpu_address = 0;
-	vk::DeviceAddress             m_device_address = 0;
-	vk::Buffer                    m_buffer     = nullptr;
-	VmaAllocation                 m_allocation = nullptr;
-	uint64_t                      m_size;
-	bool                          m_coherent = false;
-	std::span<uint8_t>            m_mapped;
+	GraphicContext*    m_graphics       = nullptr;
+	CommandScheduler*  m_scheduler      = nullptr;
+	MemoryUsage        m_usage          = MemoryUsage::DeviceLocal;
+	uint64_t           m_cpu_address    = 0;
+	vk::DeviceAddress  m_device_address = 0;
+	vk::Buffer         m_buffer         = nullptr;
+	VmaAllocation      m_allocation     = nullptr;
+	uint64_t           m_size;
+	bool               m_coherent = false;
+	std::span<uint8_t> m_mapped;
 };
 
 class StreamBuffer final: public Buffer {

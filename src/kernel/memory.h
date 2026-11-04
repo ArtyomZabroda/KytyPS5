@@ -131,8 +131,15 @@ int  AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size,
 int  MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int  UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
-bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
-bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// Advances after each backing write, which page protection does not see.
+[[nodiscard]] uint64_t BackingWriteGeneration() noexcept;
+// The host address and size of the direct-memory backing's writable view, and the offset in it
+// of a guest range inside one backing mapping.
+uint64_t BackingBase();
+uint64_t BackingSize();
+bool     TranslateBacking(uint64_t vaddr, uint64_t size, uint64_t* backing_offset);
+bool     TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+bool     TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // Reads guest bytes from the backing store on the GPU thread when no GPU-written bytes overlap
 // them, without downloading. A page can be read-protected for GPU writes beside these bytes.
 [[nodiscard]] bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) noexcept;

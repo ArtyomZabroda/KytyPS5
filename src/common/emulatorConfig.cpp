@@ -253,6 +253,58 @@ bool PinGpuThreadsEnabled() {
 	return g_config->pin_gpu_threads_enabled;
 }
 
+bool DeferredEopLabelsEnabled() {
+	return g_config->deferred_eop_labels_enabled;
+}
+
+bool ZeroCopyBuffersEnabled() {
+	return g_config->zero_copy_buffers_enabled;
+}
+
+bool ParallelDrawPrepEnabled() {
+	return g_config->parallel_draw_prep_enabled;
+}
+
+bool VerifyDrawPrepEnabled() {
+	return g_config->verify_draw_prep_enabled;
+}
+
+bool FastUnmapEnabled() {
+	return g_config->fast_unmap_enabled;
+}
+
+bool FastGuestReadsEnabled() {
+	return g_config->fast_guest_reads_enabled;
+}
+
+bool ParallelHeapPrepEnabled() {
+	return g_config->parallel_heap_prep_enabled;
+}
+
+bool ParallelBufferPrepEnabled() {
+	return g_config->parallel_buffer_prep_enabled;
+}
+
+bool XframeDrawStatsEnabled() {
+	return g_config->xframe_draw_stats_enabled || g_config->xframe_skip_repeats_enabled;
+}
+
+bool XframeSkipRepeatsEnabled() {
+	return g_config->xframe_skip_repeats_enabled;
+}
+
+bool DrawRecordsVerifyEnabled() {
+	return g_config->draw_records_verify_enabled;
+}
+
+bool DrawRecordsEnabled() {
+	return g_config->draw_records_enabled;
+}
+
+bool FastColorClearChecksEnabled() {
+	return g_config->fast_color_clear_checks_enabled;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;

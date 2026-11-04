@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -17,9 +18,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -235,7 +238,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 	};
 	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		m_scheduler.DeferPriorityOperation(std::move(publish), vaddr, size);
 	} else {
 		namespace Counters   = Common::DebugCounters;
 		const auto source    = Counters::CurrentReadbackSource();
@@ -281,6 +284,18 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
+	if (Config::ParallelBufferPrepEnabled() && Config::ParallelDrawPrepEnabled() &&
+	    !Config::ZeroCopyBuffersEnabled()) {
+		m_prestream_ring = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 0,
+		                                            AllFlags, 64 * MiB);
+		if (m_prestream_ring->Mapped().empty()) {
+			m_prestream_ring.reset();
+		}
+		const auto& limits    = m_graphics.physical_device_properties.limits;
+		m_prestream_alignment = std::max({uint64_t {limits.minUniformBufferOffsetAlignment},
+		                                  uint64_t {limits.minStorageBufferOffsetAlignment},
+		                                  uint64_t {limits.nonCoherentAtomSize}, uint64_t {16}});
+	}
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
 	m_scheduler.BeginCommand();
@@ -291,6 +306,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	StartZeroCopy();
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -306,6 +322,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	StopZeroCopy();
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -481,6 +498,23 @@ struct ObtainedRange {
 constexpr size_t                                             OBTAINED_RANGE_SLOTS = 1024;
 thread_local std::array<ObtainedRange, OBTAINED_RANGE_SLOTS> t_obtained_ranges {};
 
+// Times parts of ObtainBuffer only for draw bindings, so vertex buffers keep their own phase.
+class BindingBufferPhase final {
+public:
+	BindingBufferPhase()
+	    : m_active(std::strcmp(Common::DebugCounters::CurrentDrawPhase(),
+	                           "PrepareGraphicsBindings/Buffers") == 0) {}
+	void Switch(const char* part) {
+		m_phase.reset();
+		if (m_active) m_phase.emplace(part);
+	}
+	void Reset() { m_phase.reset(); }
+
+private:
+	bool                                                     m_active;
+	std::optional<Common::DebugCounters::ScopedDrawSubPhase> m_phase;
+};
+
 bool RepeatsInCommandBuffer(uint64_t vaddr, uint64_t size, uint64_t tick) {
 	const auto hash   = (vaddr ^ (size * 0x9e3779b97f4a7c15ull)) * 0xff51afd7ed558ccdull;
 	auto&      entry  = t_obtained_ranges[(hash >> 32u) % OBTAINED_RANGE_SLOTS];
@@ -611,8 +645,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	};
 
+	BindingBufferPhase phase;
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    m_memory_tracker.IsRegionOnlyCpuModified(vaddr, size)) {
+		phase.Switch("PrepareGraphicsBindings/BStream");
 		const auto streamed = [&](uint64_t offset) -> std::pair<Buffer*, uint64_t> {
 			Common::DebugCounters::Add(Counter::BufferObtainStreamed);
 			if (cached_id) {
@@ -623,6 +659,36 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			}
 			return {&m_stream_buffer, offset};
 		};
+		if (m_zero_copy && !is_texel_buffer) {
+			std::pair<Buffer*, uint64_t> zero_copy {};
+			if (ObtainZeroCopy(vaddr, size, zero_copy)) {
+				Common::DebugCounters::Add(Counter::BufferObtainZeroCopy);
+				if (cached_id) {
+					report_mismatch("zero-copy", {});
+				}
+				if (clean != nullptr && clean->vaddr == vaddr && clean->size == size) {
+					*clean = {};
+				}
+				return zero_copy;
+			}
+		}
+		if (m_prestream_draw != nullptr) {
+			const auto& copies = m_prestream_draw->copies;
+			const auto  copy   = std::ranges::find_if(copies, [&](const PrestreamCopy& candidate) {
+				return candidate.vaddr == vaddr && candidate.size == size;
+			});
+			if (copy != copies.end() &&
+			    copy->generation == m_memory_tracker.CpuDirtyGeneration(vaddr, size)) {
+				Common::DebugCounters::Add(Counter::DrawPrepBufferHits);
+				if (cached_id) {
+					report_mismatch("prestreamed", {});
+				}
+				if (clean != nullptr && clean->vaddr == vaddr && clean->size == size) {
+					*clean = {};
+				}
+				return {m_prestream_ring.get(), copy->offset};
+			}
+		}
 		const auto read_guest = [&](void* destination) {
 			if (!LibKernel::Memory::CopySparseMemory(vaddr, destination, size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
@@ -671,13 +737,17 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
+	phase.Reset();
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		phase.Switch("PrepareGraphicsBindings/BFind");
 		id = FindBuffer(vaddr, size);
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	t_synchronize_uploaded = false;
+	phase.Switch("PrepareGraphicsBindings/BSync");
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	phase.Reset();
 	if (counting) {
 		if (t_synchronize_uploaded) {
 			Common::DebugCounters::Add(Counter::BufferObtainUploads);
@@ -689,6 +759,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 	if (is_written) {
+		if (!m_gpu_modified_ranges.Contains(vaddr, size)) {
+			m_gpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
 	}
@@ -704,6 +777,96 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		*clean = {vaddr, size, dirty_generation, m_buffers_generation, id};
 	}
 	return {&buffer, buffer.Offset(vaddr)};
+}
+
+void BufferCache::BeginPrestream(PrestreamDraw& draw) {
+	draw.copies.clear();
+	draw.entry = 0;
+}
+
+bool BufferCache::AllocatePrestream(PrestreamDraw& draw, uint64_t size, uint64_t& offset) {
+	const auto             capacity = m_prestream_ring->Size();
+	const std::scoped_lock lock {m_prestream_mutex};
+
+	auto& entries = m_prestream_entries;
+	while (!entries.empty() && entries.front().committed &&
+	       m_scheduler.IsFree(entries.front().tick)) {
+		entries.pop_front();
+	}
+	auto start = Common::AlignUp(m_prestream_head, m_prestream_alignment);
+	if (entries.empty()) {
+		if (start > capacity || size > capacity - start) {
+			start = 0;
+		}
+	} else if (const auto tail = entries.front().begin; m_prestream_head >= tail) {
+		// In use: [tail, head).
+		if (start > capacity || size > capacity - start) {
+			if (size >= tail) {
+				return false;
+			}
+			start = 0;
+		}
+	} else if (start >= tail || size >= tail - start) {
+		// In use: [tail, capacity) and [0, head).
+		return false;
+	}
+	offset           = start;
+	m_prestream_head = start + size;
+	if (draw.entry == 0) {
+		draw.entry = m_prestream_next_id++;
+		entries.push_back({.id = draw.entry, .begin = start, .end = m_prestream_head});
+	} else {
+		entries.back().end = m_prestream_head;
+	}
+	return true;
+}
+
+void BufferCache::Prestream(PrestreamDraw& draw, uint64_t vaddr, uint64_t size) {
+	using Common::DebugCounters::Counter;
+	if (m_prestream_ring == nullptr || size > CACHING_PAGESIZE ||
+	    !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	for (const auto& copy: draw.copies) {
+		if (copy.vaddr == vaddr && copy.size == size) {
+			return;
+		}
+	}
+	// Read before the checks: a CPU write after this point advances the generation.
+	const auto generation = m_memory_tracker.CpuDirtyGeneration(vaddr, size);
+	if (generation == 0 || !m_memory_tracker.IsRegionOnlyCpuModified(vaddr, size)) {
+		return;
+	}
+	const auto reserved = Common::AlignUp(size, m_prestream_alignment);
+	uint64_t   offset   = 0;
+	if (!AllocatePrestream(draw, reserved, offset)) {
+		Common::DebugCounters::Add(Counter::DrawPrepBufferFull);
+		return;
+	}
+	if (!LibKernel::Memory::CopySparseMemory(vaddr, m_prestream_ring->Mapped().data() + offset,
+	                                         size)) {
+		return;
+	}
+	m_prestream_ring->Flush(offset, reserved);
+	draw.copies.push_back({vaddr, size, offset, generation});
+	Common::DebugCounters::Add(Counter::DrawPrepBufferCopies);
+}
+
+void BufferCache::RetirePrestream(PrestreamDraw& draw) {
+	if (draw.entry == 0) {
+		return;
+	}
+	const auto             tick = m_scheduler.CurrentTick();
+	const std::scoped_lock lock {m_prestream_mutex};
+	for (auto& entry: m_prestream_entries) {
+		if (entry.id == draw.entry) {
+			entry.committed = true;
+			entry.tick      = tick;
+			break;
+		}
+	}
+	draw.entry = 0;
+	draw.copies.clear();
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
@@ -745,8 +908,221 @@ void BufferCache::ReportStreamedCopyMismatch(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+static constexpr uint64_t ZERO_COPY_CHUNK_SIZE = uint64_t {256} << 20u;
+static constexpr uint32_t ZERO_COPY_MAX_CHUNKS = 8;
+static constexpr uint64_t ZERO_COPY_PAGE_BITS  = 12;
+// A page tick that keeps the page out of imported memory.
+static constexpr uint64_t ZERO_COPY_EXCLUDED = UINT64_MAX;
+
+struct BufferCache::ZeroCopyChunk {
+	enum State : uint8_t { None, Requested, Ready, Failed };
+	std::atomic<uint8_t>    state {None};
+	VkDeviceMemory          memory = VK_NULL_HANDLE;
+	VkBuffer                handle = VK_NULL_HANDLE;
+	std::unique_ptr<Buffer> buffer;
+	// Per page: the tick of the last command buffer that read it, or ZERO_COPY_EXCLUDED.
+	std::unique_ptr<uint64_t[]> page_ticks;
+};
+
+void BufferCache::StartZeroCopy() {
+	if (!Config::ZeroCopyBuffersEnabled()) {
+		return;
+	}
+	auto&      d    = VULKAN_HPP_DEFAULT_DISPATCHER;
+	const auto base = LibKernel::Memory::BackingBase();
+	const auto size = LibKernel::Memory::BackingSize();
+
+	VkMemoryHostPointerPropertiesEXT properties {
+	    VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+	if (d.vkGetMemoryHostPointerPropertiesEXT == nullptr || base == 0 || (base & 0xfffu) != 0 ||
+	    d.vkGetMemoryHostPointerPropertiesEXT(
+	        m_graphics.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+	        reinterpret_cast<const void*>(base), &properties) != VK_SUCCESS ||
+	    properties.memoryTypeBits == 0) {
+		LOGF_COLOR(Log::Color::BrightRed,
+		           "BufferCache: zero-copy buffers unavailable, guest memory cannot be imported\n");
+		return;
+	}
+	const auto& memory = m_graphics.physical_device_memory_properties;
+	uint32_t    type   = UINT32_MAX;
+	for (uint32_t i = 0; i < memory.memoryTypeCount; i++) {
+		const bool coherent =
+		    bool(memory.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostCoherent);
+		if ((properties.memoryTypeBits & (1u << i)) != 0 && (type == UINT32_MAX || coherent)) {
+			type = i;
+		}
+	}
+	m_zero_copy_base        = base;
+	m_zero_copy_size        = size;
+	m_zero_copy_memory_type = type;
+	m_zero_copy_chunks.resize((size + ZERO_COPY_CHUNK_SIZE - 1) / ZERO_COPY_CHUNK_SIZE);
+	for (auto& chunk: m_zero_copy_chunks) {
+		chunk = std::make_unique<ZeroCopyChunk>();
+	}
+	m_zero_copy_thread =
+	    std::jthread([this](std::stop_token stop) { ZeroCopyImportThread(std::move(stop)); });
+	m_zero_copy = true;
+	LOGF_COLOR(Log::Color::BrightGreen,
+	           "BufferCache: zero-copy buffers on, memory type %u, up to %u chunks of %" PRIu64
+	           " MB\n",
+	           type, ZERO_COPY_MAX_CHUNKS, ZERO_COPY_CHUNK_SIZE >> 20u);
+}
+
+void BufferCache::StopZeroCopy() {
+	if (!m_zero_copy) {
+		return;
+	}
+	m_zero_copy_thread.request_stop();
+	if (m_zero_copy_thread.joinable()) {
+		m_zero_copy_thread.join();
+	}
+	auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+	for (auto& chunk: m_zero_copy_chunks) {
+		chunk->buffer.reset();
+		if (chunk->handle != VK_NULL_HANDLE) {
+			d.vkDestroyBuffer(m_graphics.device, chunk->handle, nullptr);
+		}
+		if (chunk->memory != VK_NULL_HANDLE) {
+			d.vkFreeMemory(m_graphics.device, chunk->memory, nullptr);
+		}
+	}
+	m_zero_copy_chunks.clear();
+	m_zero_copy = false;
+}
+
+void BufferCache::ZeroCopyImportThread(std::stop_token stop) {
+	auto&          d      = VULKAN_HPP_DEFAULT_DISPATCHER;
+	const VkDevice device = m_graphics.device;
+	for (;;) {
+		uint32_t index = 0;
+		{
+			std::unique_lock lock(m_zero_copy_mutex);
+			if (!m_zero_copy_available.wait(lock, stop,
+			                                [this] { return !m_zero_copy_requests.empty(); })) {
+				return;
+			}
+			index = m_zero_copy_requests.back();
+			m_zero_copy_requests.pop_back();
+		}
+		auto&      chunk  = *m_zero_copy_chunks[index];
+		const auto offset = uint64_t {index} * ZERO_COPY_CHUNK_SIZE;
+		const auto bytes  = std::min(ZERO_COPY_CHUNK_SIZE, m_zero_copy_size - offset);
+		const auto start  = std::chrono::steady_clock::now();
+
+		VkImportMemoryHostPointerInfoEXT import {
+		    VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+		import.handleType   = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+		import.pHostPointer = reinterpret_cast<void*>(m_zero_copy_base + offset);
+		VkMemoryAllocateInfo allocate {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import};
+		allocate.allocationSize  = bytes;
+		allocate.memoryTypeIndex = m_zero_copy_memory_type;
+		VkExternalMemoryBufferCreateInfo external {
+		    VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+		external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+		create.size  = bytes;
+		create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+		               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+		               VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+		bool ok = d.vkAllocateMemory(device, &allocate, nullptr, &chunk.memory) == VK_SUCCESS &&
+		          d.vkCreateBuffer(device, &create, nullptr, &chunk.handle) == VK_SUCCESS &&
+		          d.vkBindBufferMemory(device, chunk.handle, chunk.memory, 0) == VK_SUCCESS;
+		if (ok) {
+			chunk.page_ticks = std::make_unique<uint64_t[]>(bytes >> ZERO_COPY_PAGE_BITS);
+			chunk.buffer =
+			    std::make_unique<Buffer>(m_graphics, m_scheduler, vk::Buffer {chunk.handle}, bytes);
+		}
+		const auto ms =
+		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+		        .count();
+		LOGF_COLOR(ok ? Log::Color::BrightGreen : Log::Color::BrightRed,
+		           "BufferCache: zero-copy chunk %u (%" PRIu64 " MB at 0x%016" PRIx64
+		           ") %s in %.1f ms\n",
+		           index, bytes >> 20u, offset, ok ? "imported" : "failed", ms);
+		chunk.state.store(ok ? ZeroCopyChunk::Ready : ZeroCopyChunk::Failed,
+		                  std::memory_order_release);
+	}
+}
+
+bool BufferCache::ObtainZeroCopy(uint64_t vaddr, uint64_t size,
+                                 std::pair<Buffer*, uint64_t>& result) {
+	uint64_t offset = 0;
+	if (!LibKernel::Memory::TranslateBacking(vaddr, size, &offset)) {
+		return false;
+	}
+	const auto index = offset / ZERO_COPY_CHUNK_SIZE;
+	if (index >= m_zero_copy_chunks.size() || (offset + size - 1) / ZERO_COPY_CHUNK_SIZE != index) {
+		return false;
+	}
+	auto&      chunk = *m_zero_copy_chunks[index];
+	const auto state = chunk.state.load(std::memory_order_acquire);
+	if (state != ZeroCopyChunk::Ready) {
+		if (state == ZeroCopyChunk::None && m_zero_copy_requested < ZERO_COPY_MAX_CHUNKS) {
+			chunk.state.store(ZeroCopyChunk::Requested, std::memory_order_relaxed);
+			++m_zero_copy_requested;
+			{
+				std::lock_guard lock(m_zero_copy_mutex);
+				m_zero_copy_requests.push_back(static_cast<uint32_t>(index));
+			}
+			m_zero_copy_available.notify_one();
+		}
+		return false;
+	}
+	const auto local = offset - index * ZERO_COPY_CHUNK_SIZE;
+	const auto first = local >> ZERO_COPY_PAGE_BITS;
+	const auto last  = (local + size - 1) >> ZERO_COPY_PAGE_BITS;
+	for (auto page = first; page <= last; page++) {
+		if (chunk.page_ticks[page] == ZERO_COPY_EXCLUDED) {
+			return false;
+		}
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	for (auto page = first; page <= last; page++) {
+		chunk.page_ticks[page] = tick;
+	}
+	result = {chunk.buffer.get(), local};
+	return true;
+}
+
+void BufferCache::NoteCommandWrite(uint64_t vaddr, uint64_t size) {
+	if (!m_zero_copy || size == 0) {
+		return;
+	}
+	bool wait = false;
+	for (auto page = vaddr >> ZERO_COPY_PAGE_BITS;
+	     page <= (vaddr + size - 1) >> ZERO_COPY_PAGE_BITS; page++) {
+		uint64_t offset = 0;
+		if (!LibKernel::Memory::TranslateBacking(page << ZERO_COPY_PAGE_BITS,
+		                                         uint64_t {1} << ZERO_COPY_PAGE_BITS, &offset)) {
+			continue;
+		}
+		const auto index = offset / ZERO_COPY_CHUNK_SIZE;
+		if (index >= m_zero_copy_chunks.size()) {
+			continue;
+		}
+		auto& chunk = *m_zero_copy_chunks[index];
+		if (chunk.state.load(std::memory_order_acquire) != ZeroCopyChunk::Ready) {
+			continue;
+		}
+		auto& tick =
+		    chunk.page_ticks[(offset - index * ZERO_COPY_CHUNK_SIZE) >> ZERO_COPY_PAGE_BITS];
+		if (tick != 0 && tick != ZERO_COPY_EXCLUDED && !m_scheduler.IsFree(tick)) {
+			wait = true;
+			tick = ZERO_COPY_EXCLUDED;
+		}
+	}
+	if (wait) {
+		// Submitted work must read the bytes from before this write; later work copies them.
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::ZeroCopyWriteWaits);
+		m_scheduler.Finish();
+	}
+}
+
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
 	ForgetStreamedCopies();
+	if (!is_gds) {
+		NoteCommandWrite(vaddr, size);
+	}
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");
 	}
@@ -776,6 +1152,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
 	ForgetStreamedCopies();
+	if (!dst_gds) {
+		NoteCommandWrite(dst_vaddr, size);
+	}
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
 	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||
@@ -840,8 +1219,15 @@ bool BufferCache::IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t
 }
 
 void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
+	bool forgot = false;
 	for (auto& checked: m_checked_color_metadata) {
-		checked.Subtract(vaddr, size);
+		if (checked.Intersects(vaddr, size)) {
+			checked.Subtract(vaddr, size);
+			forgot = true;
+		}
+	}
+	if (forgot) {
+		m_color_check_generation.fetch_add(1, std::memory_order_acq_rel);
 	}
 }
 

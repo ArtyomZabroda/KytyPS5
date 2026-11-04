@@ -42,6 +42,16 @@ public:
 		    m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
 		return manager != nullptr ? manager->CpuDirtyGeneration() : 0;
 	}
+	// GPU-dirty generation of the region holding the range, as CpuDirtyGeneration.
+	[[nodiscard]] uint64_t GpuDirtyGeneration(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || vaddr / TRACKER_REGION_SIZE != (vaddr + size - 1) / TRACKER_REGION_SIZE ||
+		    vaddr / TRACKER_REGION_SIZE >= REGION_COUNT) {
+			return 0;
+		}
+		const auto* manager =
+		    m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		return manager != nullptr ? manager->GpuDirtyGeneration() : 0;
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {

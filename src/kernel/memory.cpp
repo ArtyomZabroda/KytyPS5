@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -16,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <vector>
@@ -897,9 +900,30 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
-bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+uint64_t BackingBase() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetBackingBase() : 0;
+}
+
+uint64_t BackingSize() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetBackingSize() : 0;
+}
+
+bool TranslateBacking(uint64_t vaddr, uint64_t size, uint64_t* backing_offset) {
 	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	       g_guest_address_space->TranslateBacking(vaddr, size, backing_offset);
+}
+
+static std::atomic<uint64_t> g_backing_write_generation {1};
+
+bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	const bool written = g_guest_address_space != nullptr &&
+	                     g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	g_backing_write_generation.fetch_add(1, std::memory_order_acq_rel);
+	return written;
+}
+
+uint64_t BackingWriteGeneration() noexcept {
+	return g_backing_write_generation.load(std::memory_order_acquire);
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {

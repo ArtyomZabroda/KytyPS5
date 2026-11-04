@@ -24,6 +24,31 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+	// What FindImage returned: image_id names the depth image of a stencil association instead.
+	ImageId found_id;
+};
+
+struct TextureShape {
+	TextureCache::ImageDesc desc;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	bool                    shader_conversion = false;
+	// Metadata, view and storage checks follow the heap mapping test, as they did per draw.
+	bool complete = false;
+};
+
+// A texture's guest description, decoded without the texture cache.
+struct DecodedTexture {
+	ShaderTextureResource descriptor;
+	TextureShape          shape;
+	// Null descriptors and unmapped heap entries bind nothing.
+	bool null = true;
+};
+
+// A sampler's guest description, decoded without the sampler cache.
+struct DecodedSampler {
+	ShaderSamplerResource descriptor;
+	bool                  integer_border = false;
 };
 
 struct PreparedBindings {
@@ -46,6 +71,12 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
+	// Decoded from the snapshot before the caches are used.
+	std::vector<DecodedTexture> decoded_images;
+	std::vector<DecodedSampler> decoded_samplers;
+	// --draw-records: the bindings a record repeats instead of looking the textures up.
+	const std::vector<TextureBinding>* replay_images   = nullptr;
+	const std::vector<vk::Sampler>*    replay_samplers = nullptr;
 };
 
 [[nodiscard]] vk::DescriptorType

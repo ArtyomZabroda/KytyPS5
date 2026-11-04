@@ -42,6 +42,9 @@ public:
 	}
 	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request,
 	             ShaderRecompiler::IR::ImageHeapView&          result) override;
+	// --parallel-heap-prep: the views Acquire published, for the draw prep worker.
+	bool Peek(const ShaderRecompiler::IR::ImageHeapRequest& request,
+	          ShaderRecompiler::IR::ImageHeapPeek&          peek) override;
 	// Image discovery: resolves new elements and rediscovers changed images.
 	void Rebind(RenderExecutor& executor);
 	// Recording: uploads slots and moves resident images to their read layout.
@@ -64,6 +67,19 @@ private:
 
 	struct Memory;
 	struct View;
+
+	// What Acquire returned for a request, kept for Peek.
+	struct Published {
+		uint64_t                            base  = 0;
+		uint64_t                            size  = 0;
+		uint64_t                            step  = 0;
+		uint64_t                            first = 0;
+		uint64_t                            limit = 0;
+		ShaderRecompiler::IR::ImageResource profile;
+		uint64_t                            slots      = 0;
+		uint32_t                            slot_count = 0;
+		std::vector<DescriptorValue>        kinds;
+	};
 
 	struct Element {
 		DescriptorValue value;
@@ -131,6 +147,7 @@ private:
 	void     Retire(View& view);
 	void     Resize(Memory& memory, uint64_t size);
 	void     WriteDescriptors();
+	void     Publish(const Published& key, const ShaderRecompiler::IR::ImageHeapView& view);
 
 	RenderContext&                         m_context;
 	PageManager&                           m_page_manager;
@@ -153,6 +170,8 @@ private:
 	vk::DescriptorSetLayout                   m_layout = nullptr;
 	vk::DescriptorPool                        m_pool   = nullptr;
 	vk::DescriptorSet                         m_set    = nullptr;
+	std::mutex                                m_published_mutex; // m_published.
+	std::vector<Published>                    m_published;
 
 	friend struct ImageHeapTestAccess;
 };

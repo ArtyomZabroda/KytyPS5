@@ -10,11 +10,10 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
-
-#include <queue>
-
 #include <thread>
 #include <vector>
 
@@ -46,9 +45,14 @@ public:
 	void DrainPriorityOperations();
 	void WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
-	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
-	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
-	[[nodiscard]] bool        HasPendingPriorityOperations();
+	void DeferOperation(Common::UniqueFunction<void>&& operation);
+	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// The operation touches guest memory only in [vaddr, vaddr + size); size 0 touches none.
+	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation, uint64_t vaddr,
+	                            uint64_t size);
+	[[nodiscard]] bool HasPendingPriorityOperations();
+	// Whether a queued or running priority operation may touch guest memory in the range.
+	[[nodiscard]] bool        PriorityOperationsTouch(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 	// Called between guest packets after a draw or dispatch. Guest command buffers can hold a
 	// whole frame; without this the GPU idles until the next readback or flush, which then waits
@@ -95,12 +99,16 @@ private:
 	struct PendingOperation {
 		Common::UniqueFunction<void> callback;
 		uint64_t                     tick = 0;
+		// The guest memory the operation may touch; by default all of it.
+		uint64_t touch_begin = 0;
+		uint64_t touch_end   = UINT64_MAX;
 	};
 
 	void     BeginNext();
 	uint64_t SubmitRecorded(SubmitInfo& submit);
 	void     PriorityOperationsThread(std::stop_token stop);
-	void     QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
+	void     QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+	                        uint64_t touch_begin = 0, uint64_t touch_end = UINT64_MAX);
 	void     RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore                       m_master;
@@ -111,14 +119,16 @@ private:
 	CommandBuffer                         m_command;
 	DynamicState                          m_dynamic_state;
 	std::chrono::steady_clock::time_point m_command_begin;
-	std::queue<PendingOperation>          m_pending_operations;
-	std::queue<PendingOperation>          m_priority_operations;
+	std::deque<PendingOperation>          m_pending_operations;
+	std::deque<PendingOperation>          m_priority_operations;
 	std::mutex                            m_operation_mutex;
 	std::condition_variable               m_operation_available;
 	std::jthread                          m_priority_thread;
-	bool                                  m_priority_active      = false;
-	uint64_t                              m_priority_active_tick = 0;
-	OperationState                        m_operation_state      = OperationState::Open;
+	bool                                  m_priority_active       = false;
+	uint64_t                              m_priority_active_tick  = 0;
+	uint64_t                              m_priority_active_begin = 0;
+	uint64_t                              m_priority_active_end   = 0;
+	OperationState                        m_operation_state       = OperationState::Open;
 };
 
 } // namespace Libs::Graphics

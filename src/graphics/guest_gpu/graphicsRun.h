@@ -32,6 +32,9 @@ public:
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	[[nodiscard]] bool HasPendingCommands() const {
+		return m_pending_commands.load(std::memory_order_acquire) != 0;
+	}
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> commands);
@@ -44,6 +47,9 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// On the GPU thread during command processing, runs the commands other threads sent. A thread
+	// the GPU thread waits for may itself wait for one.
+	static void RunPendingCommands();
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;

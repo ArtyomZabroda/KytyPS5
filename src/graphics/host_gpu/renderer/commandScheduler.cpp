@@ -265,7 +265,7 @@ void CommandScheduler::PopPendingOperations() {
 				return;
 			}
 			operation = std::move(m_pending_operations.front());
-			m_pending_operations.pop();
+			m_pending_operations.pop_front();
 		}
 		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
@@ -280,13 +280,19 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 	QueueOperation(std::move(operation), true);
 }
 
-void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+                                              uint64_t vaddr, uint64_t size) {
+	QueueOperation(std::move(operation), true, vaddr, vaddr + size);
+}
+
+void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+                                      uint64_t touch_begin, uint64_t touch_end) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
 		auto& queue = priority ? m_priority_operations : m_pending_operations;
-		queue.push({std::move(operation), CurrentTick()});
+		queue.push_back({std::move(operation), CurrentTick(), touch_begin, touch_end});
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();
@@ -306,6 +312,20 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 	return !m_priority_operations.empty() || m_priority_active;
 }
 
+bool CommandScheduler::PriorityOperationsTouch(uint64_t vaddr, uint64_t size) {
+	const auto end     = vaddr + size;
+	const auto touches = [&](uint64_t begin, uint64_t finish) {
+		return begin < finish && begin < end && vaddr < finish;
+	};
+	std::lock_guard lock(m_operation_mutex);
+	if (m_priority_active && touches(m_priority_active_begin, m_priority_active_end)) {
+		return true;
+	}
+	return std::ranges::any_of(m_priority_operations, [&](const PendingOperation& operation) {
+		return touches(operation.touch_begin, operation.touch_end);
+	});
+}
+
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	const Common::DebugCounters::ScopedGpuWaitSite wait_site(
 	    Common::DebugCounters::GpuWaitSite::Background);
@@ -320,9 +340,11 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 				return;
 			}
 			operation = std::move(m_priority_operations.front());
-			m_priority_operations.pop();
-			m_priority_active      = true;
-			m_priority_active_tick = operation.tick;
+			m_priority_operations.pop_front();
+			m_priority_active       = true;
+			m_priority_active_tick  = operation.tick;
+			m_priority_active_begin = operation.touch_begin;
+			m_priority_active_end   = operation.touch_end;
 		}
 		m_master.Wait(operation.tick);
 		if (!stop.stop_requested()) {
@@ -330,8 +352,10 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		}
 		{
 			std::lock_guard lock(m_operation_mutex);
-			m_priority_active      = false;
-			m_priority_active_tick = 0;
+			m_priority_active       = false;
+			m_priority_active_tick  = 0;
+			m_priority_active_begin = 0;
+			m_priority_active_end   = 0;
 		}
 		m_operation_available.notify_all();
 	}

@@ -46,6 +46,49 @@ struct ImageBinding {
 	bool             shader_write  = false;
 };
 
+// MaterializeColorClear found nothing to do for these inputs while these generations hold
+// (--fast-color-clear-checks).
+struct ColorClearStamp {
+	enum class Kind : uint8_t { None, Trivial, GpuChecked, Cpu };
+	struct Key {
+		uint64_t metadata_address             = 0;
+		uint64_t metadata_size                = 0;
+		uint64_t clear_word                   = 0;
+		uint32_t control                      = 0;
+		uint32_t metadata_flags               = 0;
+		uint32_t view_format                  = 0;
+		uint32_t view_type                    = 0;
+		uint32_t base_level                   = 0;
+		uint32_t level_count                  = 0;
+		uint32_t base_layer                   = 0;
+		uint32_t layer_count                  = 0;
+		uint32_t pixel_format                 = 0;
+		uint32_t guest_format                 = 0;
+		uint32_t image_type                   = 0;
+		uint32_t width                        = 0;
+		uint32_t height                       = 0;
+		uint32_t depth                        = 0;
+		uint32_t levels                       = 0;
+		uint32_t layers                       = 0;
+		uint32_t tile_mode                    = 0;
+		uint32_t bytes_per_block              = 0;
+		uint32_t binding                      = 0;
+		uint32_t metadata_base_layer          = 0;
+		bool     operator==(const Key&) const = default;
+	};
+	Key  key;
+	Kind kind = Kind::None;
+	// TextureCache surface metadata and BufferCache checked-metadata generations.
+	uint64_t surface_generation = 0;
+	uint64_t check_generation   = 0;
+	// The metadata bytes read, with their region's dirty generations and the backing writes.
+	uint64_t viewed_address     = 0;
+	uint64_t viewed_size        = 0;
+	uint64_t cpu_generation     = 0;
+	uint64_t gpu_generation     = 0;
+	uint64_t backing_generation = 0;
+};
+
 class Image final {
 public:
 	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
@@ -173,6 +216,8 @@ public:
 	size_t   lru_id              = 0;
 	// m_gc_tick of the last LRU touch; repeated touches within one tick change nothing.
 	uint64_t lru_tick = UINT64_MAX;
+	// The latest first; an image bound in two ways keeps a stamp for each.
+	std::array<ColorClearStamp, 2> color_clear_stamps {};
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 	// heap_epoch after this image's last HeapChanged.

@@ -2,11 +2,13 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <bit>
@@ -141,6 +143,10 @@ void FaultManager::ProcessFaultBuffer() {
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
+			// --fast-unmap: an unmap no longer runs this first, so the range may be gone.
+			if (Config::FastUnmapEnabled() && !m_scheduler.Context().IsMapped(start, end - start)) {
+				return;
+			}
 			(void)m_buffer_cache.FindBuffer(start, end - start);
 		});
 		m_fault_areas[area] = 0;

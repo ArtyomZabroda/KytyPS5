@@ -26,11 +26,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <semaphore>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -104,6 +106,12 @@ void GuestGpu::ProcessCommands() {
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
 		command();
+	}
+}
+
+void GuestGpu::RunPendingCommands() {
+	if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
+		g_gpu_state->ProcessCommands();
 	}
 }
 
@@ -251,6 +259,55 @@ void CommandProcessor::WaitForRewind(bool valid) {
 	}
 }
 
+// --deferred-eop-labels: label values written at parse time for the command processor, while
+// the guest sees each label only after the GPU finishes the work before it. Vulkan submission
+// order already orders packets after the work, so they need not wait for the guest write.
+struct ShadowLabel {
+	uint64_t value;
+	uint32_t size;
+	uint64_t seq;
+};
+static std::unordered_map<uint64_t, ShadowLabel> g_shadow_labels;
+static uint64_t                                  g_shadow_label_seq = 0;
+
+static void ForgetShadowLabels(uint64_t vaddr, uint64_t size) {
+	if (g_shadow_labels.empty()) {
+		return;
+	}
+	for (auto it = g_shadow_labels.begin(); it != g_shadow_labels.end();) {
+		const bool overlaps = it->first < vaddr + size && vaddr < it->first + it->second.size;
+		it                  = overlaps ? g_shadow_labels.erase(it) : std::next(it);
+	}
+}
+
+uint64_t ReadPm4Label(const volatile void* address, uint32_t size) {
+	const auto vaddr = reinterpret_cast<uint64_t>(address);
+	uint64_t   value = 0;
+	if (size == sizeof(uint32_t)) {
+		value = *static_cast<const volatile uint32_t*>(address);
+	} else {
+		value = *static_cast<const volatile uint64_t*>(address);
+	}
+	if (g_shadow_labels.empty()) {
+		return value;
+	}
+	// Labels are 4- or 8-byte aligned, so only these starts can overlap the read.
+	for (const uint64_t start: {vaddr - 4, vaddr, vaddr + 4}) {
+		const auto it = g_shadow_labels.find(start);
+		if (it == g_shadow_labels.end()) {
+			continue;
+		}
+		const uint64_t lo = std::max(start, vaddr);
+		const uint64_t hi = std::min(start + it->second.size, vaddr + size);
+		if (lo < hi) {
+			std::memcpy(reinterpret_cast<uint8_t*>(&value) + (lo - vaddr),
+			            reinterpret_cast<const uint8_t*>(&it->second.value) + (lo - start),
+			            hi - lo);
+		}
+	}
+	return value;
+}
+
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
 	switch (func) {
 		case 0: return true;
@@ -275,7 +332,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	if (!TestWaitRegMemValue(ReadPm4Label(addr, sizeof(T)), ref, mask, func)) {
 		SuspendPm4();
 	}
 }
@@ -312,6 +369,11 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 	m_renderer.GetBufferCache().ForgetStreamedCopies();
+	m_renderer.GetBufferCache().NoteCommandWrite(reinterpret_cast<uint64_t>(dst),
+	                                             write_one_address ? sizeof(uint32_t)
+	                                                               : dw_num * sizeof(uint32_t));
+	ForgetShadowLabels(reinterpret_cast<uint64_t>(dst),
+	                   write_one_address ? sizeof(uint32_t) : dw_num * sizeof(uint32_t));
 
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
@@ -329,6 +391,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	const auto value = Sync::ReadReferenceClock();
 	m_renderer.GetBufferCache().ForgetStreamedCopies();
+	m_renderer.GetBufferCache().NoteCommandWrite(dst_address, num_bytes);
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
@@ -570,7 +633,7 @@ bool GuestGpu::Process(Submission& submission) {
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
+			    [ready = m_suspend_point_ready] { ready->release(); }, 0, 0);
 			cp.BufferFlush();
 			cp.Reset();
 			break;
@@ -622,6 +685,21 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
+// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
+// downloads GPU-written bytes under the label before the store. Runs on the GPU thread.
+static void WriteEndOfPipeLabel(RenderContext& renderer, void* address, const void* value,
+                                uint64_t size) {
+	const auto vaddr   = reinterpret_cast<uint64_t>(address);
+	auto&      buffers = renderer.GetBufferCache();
+	buffers.ForgetStreamedCopies();
+	if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
+	    buffers.HasGpuDirtyBytes(vaddr, size) ||
+	    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
+		std::memcpy(address, value, size);
+	}
+}
+
 static bool IsDrawOrDispatchPacket(uint32_t opcode) {
 	switch (opcode) {
 		case Pm4::IT_DISPATCH_DIRECT:
@@ -637,9 +715,50 @@ static bool IsDrawOrDispatchPacket(uint32_t opcode) {
 	}
 }
 
+// --parallel-draw-prep: packets that only set state or queue draws leave queued draws waiting;
+// every other packet commits them first.
+static bool KeepsQueuedDraws(uint32_t opcode, uint32_t packet_header) {
+	switch (opcode) {
+		case Pm4::IT_NOP: {
+			const auto r = KYTY_PM4_R(packet_header);
+			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER ||
+			       r == Pm4::R_CONTEXT_STATE;
+		}
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_CLEAR_STATE:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_PFP_SYNC_ME:
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return true;
+		default: return false;
+	}
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	auto& executor = m_renderer.GetRenderExecutor();
+	// Queued draws never outlive this call.
+	struct CommitOnExit {
+		CommandProcessor& cp;
+		RenderExecutor&   executor;
+		~CommitOnExit() { executor.CommitQueuedDraws(cp.CurrentBuffer()); }
+	} commit_on_exit {*this, executor};
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
+			if (executor.HasQueuedDraws() && g_gpu_state->HasPendingCommands()) {
+				executor.CommitQueuedDraws(CurrentBuffer());
+			}
 			g_gpu_state->ProcessCommands();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
@@ -704,6 +823,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		Common::DebugCounters::SetPm4Op(opcode);
+		if (executor.HasQueuedDraws() && !KeepsQueuedDraws(opcode, packet_header)) {
+			executor.CommitQueuedDraws(CurrentBuffer());
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		Common::DebugCounters::SetPm4Op(Common::DebugCounters::READ_FAULT_GPU_OUTSIDE);
@@ -829,11 +951,16 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 }
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+	auto& executor           = m_renderer.GetRenderExecutor();
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
+		if (m_num_instances_addr != 0) {
+			// Queued draws may write the instance count.
+			executor.CommitQueuedDraws(CurrentBuffer());
+		}
 		args.instance_count = NumInstances();
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	executor.QueueDrawIndex(m_submit_id, CurrentBuffer(), args);
 }
 
 const void* CommandProcessor::IndexAddress(uint32_t first_index) const {
@@ -1017,10 +1144,15 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	auto& executor = m_renderer.GetRenderExecutor();
 	if (args.instance_count == 0) {
+		if (m_num_instances_addr != 0) {
+			// Queued draws may write the instance count.
+			executor.CommitQueuedDraws(CurrentBuffer());
+		}
 		args.instance_count = NumInstances();
 	}
-	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	executor.QueueDrawAuto(m_submit_id, CurrentBuffer(), args);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
@@ -1058,18 +1190,51 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
 
-	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
-	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
-	// downloads GPU-written bytes under the label before the store.
+	// --deferred-eop-labels and --zero-copy-buffers: once the GPU finishes the work submitted so
+	// far, the priority thread hands the label write and the interrupt back to the GPU thread, in
+	// that order. The hand-off is asynchronous: the GPU thread can wait for priority operations.
+	if ((Config::DeferredEopLabelsEnabled() || Config::ZeroCopyBuffersEnabled()) && data_sel >= 1 &&
+	    data_sel <= 3) {
+		const auto label_size  = data_sel == 1 ? sizeof(uint32_t) : sizeof(uint64_t);
+		const auto label_value = data_sel == 1   ? static_cast<uint32_t>(data)
+		                         : data_sel == 3 ? Sync::ReadReferenceClock()
+		                                         : data;
+		const auto label_vaddr = reinterpret_cast<uint64_t>(address);
+		ForgetShadowLabels(label_vaddr, label_size);
+		const auto seq = ++g_shadow_label_seq;
+		g_shadow_labels.insert_or_assign(
+		    label_vaddr, ShadowLabel {label_value, static_cast<uint32_t>(label_size), seq});
+		GetScheduler().DeferPriorityOperation(
+		    [&renderer = m_renderer, data_sel, address, data, interrupt,
+		     event_id  = m_interrupt_event_id, interrupt_context_id, seq] {
+			    auto& gpu = renderer.GetGpu();
+			    if (gpu.IsStopping()) {
+				    return;
+			    }
+			    gpu.SendCommand([&renderer, data_sel, address, data, interrupt, event_id,
+			                     interrupt_context_id, seq] {
+				    const auto shadow = g_shadow_labels.find(reinterpret_cast<uint64_t>(address));
+				    if (shadow != g_shadow_labels.end() && shadow->second.seq == seq) {
+					    g_shadow_labels.erase(shadow);
+				    }
+				    if (data_sel == 1) {
+					    const auto value = static_cast<uint32_t>(data);
+					    WriteEndOfPipeLabel(renderer, address, &value, sizeof(value));
+				    } else {
+					    const uint64_t value = data_sel == 3 ? Sync::ReadReferenceClock() : data;
+					    WriteEndOfPipeLabel(renderer, address, &value, sizeof(value));
+				    }
+				    if (interrupt) {
+					    renderer.TriggerInterrupt(event_id, interrupt_context_id);
+				    }
+			    });
+		    },
+		    label_vaddr, label_size);
+		return;
+	}
+
 	const auto write_label = [this, address](const void* value, uint64_t size) {
-		const auto vaddr   = reinterpret_cast<uint64_t>(address);
-		auto&      buffers = m_renderer.GetBufferCache();
-		buffers.ForgetStreamedCopies();
-		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
-		    buffers.HasGpuDirtyBytes(vaddr, size) ||
-		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
-			std::memcpy(address, value, size);
-		}
+		WriteEndOfPipeLabel(m_renderer, address, value, size);
 	};
 	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS.
 	switch (data_sel) {
@@ -1082,6 +1247,8 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
 		case 2: write_label(&data, sizeof(data)); break;
 		case 5: {
+			ForgetShadowLabels(reinterpret_cast<uint64_t>(address),
+			                   (static_cast<uint32_t>(data) >> 16u) * sizeof(uint32_t));
 			{
 				const Common::DebugCounters::ScopedGpuWaitSite wait_site(
 				    Common::DebugCounters::GpuWaitSite::Gds);
@@ -1100,7 +1267,8 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		GetScheduler().DeferPriorityOperation(
 		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 			    renderer.TriggerInterrupt(event_id, interrupt_context_id);
-		    });
+		    },
+		    0, 0);
 	}
 }
 
@@ -1194,7 +1362,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
 	(void)command.Handle();
 	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); }, 0, 0);
 	GetScheduler().Flush();
 }
 
@@ -1211,7 +1379,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
-	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, 0, 0);
 	GetScheduler().Flush();
 }
 
