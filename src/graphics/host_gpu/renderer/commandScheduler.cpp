@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <optional>
@@ -108,10 +109,53 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
       m_stream(threaded_recording ? std::make_unique<CommandStream>() : nullptr), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
 	m_command.m_stream = m_stream.get();
+	if (Common::DebugCounters::Enabled() &&
+	    graphics.physical_device_properties.limits.timestampComputeAndGraphics != VK_FALSE) {
+		const vk::QueryPoolCreateInfo info {.queryType  = vk::QueryType::eTimestamp,
+		                                    .queryCount = GpuTimeSlots * 2};
+		if (graphics.device.createQueryPool(&info, nullptr, &m_gpu_time_pool) ==
+		    vk::Result::eSuccess) {
+			graphics.device.resetQueryPool(m_gpu_time_pool, 0, GpuTimeSlots * 2);
+		} else {
+			m_gpu_time_pool = nullptr;
+		}
+	}
 }
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (m_gpu_time_pool) {
+		m_graphics.device.destroyQueryPool(m_gpu_time_pool, nullptr);
+	}
+}
+
+void CommandScheduler::PollGpuTime() {
+	if (m_gpu_time_pending.empty()) {
+		return;
+	}
+	m_master.Refresh();
+	const auto   known  = m_master.KnownGpuTick();
+	const double period = m_graphics.physical_device_properties.limits.timestampPeriod;
+	while (!m_gpu_time_pending.empty() && m_gpu_time_pending.front().tick <= known) {
+		const auto slot = m_gpu_time_pending.front().slot;
+		m_gpu_time_pending.pop_front();
+		std::array<uint64_t, 2> stamps {};
+		const auto              result = m_graphics.device.getQueryPoolResults(
+		    m_gpu_time_pool, slot * 2, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		    vk::QueryResultFlagBits::e64);
+		m_graphics.device.resetQueryPool(m_gpu_time_pool, slot * 2, 2);
+		if (result != vk::Result::eSuccess || stamps[1] < stamps[0]) {
+			continue;
+		}
+		// Buffers run in order on the one queue; overlap with the previous one counts once.
+		const auto begin = std::max(stamps[0], m_gpu_time_last_end);
+		if (stamps[1] > begin) {
+			Common::DebugCounters::Add(
+			    Common::DebugCounters::Counter::GpuBusyNs,
+			    static_cast<uint64_t>(static_cast<double>(stamps[1] - begin) * period));
+		}
+		m_gpu_time_last_end = std::max(m_gpu_time_last_end, stamps[1]);
+	}
 }
 
 void CommandScheduler::Shutdown() {
@@ -419,6 +463,21 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	if (m_stream != nullptr) {
 		m_stream->RecordTarget(m_command.m_buffer);
 	}
+	m_gpu_time_current = -1;
+	if (m_gpu_time_pool && m_gpu_time_pending.size() < GpuTimeSlots) {
+		const uint32_t slot = m_gpu_time_next;
+		m_gpu_time_next     = (m_gpu_time_next + 1) % GpuTimeSlots;
+		m_gpu_time_current  = static_cast<int32_t>(slot);
+		const auto pool     = m_gpu_time_pool;
+		const auto write    = [pool, slot](vk::CommandBuffer buffer) {
+			buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, pool, slot * 2);
+		};
+		if (m_stream != nullptr) {
+			m_stream->Record(write);
+		} else {
+			write(m_command.m_buffer);
+		}
+	}
 	m_dynamic_state.Invalidate();
 	m_command_begin = std::chrono::steady_clock::now();
 	return m_command;
@@ -448,6 +507,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		return SubmitRecorded(submit);
 	}
 
+	m_command.EndRendering();
+	if (m_gpu_time_current >= 0) {
+		m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_gpu_time_pool,
+		                                  static_cast<uint32_t>(m_gpu_time_current) * 2 + 1);
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -489,6 +553,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
+	if (m_gpu_time_current >= 0) {
+		m_gpu_time_pending.push_back({static_cast<uint32_t>(m_gpu_time_current), tick});
+		m_gpu_time_current = -1;
+	}
+	PollGpuTime();
 	return tick;
 }
 
@@ -499,6 +568,13 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 // semaphore, and it submits in tick order.
 uint64_t CommandScheduler::SubmitRecorded(SubmitInfo& submit) {
 	m_command.EndRendering();
+	if (m_gpu_time_current >= 0) {
+		const auto pool  = m_gpu_time_pool;
+		const auto query = static_cast<uint32_t>(m_gpu_time_current) * 2 + 1;
+		m_stream->Record([pool, query](vk::CommandBuffer buffer) {
+			buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, query);
+		});
+	}
 	const auto tick = m_master.NextTick();
 	submit.AddSignal(m_master.Handle(), tick);
 
@@ -552,6 +628,11 @@ uint64_t CommandScheduler::SubmitRecorded(SubmitInfo& submit) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	m_command.m_buffer = nullptr;
+	if (m_gpu_time_current >= 0) {
+		m_gpu_time_pending.push_back({static_cast<uint32_t>(m_gpu_time_current), tick});
+		m_gpu_time_current = -1;
+	}
+	PollGpuTime();
 	return tick;
 }
 

@@ -40,6 +40,7 @@
 #include <limits>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <xxhash.h>
 
@@ -55,6 +56,69 @@ namespace Libs::Graphics {
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+
+// --perf-overlay: each buffer range's tracker-region CPU generation at its first use in this
+// frame and in the frame before (the GPU thread only).
+struct BufferCleanEntry {
+	uint64_t frame    = 0;
+	uint64_t gen      = 0;
+	uint64_t prev_gen = 0;
+	bool     prev     = false;
+};
+std::unordered_map<uint64_t, BufferCleanEntry> g_buffer_clean;
+uint64_t                                       g_buffer_clean_swept = 0;
+
+// Counts whether a draw's buffers are the ranges bound last frame, not CPU-written since: what
+// an object record that keeps its buffers needs.
+void CountBufferCleanliness(BufferCache& cache, std::span<PreparedBindings* const> stages) {
+	using Common::DebugCounters::Add;
+	using Common::DebugCounters::Counter;
+	const uint64_t frame = Common::DebugCounters::g_flips.load(std::memory_order_relaxed) + 1;
+	if (frame >= g_buffer_clean_swept + 64) {
+		g_buffer_clean_swept = frame;
+		std::erase_if(g_buffer_clean,
+		              [&](const auto& item) { return item.second.frame + 2 < frame; });
+	}
+	uint32_t bindings = 0;
+	bool     clean    = true;
+	for (const auto* stage: stages) {
+		for (const auto& source: stage->buffer_sources) {
+			if (source.address == 0 || source.size == 0) continue;
+			bindings++;
+			const auto gen = cache.DirtyGenerations(source.address, source.size).first;
+			if (cache.IsRegionCpuModified(source.address, source.size)) {
+				Add(Counter::BufCleanDirtyNow);
+			}
+			const uint64_t key   = source.address * 0x9e3779b97f4a7c15ull ^ source.size;
+			auto&          entry = g_buffer_clean[key];
+			if (entry.frame != frame) {
+				entry.prev     = entry.frame + 1 == frame;
+				entry.prev_gen = entry.gen;
+				entry.gen      = gen;
+				entry.frame    = frame;
+			}
+			if (gen == 0) {
+				Add(Counter::BufCleanUnknown);
+				clean = false;
+			} else if (!entry.prev) {
+				Add(Counter::BufCleanNew);
+				clean = false;
+			} else if (entry.prev_gen != gen) {
+				Add(Counter::BufCleanWritten);
+				clean = false;
+			} else {
+				Add(Counter::BufCleanClean);
+			}
+		}
+	}
+	Add(Counter::BufCleanDraws);
+	Add(Counter::BufCleanBindings, bindings);
+	if (bindings == 0) {
+		Add(Counter::BufCleanDrawsNoBuffers);
+	} else if (clean) {
+		Add(Counter::BufCleanDrawsAllClean);
+	}
+}
 
 } // namespace
 
@@ -1077,6 +1141,9 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	{
 		const ScopedDrawSubPhase phase("PrepareGraphicsBindings/Find");
 		FindBuffers(stages);
+	}
+	if (Common::DebugCounters::Enabled()) {
+		CountBufferCleanliness(m_context.GetBufferCache(), stages);
 	}
 	for (auto* stage: stages) {
 		uses_dma |= stage->runtime->module->info.info.uses_dma;

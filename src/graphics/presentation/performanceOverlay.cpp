@@ -408,6 +408,19 @@ void DrawPhaseRows(const Snapshot& shown) {
 	if (count > SHOWN_PHASES) {
 		Row(Fmt("  %u other phases", count - SHOWN_PHASES).c_str(),
 		    Fmt("%.2f us/draw  %.0f ms/s", rest / 1e3 / draws, rest / 1e6));
+		// Each of them, four to a row.
+		std::string line;
+		uint32_t    in_line = 0;
+		for (uint32_t i = SHOWN_PHASES; i < count; i++) {
+			const auto& group = groups[i];
+			line += Fmt("%.*s %.2f  ", static_cast<int>(std::min<size_t>(group.name.size(), 28)),
+			            group.name.data(), group.rate / 1e3 / draws);
+			if (++in_line == 4 || i + 1 == count) {
+				Row("    each", line);
+				line.clear();
+				in_line = 0;
+			}
+		}
 	}
 }
 
@@ -620,6 +633,25 @@ void GpuActivityRows(const Snapshot& shown) {
 	Row("CPU waiting on GPU",
 	    Fmt("%.0f ms/s  (%.0f waits/s)", Rate(shown, Counter::GpuWaitNs) / 1e6,
 	        Rate(shown, Counter::GpuWaits)));
+	if (const auto busy = Rate(shown, Counter::GpuBusyNs); busy > 0.0) {
+		const auto flips = std::max(Rate(shown, Counter::FlipsRequested), 1.0);
+		Row("GPU busy", Fmt("%.0f ms/s  (%.0f%%)  %.1f ms/flip  (command buffers running)",
+		                    busy / 1e6, busy / 1e7, busy / 1e6 / flips));
+	}
+	if (const auto checked = Rate(shown, Counter::BufCleanDraws); checked > 0.0) {
+		const auto bindings = std::max(Rate(shown, Counter::BufCleanBindings), 1.0);
+		const auto of       = [&](Counter counter, double total) {
+			return 100.0 * Rate(shown, counter) / total;
+		};
+		Row("Buffer cleanliness",
+		    Fmt("draws: all clean %.0f%%  no buffers %.0f%%  |  bindings %.1f/draw: clean %.0f%%  "
+		        "new %.0f%%  written %.0f%%  unknown %.0f%%  dirty now %.0f%%",
+		        of(Counter::BufCleanDrawsAllClean, checked),
+		        of(Counter::BufCleanDrawsNoBuffers, checked), bindings / checked,
+		        of(Counter::BufCleanClean, bindings), of(Counter::BufCleanNew, bindings),
+		        of(Counter::BufCleanWritten, bindings), of(Counter::BufCleanUnknown, bindings),
+		        of(Counter::BufCleanDirtyNow, bindings)));
+	}
 	// Percent of each second: ns/s divided by 1e7.
 	Row("GPU thread time",
 	    Fmt("PM4 %.0f%%  calls %.0f%%  idle %.0f%%  blocked %.0f%% (%.0f/s)",

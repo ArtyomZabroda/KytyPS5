@@ -138,6 +138,20 @@ enum class Counter {
 	GpuThreadPm4Ns,     // Processing guest command buffers.
 	GpuThreadCallNs,    // Running calls other threads sent to the GPU thread.
 	GpuThreadGpuWaitNs, // Of PM4 and call time, blocked on GPU timeline semaphores.
+	GpuBusyNs, // GPU time with a submitted command buffer running, from timestamps at its ends.
+	// Buffer cleanliness across frames (--perf-overlay): draws checked; draws with buffers whose
+	// every binding is clean; draws without buffers. Bindings: all; range not bound last frame;
+	// its tracker region CPU-written since last frame's first use; clean; CPU-dirty at the draw;
+	// generation unknown (untracked or spanning regions).
+	BufCleanDraws,
+	BufCleanDrawsAllClean,
+	BufCleanDrawsNoBuffers,
+	BufCleanBindings,
+	BufCleanNew,
+	BufCleanWritten,
+	BufCleanClean,
+	BufCleanDirtyNow,
+	BufCleanUnknown,
 	// GPU waits by call site, as count and duration pairs in GpuWaitSite order.
 	GpuWaitOther,
 	GpuWaitOtherNs,

@@ -110,6 +110,8 @@ private:
 	void     QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
 	                        uint64_t touch_begin = 0, uint64_t touch_end = UINT64_MAX);
 	void     RunOperation(Common::UniqueFunction<void>&& operation);
+	// --perf-overlay: reads the start and end timestamps of command buffers whose ticks completed.
+	void PollGpuTime();
 
 	MasterSemaphore                       m_master;
 	RenderContext&                        m_context;
@@ -119,6 +121,17 @@ private:
 	CommandBuffer                         m_command;
 	DynamicState                          m_dynamic_state;
 	std::chrono::steady_clock::time_point m_command_begin;
+	// --perf-overlay: a pair of timestamp queries per command buffer, at its start and its end.
+	struct GpuTimeSlot {
+		uint32_t slot = 0;
+		uint64_t tick = 0;
+	};
+	static constexpr uint32_t             GpuTimeSlots    = 256;
+	vk::QueryPool                         m_gpu_time_pool = nullptr;
+	std::deque<GpuTimeSlot>               m_gpu_time_pending;
+	uint32_t                              m_gpu_time_next     = 0;
+	int32_t                               m_gpu_time_current  = -1;
+	uint64_t                              m_gpu_time_last_end = 0;
 	std::deque<PendingOperation>          m_pending_operations;
 	std::deque<PendingOperation>          m_priority_operations;
 	std::mutex                            m_operation_mutex;
