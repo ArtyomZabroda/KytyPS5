@@ -84,6 +84,16 @@ public:
 
 	KYTY_CLASS_NO_COPY(RegionManager);
 
+	// Advances whenever pages of the region become CPU-dirty, so a range seen clean at one
+	// generation is still clean while the generation stays the same.
+	[[nodiscard]] uint64_t CpuDirtyGeneration() const {
+		return m_cpu_dirty_generation.load(std::memory_order_acquire);
+	}
+	// Advances whenever pages of the region become GPU-dirty.
+	[[nodiscard]] uint64_t GpuDirtyGeneration() const {
+		return m_gpu_dirty_generation.load(std::memory_order_acquire);
+	}
+
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(offset, size);
@@ -102,6 +112,11 @@ public:
 		RegionBits changed(enable ? ~bits : bits, start, end);
 		if constexpr (enable) {
 			bits.SetRange(start, end);
+			if constexpr (source == DirtySource::Cpu) {
+				m_cpu_dirty_generation.fetch_add(1, std::memory_order_acq_rel);
+			} else {
+				m_gpu_dirty_generation.fetch_add(1, std::memory_order_acq_rel);
+			}
 		} else {
 			bits.UnsetRange(start, end);
 		}
@@ -167,10 +182,14 @@ private:
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};
 	}
 
-	PageManager& m_page_manager;
-	uint64_t     m_cpu_addr = 0;
-	RegionBits   m_cpu_dirty;
-	RegionBits   m_gpu_dirty;
+	PageManager&          m_page_manager;
+	uint64_t              m_cpu_addr = 0;
+	RegionBits            m_cpu_dirty;
+	RegionBits            m_gpu_dirty;
+	RegionBits            m_writable;
+	RegionBits            m_readable;
+	std::atomic<uint64_t> m_cpu_dirty_generation {1};
+	std::atomic<uint64_t> m_gpu_dirty_generation {1};
 };
 
 } // namespace Libs::Graphics

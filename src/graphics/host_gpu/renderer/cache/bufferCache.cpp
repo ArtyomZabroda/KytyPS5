@@ -104,6 +104,7 @@ void BufferCache::Unregister(BufferId id) {
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	auto& buffer = m_slot_buffers[id];
+	m_buffers_generation++;
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
 	        !PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
@@ -480,9 +481,27 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
                                                        BufferId id) {
 	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
 
+	// Read before the checks below: a CPU write after this point advances the generation, so a
+	// range recorded with it is never answered from the cache after that write.
+	CleanRead* clean            = nullptr;
+	uint64_t   dirty_generation = 0;
+	if (!is_written && !is_texel_buffer) {
+		dirty_generation = m_memory_tracker.CpuDirtyGeneration(vaddr, size);
+		const auto hash  = (vaddr ^ (size * 0x9e3779b97f4a7c15ull)) * 0xff51afd7ed558ccdull;
+		clean            = &m_clean_reads[(hash >> 32u) % m_clean_reads.size()];
+		if (dirty_generation != 0 && clean->vaddr == vaddr && clean->size == size &&
+		    clean->dirty_generation == dirty_generation &&
+		    clean->buffers_generation == m_buffers_generation) {
+			auto& buffer = m_slot_buffers[clean->id];
+			TouchBuffer(buffer);
+			return {&buffer, buffer.Offset(vaddr)};
+		}
+	}
+
+	// Small CPU-dirty ranges stay CPU-dirty and are copied per use, so later guest writes to
+	// them do not fault.
 	if (!is_written && size <= CACHING_PAGESIZE &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	    m_memory_tracker.IsRegionOnlyCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
@@ -491,6 +510,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
 			m_stream_buffer.Commit();
+			if (clean != nullptr && clean->vaddr == vaddr && clean->size == size) {
+				*clean = {};
+			}
 			return {&m_stream_buffer, offset};
 		}
 	}
@@ -504,6 +526,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
+	}
+	// After this call the range is clean: anything CPU-dirty was just uploaded.
+	if (clean != nullptr && dirty_generation != 0) {
+		*clean = {vaddr, size, dirty_generation, m_buffers_generation, id};
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

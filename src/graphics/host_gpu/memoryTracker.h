@@ -24,8 +24,22 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// !IsRegionGpuModified && IsRegionCpuModified, taking each region lock once.
+	[[nodiscard]] bool IsRegionOnlyCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
+	// Lock-free CPU-dirty generation of the region holding the range, or 0 when the range spans
+	// regions or its region is not tracked yet. Read it before checking the range, so a page
+	// dirtied during or after the check advances it past the value read.
+	[[nodiscard]] uint64_t CpuDirtyGeneration(uint64_t vaddr, uint64_t size) const {
+		const auto* manager = FindSingleRegion(vaddr, size);
+		return manager != nullptr ? manager->CpuDirtyGeneration() : 0;
+	}
+	// GPU-dirty generation of the region holding the range, as CpuDirtyGeneration.
+	[[nodiscard]] uint64_t GpuDirtyGeneration(uint64_t vaddr, uint64_t size) const {
+		const auto* manager = FindSingleRegion(vaddr, size);
+		return manager != nullptr ? manager->GpuDirtyGeneration() : 0;
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -93,6 +107,16 @@ public:
 
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+
+	// The tracked region holding the whole range, or nullptr.
+	[[nodiscard]] const RegionManager* FindSingleRegion(uint64_t vaddr, uint64_t size) const {
+		const auto index = vaddr / TRACKER_REGION_SIZE;
+		if (size == 0 || size - 1 > UINT64_MAX - vaddr ||
+		    index != (vaddr + size - 1) / TRACKER_REGION_SIZE || index >= REGION_COUNT) {
+			return nullptr;
+		}
+		return m_regions[index].load(std::memory_order_acquire);
+	}
 
 	template <bool create, typename Func>
 	bool Iterate(uint64_t vaddr, uint64_t size, Func&& func) {

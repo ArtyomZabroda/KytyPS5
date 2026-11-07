@@ -153,6 +153,17 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// Read-only ranges ObtainBuffer found with nothing to upload. One stays valid while no
+	// buffer is registered or unregistered and the CPU dirties no page of its tracking region.
+	struct CleanRead {
+		uint64_t vaddr              = 0;
+		uint64_t size               = 0;
+		uint64_t dirty_generation   = 0;
+		uint64_t buffers_generation = 0;
+		BufferId id {};
+	};
+	std::array<CleanRead, 4096> m_clean_reads {};
+	uint64_t                    m_buffers_generation = 1;
 };
 
 } // namespace Libs::Graphics
